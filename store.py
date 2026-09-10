@@ -8,7 +8,7 @@ from typing import Dict, Iterator
 
 class UserProfile:
     __slots__ = ("watchlist", "threshold_pct", "cooldown_min",
-                 "report_min", "last_report_ts", "flow_alerts")
+                 "report_min", "last_report_ts", "flow_alerts", "quiet_from", "quiet_to")
 
     def __init__(self) -> None:
         self.watchlist: list[str] = []      # тикеры в верхнем регистре
@@ -17,6 +17,8 @@ class UserProfile:
         self.report_min: float = 60.0       # период сводки, мин (0 = выкл)
         self.last_report_ts: float = 0.0    # unix-время последней сводки
         self.flow_alerts: bool = True       # сигналы по ленте/стакану (роботы)
+        self.quiet_from: int = -1           # тихие часы, час МСК начала (-1 = выкл)
+        self.quiet_to: int = -1             # час МСК окончания
 
     def to_dict(self) -> dict:
         return {
@@ -26,6 +28,8 @@ class UserProfile:
             "report_min": self.report_min,
             "last_report_ts": self.last_report_ts,
             "flow_alerts": self.flow_alerts,
+            "quiet_from": self.quiet_from,
+            "quiet_to": self.quiet_to,
         }
 
     @classmethod
@@ -37,7 +41,16 @@ class UserProfile:
         p.report_min = float(d.get("report_min", p.report_min))
         p.last_report_ts = float(d.get("last_report_ts", 0.0))
         p.flow_alerts = bool(d.get("flow_alerts", True))
+        p.quiet_from = int(d.get("quiet_from", -1))
+        p.quiet_to = int(d.get("quiet_to", -1))
         return p
+
+    def is_quiet(self, hour_msk: int) -> bool:
+        """Попадает ли час в тихий интервал (поддерживает переход через полночь)."""
+        a, b = self.quiet_from, self.quiet_to
+        if a < 0 or b < 0 or a == b:
+            return False
+        return a <= hour_msk < b if a < b else (hour_msk >= a or hour_msk < b)
 
 
 class Store:

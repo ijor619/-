@@ -141,9 +141,21 @@ def aggregate(cs: list[Candle], base: int, agg: int) -> list[Candle]:
 
 # --------------------------------------------------------------- рисование
 
-def render(info: SecurityInfo, p: Period, cs: list[Candle]) -> bytes:
+@dataclass
+class Overlay:
+    """Дополнительные слои графика: уровни и дельта по агрессору."""
+    day_high: float = 0.0
+    day_low: float = 0.0
+    vwap: float = 0.0
+    walls: list = None            # [(price, qty_lots, side)] — плотности стакана
+    delta: list = None            # кумулятивная дельта по свечам (лоты), len == len(cs)
+
+
+def render(info: SecurityInfo, p: Period, cs: list[Candle],
+           ov: Optional[Overlay] = None) -> bytes:
     cur = cur_symbol(info.currency)
     n = len(cs)
+    ov = ov or Overlay()
     xs = range(n)
     last = cs[-1].close
     first = cs[0].open
@@ -169,6 +181,32 @@ def render(info: SecurityInfo, p: Period, cs: list[Candle]) -> bytes:
         ax.annotate(f"пред. закр. {fmt_price(info.prev_close, info.decimals)}",
                     xy=(0, info.prev_close), xytext=(3, 3),
                     textcoords="offset points", fontsize=7.5, color=MUTED)
+    # уровни: high/low дня, VWAP, стены стакана (только внутридневные периоды)
+    if p.base != 24:
+        lo_y, hi_y = min(c.low for c in cs), max(c.high for c in cs)
+        pad = (hi_y - lo_y) * 0.25 or last * 0.005
+        def _in_view(v: float) -> bool:
+            return bool(v) and lo_y - pad <= v <= hi_y + pad
+        if _in_view(ov.day_high):
+            ax.axhline(ov.day_high, color="#f59e0b", linewidth=0.8, linestyle=":")
+            ax.annotate(f"H {fmt_price(ov.day_high, info.decimals)}", xy=(0, ov.day_high),
+                        xytext=(3, 3), textcoords="offset points", fontsize=7, color="#b45309")
+        if _in_view(ov.day_low):
+            ax.axhline(ov.day_low, color="#f59e0b", linewidth=0.8, linestyle=":")
+            ax.annotate(f"L {fmt_price(ov.day_low, info.decimals)}", xy=(0, ov.day_low),
+                        xytext=(3, -9), textcoords="offset points", fontsize=7, color="#b45309")
+        if _in_view(ov.vwap):
+            ax.axhline(ov.vwap, color="#7c3aed", linewidth=0.9, linestyle="-.", alpha=0.8)
+            ax.annotate(f"VWAP {fmt_price(ov.vwap, info.decimals)}", xy=(0, ov.vwap),
+                        xytext=(3, 3), textcoords="offset points", fontsize=7, color="#6d28d9")
+        for price, qty, side in (ov.walls or []):
+            if _in_view(price):
+                c = UP if side == "B" else DOWN
+                ax.axhspan(price * 0.9995, price * 1.0005, color=c, alpha=0.18)
+                ax.annotate(f"стена {qty:,}".replace(",", " "), xy=(n - 1, price),
+                            xytext=(-2, 2), textcoords="offset points", fontsize=7,
+                            color=c, ha="right")
+
     # текущая цена
     ax.axhline(last, color=colors[-1], linewidth=0.7, alpha=0.6)
     ax.annotate(fmt_price(last, info.decimals), xy=(n - 1, last),
@@ -181,9 +219,22 @@ def render(info: SecurityInfo, p: Period, cs: list[Candle]) -> bytes:
         f"{fmt_price(last, info.decimals)} {cur}    {fmt_pct(chg)} за период",
         loc="left", fontsize=11, fontweight="bold", color=TXT)
 
-    # объём
-    axv.bar(xs, [c.volume for c in cs], width=0.7, color=colors, alpha=0.55)
+    # нижняя панель: кумулятивная дельта (если есть) поверх объёма
+    axv.bar(xs, [c.volume for c in cs], width=0.7, color=colors, alpha=0.35)
     axv.set_ylabel("Объём", fontsize=7.5, color=MUTED)
+    if ov.delta and len(ov.delta) == n and any(ov.delta):
+        axd = axv.twinx()
+        dcol = UP if ov.delta[-1] >= 0 else DOWN
+        axd.plot(list(xs), ov.delta, color=dcol, linewidth=1.4)
+        axd.fill_between(list(xs), ov.delta, 0, color=dcol, alpha=0.12)
+        axd.axhline(0, color=MUTED, linewidth=0.6)
+        axd.set_ylabel("Δ покупки−продажи, лот.", fontsize=7, color=dcol)
+        axd.tick_params(labelsize=7, colors=dcol, length=0)
+        axd.yaxis.set_major_formatter(plt.FuncFormatter(
+            lambda v, _: (f"{v/1e6:+.1f}M" if abs(v) >= 1e6 else
+                          f"{v/1e3:+.0f}K" if abs(v) >= 1e3 else f"{v:+.0f}")))
+        for sp in ("top",):
+            axd.spines[sp].set_visible(False)
     axv.yaxis.set_major_formatter(plt.FuncFormatter(
         lambda v, _: f"{v/1e6:.1f}M" if v >= 1e6 else
         f"{v/1e3:.0f}K" if v >= 1e3 else f"{v:.0f}"))
@@ -213,12 +264,81 @@ def render(info: SecurityInfo, p: Period, cs: list[Candle]) -> bytes:
     return buf.getvalue()
 
 
+def day_levels(base_candles: list[Candle]) -> tuple[float, float, float]:
+    """(high, low, vwap) за последний торговый день по минутным свечам."""
+    if not base_candles:
+        return 0.0, 0.0, 0.0
+    day = base_candles[-1].begin.date()
+    today = [c for c in base_candles if c.begin.date() == day]
+    hi = max(c.high for c in today)
+    lo = min(c.low for c in today)
+    vol = sum(c.volume for c in today)
+    vwap = sum((c.high + c.low + c.close) / 3 * c.volume for c in today) / vol if vol else 0.0
+    return hi, lo, vwap
+
+
+def delta_series(cs: list[Candle], trades, minutes: int) -> Optional[list[float]]:
+    """Кумулятивная дельта (покупки − продажи, лоты) по свечам из ленты сделок.
+
+    Лента T-Invest доступна только за последний час, поэтому дельта строится
+    лишь на 1м/5м/15м; для свечей, которые старше ленты, — 0 до первой сделки.
+    """
+    if not trades or minutes > 15:
+        return None
+    from datetime import timezone
+    msk = timezone(timedelta(hours=3))
+    per: dict[datetime, float] = {}
+    for t in trades:
+        ts = t.ts.astimezone(msk).replace(tzinfo=None)
+        mins = ts.hour * 60 + ts.minute
+        key = ts.replace(hour=(mins // minutes * minutes) // 60,
+                         minute=(mins // minutes * minutes) % 60, second=0, microsecond=0)
+        per[key] = per.get(key, 0.0) + (t.qty if t.side == "B" else -t.qty)
+    if not per:
+        return None
+    out, acc, started = [], 0.0, False
+    for c in cs:
+        if c.begin in per:
+            started = True
+            acc += per[c.begin]
+        out.append(acc if started else 0.0)
+    return out
+
+
 async def build_chart(sess: aiohttp.ClientSession, info: SecurityInfo,
-                      period: str) -> Optional[bytes]:
-    """PNG свечного графика или None, если данных нет."""
+                      period: str, tk=None) -> Optional[bytes]:
+    """PNG свечного графика или None, если данных нет.
+
+    tk — TinkoffClient (опционально): добавляет стены стакана и дельту.
+    """
     p = PERIODS.get(period) or PERIODS[DEFAULT_PERIOD]
     base = await fetch_candles(sess, info, p.base, p.depth)
     cs = aggregate(base, p.base, p.agg)[-p.bars:]
     if len(cs) < 2:
         return None
-    return render(info, p, cs)
+    ov = Overlay()
+    if p.base != 24:
+        # уровни дня считаем по минутным свечам (для 1м/5м/15м они уже есть)
+        mins = base if p.base == 1 else await fetch_candles(sess, info, 1, timedelta(days=2))
+        ov.day_high, ov.day_low, ov.vwap = day_levels(mins)
+    if tk is not None and p.base != 24:
+        try:
+            inst = await tk.instrument(info.ticker)
+            if inst is not None:
+                ob, trades = await asyncio.gather(
+                    tk.order_book(inst, depth=20), tk.last_trades(inst, minutes=60),
+                    return_exceptions=True)
+                if ob is not None and not isinstance(ob, BaseException):
+                    import statistics
+                    walls = []
+                    for side, levels in (("B", ob.bids), ("S", ob.asks)):
+                        if len(levels) >= 8:
+                            med = statistics.median(l.qty for l in levels) or 1
+                            walls += [(l.price, l.qty, side) for l in levels
+                                      if l.qty >= 8 * med][:2]
+                    ov.walls = walls
+                if isinstance(trades, list):
+                    ov.delta = delta_series(cs, trades, p.base * p.agg)
+        except Exception as e:
+            log.debug("chart overlay %s: %s", info.ticker, e)
+    return render(info, p, cs, ov)

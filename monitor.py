@@ -56,7 +56,10 @@ class Monitor:
         quotes = await moex.fetch_quotes(session, known, self._hints)
         now_ts = time.time()
 
+        hour = now_msk().hour
         for uid, prof in users:
+            if prof.is_quiet(hour):
+                continue
             for t in prof.watchlist:
                 q = quotes.get(t)
                 # Алерты — только когда рынок торгует (данные свежие),

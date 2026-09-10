@@ -50,16 +50,74 @@ WALL_MULT = 8.0              # уровень к медиане остальны
 WALL_MIN_LEVELS = 8
 SPOOF_MULT = 6.0
 SPOOF_MAX_LIFE_SEC = 90
+WHALE_MIN_RUB = 20_000_000    # одна сделка от N ₽ — «кит»
+WHALE_MULT = 25.0             # и не меньше чем в N раз типичной сделки
+WALL_EATEN_MIN_SHARE = 0.7    # стена считается съеденной, если исполнено ≥70%
+
+
+@dataclass
+class Baseline:
+    """Адаптивные «нормы» бумаги, накапливаются в течение дня (EMA).
+
+    Позволяют сравнивать активность не с фиксированными числами, а с тем,
+    что типично для ЭТОЙ бумаги: SBER и RUAL живут по разным правилам.
+    """
+    trades_per_min: float = 0.0   # средняя частота сделок
+    avg_qty: float = 0.0          # средний размер сделки, лот.
+    avg_rub: float = 0.0          # средний размер сделки, ₽
+    n: int = 0                    # сколько минут учтено
+
+    def update(self, trades: list["Trade"], lot: int) -> None:
+        if not trades:
+            return
+        span = max(1.0, (trades[-1].ts - trades[0].ts).total_seconds() / 60)
+        tpm = len(trades) / span
+        aq = statistics.fmean(t.qty for t in trades)
+        ar = statistics.fmean(t.qty * t.price * lot for t in trades)
+        if self.n == 0:
+            self.trades_per_min, self.avg_qty, self.avg_rub = tpm, aq, ar
+        else:
+            a = 0.1
+            self.trades_per_min += a * (tpm - self.trades_per_min)
+            self.avg_qty += a * (aq - self.avg_qty)
+            self.avg_rub += a * (ar - self.avg_rub)
+        self.n += 1
+
+    @property
+    def ready(self) -> bool:
+        return self.n >= 3
 
 
 # =============================================================== лента
 
 def analyze_trades(ticker: str, trades: list[Trade], lot: int,
-                   decimals: int) -> list[Signal]:
+                   decimals: int, base: Optional[Baseline] = None) -> list[Signal]:
     if len(trades) < 10:
         return []
     out: list[Signal] = []
     now = trades[-1].ts
+
+    # адаптивные пороги: если по бумаге уже есть статистика — масштабируем
+    iceberg_min = ICEBERG_MIN_TRADES
+    burst_min = BURST_MIN_TRADES
+    if base is not None and base.ready:
+        # для вялых бумаг 8 одинаковых сделок — событие; для SBER — фон
+        iceberg_min = max(ICEBERG_MIN_TRADES, int(base.trades_per_min * 0.5))
+        burst_min = max(BURST_MIN_TRADES, int(base.trades_per_min * BURST_MULT))
+
+    # --- кит: одна сделка на крупную сумму ---------------------------------
+    for t in trades[-60:]:
+        rub = t.qty * t.price * lot
+        typical = base.avg_rub if (base and base.ready and base.avg_rub) else 0
+        if rub >= WHALE_MIN_RUB and (not typical or rub >= WHALE_MULT * typical):
+            out.append(Signal(
+                "whale", ticker,
+                f"🐋 <b>{ticker}</b> — крупная сделка\n"
+                f"{fmt_n(rub)} ₽ одной сделкой "
+                f"({'покупка' if t.side == 'B' else 'продажа'}, "
+                f"{fmt_n(t.qty * lot)} шт. по {fmt_price(t.price, decimals)})"
+                + (f"\nВ {rub / typical:.0f}× больше типичной сделки" if typical else ""),
+                f"whale:{t.ts.isoformat()}:{t.price}"))
     recent = [t for t in trades if now - t.ts <= timedelta(seconds=ICEBERG_WINDOW_SEC)]
 
     # --- айсберг: одинаковые (цена, объём, сторона) ------------------------
@@ -68,7 +126,7 @@ def analyze_trades(ticker: str, trades: list[Trade], lot: int,
         if t.qty > 0:
             groups[(t.price, t.qty, t.side)].append(t)
     for (price, qty, side), g in groups.items():
-        if len(g) >= ICEBERG_MIN_TRADES and qty * len(g) >= 20:
+        if len(g) >= iceberg_min and qty * len(g) >= 20:
             span = (g[-1].ts - g[0].ts).total_seconds()
             out.append(Signal(
                 "iceberg", ticker,
@@ -126,7 +184,7 @@ def analyze_trades(ticker: str, trades: list[Trade], lot: int,
         mins = sorted(per_min)
         last_m, prev = mins[-1], [per_min[m] for m in mins[:-1]]
         med = statistics.median(prev) or 1
-        if per_min[last_m] >= BURST_MIN_TRADES and per_min[last_m] >= BURST_MULT * med:
+        if per_min[last_m] >= burst_min and per_min[last_m] >= BURST_MULT * med:
             tm = [t for t in trades if t.ts.replace(second=0, microsecond=0) == last_m]
             vb = sum(t.qty for t in tm if t.side == "B")
             vs = sum(t.qty for t in tm if t.side == "S")
@@ -144,9 +202,10 @@ def analyze_trades(ticker: str, trades: list[Trade], lot: int,
 
 @dataclass
 class BookState:
-    """Память по стакану одного инструмента для детекции спуфинга."""
+    """Память по стакану одного инструмента (спуфинг, съедание стен)."""
     big: dict[tuple[str, float], tuple[float, int]] = field(default_factory=dict)
     # (side, price) -> (first_seen_ts, qty)
+    last: Optional[OrderBook] = None
 
 
 def _wall(levels: list[Level], side: str, ticker: str, decimals: int,
@@ -199,7 +258,16 @@ def analyze_book(ticker: str, ob: OrderBook, st: BookState, lot: int,
         life = now - first
         # если цена дошла до уровня — заявка могла исполниться, это не спуфинг
         touched = (side == "B" and best_bid <= price) or (side == "S" and best_ask >= price)
-        if life <= SPOOF_MAX_LIFE_SEC and not touched:
+        if touched and life > 10:
+            # стена стояла, до неё дошли и её больше нет => съели (пробой уровня)
+            out.append(Signal(
+                "eaten", ticker,
+                f"🍽 <b>{ticker}</b> — стену съели\n"
+                f"Плотность {fmt_n(qty * lot)} шт. по {fmt_price(price, decimals)} "
+                f"({'бид' if side == 'B' else 'аск'}) простояла {int(life)} c и "
+                f"исполнена — уровень {'пробит вниз' if side == 'B' else 'пробит вверх'}",
+                f"eaten:{side}:{price}"))
+        elif life <= SPOOF_MAX_LIFE_SEC and not touched:
             out.append(Signal(
                 "spoof", ticker,
                 f"👻 <b>{ticker}</b> — возможный спуфинг\n"
@@ -207,7 +275,38 @@ def analyze_book(ticker: str, ob: OrderBook, st: BookState, lot: int,
                 f"{fmt_n(qty * lot)} шт. по {fmt_price(price, decimals)} "
                 f"снята через {int(life)} c, цена до неё не дошла",
                 f"spoof:{side}:{price}:{int(first)}"))
+    st.last = ob
     return out
+
+
+# =============================================================== контекст
+
+def context_text(price: float, prev_close: float, day_high: float,
+                 day_low: float, vwap: float, decimals: int,
+                 ob: Optional[OrderBook] = None, lot: int = 1) -> str:
+    """Блок «где мы находимся» под сигналом."""
+    parts = []
+    if prev_close:
+        parts.append(f"к закр. {fmt_pct((price - prev_close) / prev_close * 100)}")
+    if day_high and day_low and day_high > day_low:
+        pos = (price - day_low) / (day_high - day_low)
+        where = ("у максимума дня" if pos >= 0.95 else "у минимума дня" if pos <= 0.05
+                 else f"{pos * 100:.0f}% диапазона дня")
+        parts.append(where)
+        parts.append(f"H {fmt_price(day_high, decimals)} / L {fmt_price(day_low, decimals)}")
+    if vwap:
+        parts.append(f"VWAP {fmt_price(vwap, decimals)} "
+                     f"({'выше' if price >= vwap else 'ниже'})")
+    line = "📍 " + " · ".join(parts) if parts else ""
+    if ob and ob.bids and ob.asks:
+        tb = sum(l.qty for l in ob.bids)
+        ta = sum(l.qty for l in ob.asks)
+        if tb and ta:
+            r = tb / ta
+            line += (f"\n📚 стакан: {'бид' if r >= 1 else 'аск'} сильнее в "
+                     f"{max(r, 1 / r):.1f}×, спред "
+                     f"{fmt_price(ob.asks[0].price - ob.bids[0].price, decimals)}")
+    return line
 
 
 # =============================================================== тексты
