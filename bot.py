@@ -24,7 +24,10 @@ from aiogram.types import (BufferedInputFile, CallbackQuery, InputMediaPhoto,
 
 import charts
 import moex
-from keyboards import chart_kb, report_kb
+import tape
+import tinkoff
+from flow import FlowMonitor
+from keyboards import book_kb, chart_kb, report_kb, tape_kb
 from config import (BOT_TOKEN, CHECK_INTERVAL_SEC, DATA_FILE,
                     DEFAULT_REPORT_MIN, DEFAULT_THRESHOLD_PCT)
 from formatting import cur_symbol, esc, fmt_pct, fmt_price
@@ -46,7 +49,9 @@ HELP = (
     "/alert N — алерт, если цена уйдёт более чем на N% за день (0.1–50)\n"
     "/quiet N — мин. пауза между повторными алертами, мин\n"
     "/report N — сводка каждые N минут, 0 — выключить\n"
-    "/chart TICKER [1m|5m|15m|30m|1h|4h|1d] — свечной график\n\n"
+    "/chart TICKER [1m|5m|15m|30m|1h|4h|1d] — свечной график\n"
+    "/book TICKER — стакан, /tape TICKER — лента сделок\n"
+    "/flow on|off — сигналы о роботах (айсберги, спуфинг, перекосы)\n\n"
     "Просто напиши тикер сообщением — добавлю в список.\n"
     "Цены — из официального ISS API Мосбиржи, обновление каждую минуту."
 )
@@ -62,6 +67,9 @@ def _help_text(store: Store, user_id: int) -> str:
         f"Пауза между алертами: {p.cooldown_min:g} мин\n"
         f"Сводка: "
         + (f"каждые {p.report_min:g} мин" if p.report_min > 0 else "выключена")
+        + "\nСигналы ленты/стакана: "
+        + ("нет T-Invest токена" if not tinkoff.enabled()
+           else "включены" if p.flow_alerts else "выключены")
     )
 
 
@@ -114,6 +122,52 @@ async def _list(m, store: Store, sess: aiohttp.ClientSession) -> str:
                 f"{fmt_pct(q.change_pct)}"
             )
     return "\n".join(lines)
+
+
+# id единственного сообщения-графика в каждом чате: chat_id -> message_id
+_chart_msg: dict[int, int] = {}
+
+
+async def show_chart(bot: Bot, chat_id: int, sess: aiohttp.ClientSession,
+                     store: Store, t: str, period: str,
+                     current: Message | None = None) -> str | None:
+    """Показать график, не плодя сообщений.
+
+    Если `current` — уже сообщение с графиком, картинка заменяется на месте.
+    Иначе предыдущее сообщение-график в чате удаляется и присылается новое.
+    Возвращает текст ошибки или None.
+    """
+    if period not in charts.PERIODS:
+        period = charts.DEFAULT_PERIOD
+    info = await moex.get_security_info(sess, t)
+    if info is None:
+        return f"❌ <b>{esc(t)}</b> — не найден на Мосбирже"
+    png = await charts.build_chart(sess, info, period)
+    if png is None:
+        return f"Нет данных для графика {esc(t)}."
+    file = BufferedInputFile(png, f"{t}_{period}.png")
+    kb = chart_kb(t, period, store.get(chat_id).watchlist)
+
+    if current is not None and current.photo:
+        try:
+            await current.edit_media(InputMediaPhoto(media=file), reply_markup=kb)
+            _chart_msg[chat_id] = current.message_id
+            return None
+        except TelegramBadRequest as e:
+            if "not modified" in str(e):
+                return None
+        except Exception:
+            log.exception("edit_media %s", t)
+
+    old = _chart_msg.get(chat_id)
+    if old is not None:
+        try:
+            await bot.delete_message(chat_id, old)
+        except Exception:
+            pass  # уже удалено / старше 48 ч
+    msg = await bot.send_photo(chat_id, file, reply_markup=kb)
+    _chart_msg[chat_id] = msg.message_id
+    return None
 
 
 # ------------------------------------------------------------------ команды
@@ -172,31 +226,19 @@ async def cmd_list(m: Message, store: Store, sess: aiohttp.ClientSession) -> Non
 
 
 @router.message(Command("chart"))
-async def cmd_chart(m: Message, store: Store, sess: aiohttp.ClientSession) -> None:
+async def cmd_chart(m: Message, store: Store, sess: aiohttp.ClientSession) -> None:  # noqa: E501
     args = (m.text or "").split()[1:]
     if not args:
         await m.answer("Использование: /chart SBER [1m|5m|15m|30m|1h|4h|1d]")
         return
     t = args[0].upper()
     period = args[1].lower() if len(args) > 1 else charts.DEFAULT_PERIOD
-    await _send_chart(m, sess, t, period)
-
-
-async def _send_chart(m: Message, sess: aiohttp.ClientSession,
-                      t: str, period: str) -> None:
     if not TICKER_RE.match(t):
         await m.answer("Не похоже на тикер.")
         return
-    info = await moex.get_security_info(sess, t)
-    if info is None:
-        await m.answer(f"❌ <b>{esc(t)}</b> — не найден на Мосбирже")
-        return
-    png = await charts.build_chart(sess, info, period)
-    if png is None:
-        await m.answer(f"Нет данных для графика {t}.")
-        return
-    await m.answer_photo(BufferedInputFile(png, f"{t}_{period}.png"),
-                         reply_markup=chart_kb(t, period))
+    err = await show_chart(m.bot, m.chat.id, sess, store, t, period)
+    if err:
+        await m.answer(err)
 
 
 @router.message(Command("alert"))
@@ -273,37 +315,147 @@ async def cmd_settings(m: Message, store: Store) -> None:
     await m.answer(_help_text(store, m.from_user.id))
 
 
+# ------------------------------------------------------ стакан / лента
+
+async def _book_text(sess, tk: tinkoff.TinkoffClient, t: str) -> str:
+    inst = await tk.instrument(t)
+    if inst is None:
+        return f"❌ <b>{esc(t)}</b> — не найден в T-Invest"
+    info = await moex.get_security_info(sess, t)
+    dec = info.decimals if info else 2
+    ob = await tk.order_book(inst, depth=20)
+    if ob is None:
+        return f"📚 <b>{t}</b> — стакан пуст (торгов нет)"
+    return tape.book_text(t, inst.name, ob, inst.lot, dec)
+
+
+async def _tape_text(sess, tk: tinkoff.TinkoffClient, t: str) -> str:
+    inst = await tk.instrument(t)
+    if inst is None:
+        return f"❌ <b>{esc(t)}</b> — не найден в T-Invest"
+    info = await moex.get_security_info(sess, t)
+    dec = info.decimals if info else 2
+    trades = await tk.last_trades(inst, minutes=15)
+    text = tape.tape_text(t, trades, inst.lot, dec)
+    sigs = tape.analyze_trades(t, trades, inst.lot, dec)
+    if sigs:
+        text += "\n\n<b>Сигналы:</b>\n" + "\n".join(s.text.split("\n")[0] for s in sigs)
+    return text
+
+
+NO_TK = ("Стакан и лента доступны через T-Invest API. "
+         "Задай переменную окружения TINKOFF_TOKEN (токен «только чтение»).")
+
+
+@router.message(Command("book"))
+async def cmd_book(m: Message, sess: aiohttp.ClientSession, tk: tinkoff.TinkoffClient) -> None:
+    args = (m.text or "").split()[1:]
+    if not tinkoff.enabled():
+        await m.answer(NO_TK); return
+    if not args:
+        await m.answer("Использование: /book SBER"); return
+    t = args[0].upper()
+    await m.answer(await _book_text(sess, tk, t), reply_markup=book_kb(t))
+
+
+@router.message(Command("tape"))
+async def cmd_tape(m: Message, sess: aiohttp.ClientSession, tk: tinkoff.TinkoffClient) -> None:
+    args = (m.text or "").split()[1:]
+    if not tinkoff.enabled():
+        await m.answer(NO_TK); return
+    if not args:
+        await m.answer("Использование: /tape SBER"); return
+    t = args[0].upper()
+    await m.answer(await _tape_text(sess, tk, t), reply_markup=tape_kb(t))
+
+
+@router.message(Command("flow"))
+async def cmd_flow(m: Message, store: Store) -> None:
+    args = (m.text or "").split()[1:]
+    p = store.get(m.from_user.id)
+    if not tinkoff.enabled():
+        await m.answer(NO_TK); return
+    if args and args[0].lower() in ("on", "off"):
+        p.flow_alerts = args[0].lower() == "on"
+        store.save()
+    await m.answer(
+        f"🤖 Сигналы ленты/стакана: <b>{'включены' if p.flow_alerts else 'выключены'}</b>\n"
+        "Айсберги 🧊, ритмичные роботы 🤖, перекосы ⚖️, всплески 🔥, "
+        "плотности 🧱, спуфинг 👻.\nПереключить: /flow on | /flow off")
+
+
+@router.callback_query(F.data.startswith("book:"))
+async def cb_book(c: CallbackQuery, sess: aiohttp.ClientSession, tk: tinkoff.TinkoffClient) -> None:
+    parts = c.data.split(":")
+    t = parts[1]
+    await c.answer("Загружаю стакан…")
+    if not tinkoff.enabled():
+        await c.message.answer(NO_TK); return
+    try:
+        text = await _book_text(sess, tk, t)
+    except Exception as e:
+        log.exception("book %s", t); text = f"Не удалось получить стакан {t}: {esc(e)}"
+    if len(parts) > 2 and parts[2] == "r":
+        try:
+            await c.message.edit_text(text, reply_markup=book_kb(t)); return
+        except TelegramBadRequest as e:
+            if "not modified" in str(e): return
+    await c.message.answer(text, reply_markup=book_kb(t))
+
+
+@router.callback_query(F.data.startswith("tape:"))
+async def cb_tape(c: CallbackQuery, sess: aiohttp.ClientSession, tk: tinkoff.TinkoffClient) -> None:
+    parts = c.data.split(":")
+    t = parts[1]
+    await c.answer("Загружаю ленту…")
+    if not tinkoff.enabled():
+        await c.message.answer(NO_TK); return
+    try:
+        text = await _tape_text(sess, tk, t)
+    except Exception as e:
+        log.exception("tape %s", t); text = f"Не удалось получить ленту {t}: {esc(e)}"
+    if len(parts) > 2 and parts[2] == "r":
+        try:
+            await c.message.edit_text(text, reply_markup=tape_kb(t)); return
+        except TelegramBadRequest as e:
+            if "not modified" in str(e): return
+    await c.message.answer(text, reply_markup=tape_kb(t))
+
+
+@router.callback_query(F.data == "flow:off")
+async def cb_flow_off(c: CallbackQuery, store: Store) -> None:
+    p = store.get(c.from_user.id)
+    p.flow_alerts = False
+    store.save()
+    await c.answer("Сигналы ленты выключены")
+    await c.message.answer("🔕 Сигналы ленты/стакана выключены. Включить: /flow on")
+
+
 # ------------------------------------------------------------- callbacks
 
+@router.callback_query(F.data == "chart:close")
+async def cb_chart_close(c: CallbackQuery) -> None:
+    await c.answer()
+    _chart_msg.pop(c.message.chat.id, None)
+    try:
+        await c.message.delete()
+    except Exception:
+        pass
+
+
 @router.callback_query(F.data.startswith("chart:"))
-async def cb_chart(c: CallbackQuery, sess: aiohttp.ClientSession) -> None:
+async def cb_chart(c: CallbackQuery, store: Store, sess: aiohttp.ClientSession) -> None:
     parts = c.data.split(":")
     t, period = parts[1], (parts[2] if len(parts) > 2 else charts.DEFAULT_PERIOD)
-    if period not in charts.PERIODS:
-        period = charts.DEFAULT_PERIOD
     await c.answer("Строю график…")
     try:
-        info = await moex.get_security_info(sess, t)
-        png = await charts.build_chart(sess, info, period) if info else None
-    except Exception:
+        err = await show_chart(c.bot, c.message.chat.id, sess, store, t, period,
+                               current=c.message)
+    except Exception as e:
         log.exception("график %s", t)
-        png = None
-    if png is None:
-        await c.message.answer(f"Нет данных для графика {esc(t)}.")
-        return
-    file = BufferedInputFile(png, f"{t}_{period}.png")
-    kb = chart_kb(t, period)
-    if c.message.photo:
-        # уже график — заменяем картинку на месте (смена периода / обновление)
-        try:
-            await c.message.edit_media(InputMediaPhoto(media=file), reply_markup=kb)
-            return
-        except TelegramBadRequest as e:
-            if "not modified" in str(e):
-                return
-        except Exception:
-            log.exception("edit_media %s", t)
-    await c.message.answer_photo(file, reply_markup=kb)
+        err = f"Не удалось построить график {esc(t)}: {esc(e)}"
+    if err:
+        await c.answer(err.replace("<b>", "").replace("</b>", ""), show_alert=True)
 
 
 @router.callback_query(F.data == "refresh")
@@ -396,6 +548,8 @@ def main() -> None:
     dp.include_router(router)
     store = Store(DATA_FILE)
     monitor = Monitor(bot, store)
+    tk = tinkoff.TinkoffClient()
+    flow = FlowMonitor(bot, store, tk)
 
     async def amain() -> None:
         session = aiohttp.ClientSession(
@@ -403,12 +557,15 @@ def main() -> None:
             timeout=ClientTimeout(total=20),
         )
         monitor_task = asyncio.create_task(monitor.run(session))
+        flow_task = asyncio.create_task(flow.run(session))
         health_task = asyncio.create_task(health_check(bot))
         try:
-            await dp.start_polling(bot, store=store, sess=session)
+            await dp.start_polling(bot, store=store, sess=session, tk=tk)
         finally:
             monitor_task.cancel()
+            flow_task.cancel()
             health_task.cancel()
+            await tk.close()
             await session.close()
             await bot.session.close()
 

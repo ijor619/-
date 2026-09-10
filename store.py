@@ -8,7 +8,7 @@ from typing import Dict, Iterator
 
 class UserProfile:
     __slots__ = ("watchlist", "threshold_pct", "cooldown_min",
-                 "report_min", "last_report_ts")
+                 "report_min", "last_report_ts", "flow_alerts")
 
     def __init__(self) -> None:
         self.watchlist: list[str] = []      # тикеры в верхнем регистре
@@ -16,6 +16,7 @@ class UserProfile:
         self.cooldown_min: float = 30.0     # пауза между повторными алертами, мин
         self.report_min: float = 60.0       # период сводки, мин (0 = выкл)
         self.last_report_ts: float = 0.0    # unix-время последней сводки
+        self.flow_alerts: bool = True       # сигналы по ленте/стакану (роботы)
 
     def to_dict(self) -> dict:
         return {
@@ -24,6 +25,7 @@ class UserProfile:
             "cooldown_min": self.cooldown_min,
             "report_min": self.report_min,
             "last_report_ts": self.last_report_ts,
+            "flow_alerts": self.flow_alerts,
         }
 
     @classmethod
@@ -34,6 +36,7 @@ class UserProfile:
         p.cooldown_min = float(d.get("cooldown_min", p.cooldown_min))
         p.report_min = float(d.get("report_min", p.report_min))
         p.last_report_ts = float(d.get("last_report_ts", 0.0))
+        p.flow_alerts = bool(d.get("flow_alerts", True))
         return p
 
 

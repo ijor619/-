@@ -16,6 +16,7 @@ from config import (CHECK_INTERVAL_SEC, SEC_INFO_TTL_SEC,
 from formatting import cur_symbol, esc, fmt_pct, fmt_price
 from moex import Quote, SecurityInfo, now_msk
 from keyboards import alert_kb, report_kb
+from tinkoff import enabled as flow_enabled
 from store import Store, UserProfile
 
 log = logging.getLogger(__name__)
@@ -66,7 +67,7 @@ class Monitor:
                     last = self._last_alert.get((uid, t), 0.0)
                     if now_ts - last >= prof.cooldown_min * 60:
                         self._last_alert[(uid, t)] = now_ts
-                        await self._send(uid, self._alert_text(q, prof), alert_kb(t))
+                        await self._send(uid, self._alert_text(q, prof), alert_kb(t, flow_enabled()))
 
             if (prof.report_min > 0
                     and now_ts - prof.last_report_ts >= prof.report_min * 60):
