@@ -1,0 +1,15 @@
+{
+  "297759212": {
+    "watchlist": [
+      "GAZP",
+      "SBER",
+      "YDEX",
+      "PLZL",
+      "RUAL"
+    ],
+    "threshold_pct": 0.3,
+    "cooldown_min": 30.0,
+    "report_min": 60.0,
+    "last_report_ts": 1789072351.939437
+  }
+}
