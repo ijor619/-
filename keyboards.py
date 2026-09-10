@@ -12,8 +12,9 @@ def tinvest_url(ticker: str) -> str:
 
 
 def terminal_url(ticker: str) -> str:
-    """Веб-терминал Т-Инвестиций (график + стакан + заявки) на нужной бумаге."""
-    return f"https://www.tbank.ru/terminal/?ticker={ticker}"
+    """Веб-терминал Т-Инвестиций. Параметров выбора бумаги у него нет:
+    он открывает последнюю сохранённую раскладку пользователя."""
+    return "https://www.tbank.ru/terminal/"
 
 
 def tinvest_btn(ticker: str) -> InlineKeyboardButton:
