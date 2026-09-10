@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from charts import PERIOD_ORDER, PERIOD_TITLES
+from charts import DEFAULT_PERIOD, PERIOD_ORDER, PERIOD_TITLES
 
 
 def report_kb(tickers: list[str]) -> InlineKeyboardMarkup:
@@ -11,7 +11,7 @@ def report_kb(tickers: list[str]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     row: list[InlineKeyboardButton] = []
     for t in tickers:
-        row.append(InlineKeyboardButton(text=f"📈 {t}", callback_data=f"chart:{t}:1d"))
+        row.append(InlineKeyboardButton(text=f"📈 {t}", callback_data=f"chart:{t}:{DEFAULT_PERIOD}"))
         if len(row) == 3:
             rows.append(row)
             row = []
@@ -27,7 +27,7 @@ def report_kb(tickers: list[str]) -> InlineKeyboardMarkup:
 def alert_kb(ticker: str) -> InlineKeyboardMarkup:
     """Под алертом: график и быстрое удаление бумаги."""
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="📈 График", callback_data=f"chart:{ticker}:1d"),
+        InlineKeyboardButton(text="📈 График", callback_data=f"chart:{ticker}:{DEFAULT_PERIOD}"),
         InlineKeyboardButton(text="🔕 Не следить", callback_data=f"unwatch:{ticker}"),
     ]])
 
@@ -42,6 +42,7 @@ def chart_kb(ticker: str, period: str) -> InlineKeyboardMarkup:
         for p in PERIOD_ORDER
     ]
     return InlineKeyboardMarkup(inline_keyboard=[
-        periods,
+        periods[:4],
+        periods[4:],
         [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"chart:{ticker}:{period}:r")],
     ])

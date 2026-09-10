@@ -46,7 +46,7 @@ HELP = (
     "/alert N — алерт, если цена уйдёт более чем на N% за день (0.1–50)\n"
     "/quiet N — мин. пауза между повторными алертами, мин\n"
     "/report N — сводка каждые N минут, 0 — выключить\n"
-    "/chart TICKER [1d|1w|1m|3m] — график цены\n\n"
+    "/chart TICKER [1m|5m|15m|30m|1h|4h|1d] — свечной график\n\n"
     "Просто напиши тикер сообщением — добавлю в список.\n"
     "Цены — из официального ISS API Мосбиржи, обновление каждую минуту."
 )
@@ -175,10 +175,10 @@ async def cmd_list(m: Message, store: Store, sess: aiohttp.ClientSession) -> Non
 async def cmd_chart(m: Message, store: Store, sess: aiohttp.ClientSession) -> None:
     args = (m.text or "").split()[1:]
     if not args:
-        await m.answer("Использование: /chart SBER [1d|1w|1m|3m]")
+        await m.answer("Использование: /chart SBER [1m|5m|15m|30m|1h|4h|1d]")
         return
     t = args[0].upper()
-    period = args[1].lower() if len(args) > 1 else "1d"
+    period = args[1].lower() if len(args) > 1 else charts.DEFAULT_PERIOD
     await _send_chart(m, sess, t, period)
 
 
@@ -278,9 +278,9 @@ async def cmd_settings(m: Message, store: Store) -> None:
 @router.callback_query(F.data.startswith("chart:"))
 async def cb_chart(c: CallbackQuery, sess: aiohttp.ClientSession) -> None:
     parts = c.data.split(":")
-    t, period = parts[1], (parts[2] if len(parts) > 2 else "1d")
+    t, period = parts[1], (parts[2] if len(parts) > 2 else charts.DEFAULT_PERIOD)
     if period not in charts.PERIODS:
-        period = "1d"
+        period = charts.DEFAULT_PERIOD
     await c.answer("Строю график…")
     try:
         info = await moex.get_security_info(sess, t)
