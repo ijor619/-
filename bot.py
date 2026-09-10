@@ -14,13 +14,17 @@ import sys
 
 import aiohttp
 from aiohttp import ClientTimeout
-from aiogram import Bot, Dispatcher, Router
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
+from aiogram.types import (BufferedInputFile, CallbackQuery, InputMediaPhoto,
+                           Message)
 
+import charts
 import moex
+from keyboards import chart_kb, report_kb
 from config import (BOT_TOKEN, CHECK_INTERVAL_SEC, DATA_FILE,
                     DEFAULT_REPORT_MIN, DEFAULT_THRESHOLD_PCT)
 from formatting import cur_symbol, esc, fmt_pct, fmt_price
@@ -41,7 +45,8 @@ HELP = (
     "/list — список с текущими ценами\n"
     "/alert N — алерт, если цена уйдёт более чем на N% за день (0.1–50)\n"
     "/quiet N — мин. пауза между повторными алертами, мин\n"
-    "/report N — сводка каждые N минут, 0 — выключить\n\n"
+    "/report N — сводка каждые N минут, 0 — выключить\n"
+    "/chart TICKER [1d|1w|1m|3m] — график цены\n\n"
     "Просто напиши тикер сообщением — добавлю в список.\n"
     "Цены — из официального ISS API Мосбиржи, обновление каждую минуту."
 )
@@ -86,7 +91,7 @@ async def _watch(m: Message, store: Store, sess: aiohttp.ClientSession,
     return "\n".join(lines)
 
 
-async def _list(m: Message, store: Store, sess: aiohttp.ClientSession) -> str:
+async def _list(m, store: Store, sess: aiohttp.ClientSession) -> str:
     prof = store.get(m.from_user.id)
     if not prof.watchlist:
         return "Список пуст. Добавь: /watch SBER GAZP"
@@ -161,7 +166,37 @@ async def cmd_unwatch(m: Message, store: Store) -> None:
 
 @router.message(Command("list"))
 async def cmd_list(m: Message, store: Store, sess: aiohttp.ClientSession) -> None:
-    await m.answer(await _list(m, store, sess))
+    prof = store.get(m.from_user.id)
+    await m.answer(await _list(m, store, sess),
+                   reply_markup=report_kb(prof.watchlist) if prof.watchlist else None)
+
+
+@router.message(Command("chart"))
+async def cmd_chart(m: Message, store: Store, sess: aiohttp.ClientSession) -> None:
+    args = (m.text or "").split()[1:]
+    if not args:
+        await m.answer("Использование: /chart SBER [1d|1w|1m|3m]")
+        return
+    t = args[0].upper()
+    period = args[1].lower() if len(args) > 1 else "1d"
+    await _send_chart(m, sess, t, period)
+
+
+async def _send_chart(m: Message, sess: aiohttp.ClientSession,
+                      t: str, period: str) -> None:
+    if not TICKER_RE.match(t):
+        await m.answer("Не похоже на тикер.")
+        return
+    info = await moex.get_security_info(sess, t)
+    if info is None:
+        await m.answer(f"❌ <b>{esc(t)}</b> — не найден на Мосбирже")
+        return
+    png = await charts.build_chart(sess, info, period)
+    if png is None:
+        await m.answer(f"Нет данных для графика {t}.")
+        return
+    await m.answer_photo(BufferedInputFile(png, f"{t}_{period}.png"),
+                         reply_markup=chart_kb(t, period))
 
 
 @router.message(Command("alert"))
@@ -236,6 +271,75 @@ async def cmd_report(m: Message, store: Store) -> None:
 @router.message(Command("settings"))
 async def cmd_settings(m: Message, store: Store) -> None:
     await m.answer(_help_text(store, m.from_user.id))
+
+
+# ------------------------------------------------------------- callbacks
+
+@router.callback_query(F.data.startswith("chart:"))
+async def cb_chart(c: CallbackQuery, sess: aiohttp.ClientSession) -> None:
+    parts = c.data.split(":")
+    t, period = parts[1], (parts[2] if len(parts) > 2 else "1d")
+    if period not in charts.PERIODS:
+        period = "1d"
+    await c.answer("Строю график…")
+    try:
+        info = await moex.get_security_info(sess, t)
+        png = await charts.build_chart(sess, info, period) if info else None
+    except Exception:
+        log.exception("график %s", t)
+        png = None
+    if png is None:
+        await c.message.answer(f"Нет данных для графика {esc(t)}.")
+        return
+    file = BufferedInputFile(png, f"{t}_{period}.png")
+    kb = chart_kb(t, period)
+    if c.message.photo:
+        # уже график — заменяем картинку на месте (смена периода / обновление)
+        try:
+            await c.message.edit_media(InputMediaPhoto(media=file), reply_markup=kb)
+            return
+        except TelegramBadRequest as e:
+            if "not modified" in str(e):
+                return
+        except Exception:
+            log.exception("edit_media %s", t)
+    await c.message.answer_photo(file, reply_markup=kb)
+
+
+@router.callback_query(F.data == "refresh")
+async def cb_refresh(c: CallbackQuery, store: Store, sess: aiohttp.ClientSession) -> None:
+    await c.answer("Обновляю…")
+    prof = store.get(c.from_user.id)
+    text = await _list(c, store, sess)
+    try:
+        await c.message.edit_text(text, reply_markup=report_kb(prof.watchlist))
+    except TelegramBadRequest as e:
+        if "not modified" not in str(e):
+            await c.message.answer(text, reply_markup=report_kb(prof.watchlist))
+
+
+@router.callback_query(F.data == "settings")
+async def cb_settings(c: CallbackQuery, store: Store) -> None:
+    await c.answer()
+    await c.message.answer(_help_text(store, c.from_user.id))
+
+
+@router.callback_query(F.data.startswith("unwatch:"))
+async def cb_unwatch(c: CallbackQuery, store: Store) -> None:
+    t = c.data.split(":", 1)[1]
+    prof = store.get(c.from_user.id)
+    if t in prof.watchlist:
+        prof.watchlist.remove(t)
+        store.save()
+        await c.answer(f"{t} убран из списка")
+        await c.message.answer(f"🗑 <b>{t}</b> — больше не слежу.\n"
+                               f"Следим за: {', '.join(prof.watchlist) or '—'}")
+    else:
+        await c.answer(f"{t} уже не в списке")
+    try:
+        await c.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
 
 # ----------------------------------------------------------------- fallback

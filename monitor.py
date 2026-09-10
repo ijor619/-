@@ -15,6 +15,7 @@ from config import (CHECK_INTERVAL_SEC, SEC_INFO_TTL_SEC,
                     DEFAULT_THRESHOLD_PCT, DEFAULT_REPORT_MIN)
 from formatting import cur_symbol, esc, fmt_pct, fmt_price
 from moex import Quote, SecurityInfo, now_msk
+from keyboards import alert_kb, report_kb
 from store import Store, UserProfile
 
 log = logging.getLogger(__name__)
@@ -65,7 +66,7 @@ class Monitor:
                     last = self._last_alert.get((uid, t), 0.0)
                     if now_ts - last >= prof.cooldown_min * 60:
                         self._last_alert[(uid, t)] = now_ts
-                        await self._send(uid, self._alert_text(q, prof))
+                        await self._send(uid, self._alert_text(q, prof), alert_kb(t))
 
             if (prof.report_min > 0
                     and now_ts - prof.last_report_ts >= prof.report_min * 60):
@@ -73,7 +74,8 @@ class Monitor:
                 if any(q is not None for _, q in rows):
                     prof.last_report_ts = now_ts
                     self.store.save()
-                    await self._send(uid, self._report_text(rows))
+                    await self._send(uid, self._report_text(rows),
+                                     report_kb(prof.watchlist))
 
         self._first_tick = False
 
@@ -137,8 +139,8 @@ class Monitor:
         lines.append(f"Рынок: {'открыт' if trading else 'закрыт'}")
         return "\n".join(lines)
 
-    async def _send(self, user_id: int, text: str) -> None:
+    async def _send(self, user_id: int, text: str, kb=None) -> None:
         try:
-            await self.bot.send_message(user_id, text)
+            await self.bot.send_message(user_id, text, reply_markup=kb)
         except Exception:
             log.exception("не удалось отправить сообщение пользователю %s", user_id)

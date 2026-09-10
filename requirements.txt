@@ -1,1 +1,2 @@
 aiogram>=3.13,<4
+matplotlib>=3.8
