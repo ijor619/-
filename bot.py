@@ -318,9 +318,12 @@ async def cmd_settings(m: Message, store: Store) -> None:
 # ------------------------------------------------------ стакан / лента
 
 async def _book_text(sess, tk: tinkoff.TinkoffClient, t: str) -> str:
-    inst = await tk.instrument(t)
+    try:
+        inst = await tk.instrument(t)
+    except Exception as e:
+        return f"⚠️ T-Invest API недоступен: {esc(e)}"
     if inst is None:
-        return f"❌ <b>{esc(t)}</b> — не найден в T-Invest"
+        return f"❌ <b>{esc(t)}</b> — нет такого тикера на TQBR (Т-Банк)"
     info = await moex.get_security_info(sess, t)
     dec = info.decimals if info else 2
     ob = await tk.order_book(inst, depth=20)
@@ -330,9 +333,12 @@ async def _book_text(sess, tk: tinkoff.TinkoffClient, t: str) -> str:
 
 
 async def _tape_text(sess, tk: tinkoff.TinkoffClient, t: str) -> str:
-    inst = await tk.instrument(t)
+    try:
+        inst = await tk.instrument(t)
+    except Exception as e:
+        return f"⚠️ T-Invest API недоступен: {esc(e)}"
     if inst is None:
-        return f"❌ <b>{esc(t)}</b> — не найден в T-Invest"
+        return f"❌ <b>{esc(t)}</b> — нет такого тикера на TQBR (Т-Банк)"
     info = await moex.get_security_info(sess, t)
     dec = info.decimals if info else 2
     trades = await tk.last_trades(inst, minutes=15)
@@ -355,7 +361,11 @@ async def cmd_book(m: Message, sess: aiohttp.ClientSession, tk: tinkoff.TinkoffC
     if not args:
         await m.answer("Использование: /book SBER"); return
     t = args[0].upper()
-    await m.answer(await _book_text(sess, tk, t), reply_markup=book_kb(t))
+    try:
+        text = await _book_text(sess, tk, t)
+    except Exception as e:
+        log.exception("book %s", t); text = f"⚠️ Не удалось получить стакан {t}: {esc(e)}"
+    await m.answer(text, reply_markup=book_kb(t))
 
 
 @router.message(Command("tape"))
@@ -366,7 +376,11 @@ async def cmd_tape(m: Message, sess: aiohttp.ClientSession, tk: tinkoff.TinkoffC
     if not args:
         await m.answer("Использование: /tape SBER"); return
     t = args[0].upper()
-    await m.answer(await _tape_text(sess, tk, t), reply_markup=tape_kb(t))
+    try:
+        text = await _tape_text(sess, tk, t)
+    except Exception as e:
+        log.exception("tape %s", t); text = f"⚠️ Не удалось получить ленту {t}: {esc(e)}"
+    await m.answer(text, reply_markup=tape_kb(t))
 
 
 @router.message(Command("flow"))

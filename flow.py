@@ -86,7 +86,11 @@ class FlowMonitor:
             self._sent = {k: v for k, v in self._sent.items() if now - v < 3600}
 
     async def _analyze(self, sess, t: str) -> list[tape.Signal]:
-        inst = await self.tk.instrument(t)
+        try:
+            inst = await self.tk.instrument(t)
+        except Exception as e:
+            log.warning("flow: T-Invest недоступен (%s): %s", t, e)
+            return []
         if inst is None:
             return []
         dec = await self._decimals(sess, t)
