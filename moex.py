@@ -223,3 +223,40 @@ async def fetch_quotes(session: aiohttp.ClientSession,
 
     await asyncio.gather(*(one(t) for t in infos))
     return out
+
+
+# ------------------------------------------------------------ индекс IMOEX
+
+async def index_candles(session: aiohttp.ClientSession, minutes: int = 60,
+                        index: str = "IMOEX") -> list[list[Any]]:
+    """Минутные свечи индекса: [open, close, high, low, value, volume, begin, end]."""
+    frm = now_msk() - timedelta(minutes=minutes + 20)
+    data = await _get(
+        session,
+        f"/engines/stock/markets/index/boards/SNDX/securities/{index}/candles.json",
+        {"interval": 1, "from": frm.strftime("%Y-%m-%d %H:%M:%S")})
+    _, rows = _rows(data)
+    return rows
+
+
+async def index_changes(session: aiohttp.ClientSession) -> dict[str, Optional[float]]:
+    """Изменение IMOEX: {'15m': %, 'day': % к вчерашнему закрытию}. Значения None при ошибке."""
+    out: dict[str, Optional[float]] = {"15m": None, "day": None}
+    try:
+        rows = await index_candles(session, 60)
+        if rows:
+            last = float(rows[-1][1])
+            end = rows[-1][7]
+            ago = [r for r in rows if r[7] <= (datetime.strptime(end, "%Y-%m-%d %H:%M:%S")
+                                               - timedelta(minutes=15)).strftime("%Y-%m-%d %H:%M:%S")]
+            if ago:
+                base = float(ago[-1][1])
+                out["15m"] = (last - base) / base * 100 if base else None
+        data = await _get(session, "/engines/stock/markets/index/boards/SNDX/securities/IMOEX.json",
+                          {"iss.only": "marketdata", "marketdata.columns": "LASTCHANGEPRC"})
+        _, md = _rows(data)
+        if md and md[0][0] is not None:
+            out["day"] = float(md[0][0])
+    except Exception as e:
+        log.debug("IMOEX: %s", e)
+    return out

@@ -16,11 +16,12 @@ from typing import Optional
 KIND_EMOJI = {
     "iceberg": "🧊", "rhythm": "🤖", "imbalance": "⚖️", "burst": "🔥",
     "wall": "🧱", "spoof": "👻", "whale": "🐋", "eaten": "🍽",
+    "level": "📏", "volume": "📊",
 }
 KIND_NAME = {
     "iceberg": "айсберг", "rhythm": "ритм", "imbalance": "перекос",
     "burst": "всплеск", "wall": "плотность", "spoof": "спуфинг",
-    "whale": "кит", "eaten": "стену съели",
+    "whale": "кит", "eaten": "стену съели", "level": "уровень", "volume": "объём",
 }
 # ожидаемое направление сигнала: +1 — рост, -1 — падение, 0 — неизвестно
 CHECKPOINTS = (5, 15)  # минуты
@@ -39,6 +40,7 @@ class Entry:
     text: str = ""                              # исходный текст (HTML)
     results: dict = field(default_factory=dict)  # "5": +0.42, "15": -0.1
     done: bool = False
+    ctx: dict = field(default_factory=dict)      # контекст: vwap (+1/-1), hour, delta15 (+1/0/-1), rs
 
 
 class Journal:
@@ -107,4 +109,52 @@ class Journal:
         lines.append("</pre>")
         lines.append("<i>15м ср. — среднее изменение цены через 15 мин после сигнала; "
                      "попад. — доля случаев, когда цена пошла в сторону сигнала на ≥0,2%.</i>")
+        ctx = self._ctx_stats(es)
+        if ctx:
+            lines.append("")
+            lines.append(ctx)
         return "\n".join(lines)
+
+    def _ctx_stats(self, es: list[Entry]) -> str:
+        """В каких условиях сигналы работают: по VWAP, времени дня, дельте, силе к рынку."""
+        directed = [e for e in es if "15" in e.results and e.direction and e.ctx]
+        if len(directed) < 8:
+            return ""
+
+        def _grp(key: str, labeler) -> list[tuple[str, int, float, float]]:
+            by: dict[str, list[Entry]] = {}
+            for e in directed:
+                v = e.ctx.get(key)
+                if v is None:
+                    continue
+                by.setdefault(labeler(e, v), []).append(e)
+            rows = []
+            for lab, grp in by.items():
+                if len(grp) < 4:
+                    continue
+                hits = sum(1 for e in grp if e.results["15"] * e.direction >= 0.2)
+                avg = sum(e.results["15"] * e.direction for e in grp) / len(grp)
+                rows.append((lab, len(grp), hits / len(grp) * 100, avg))
+            return sorted(rows, key=lambda r: -r[2])
+
+        def _hour(e, v):
+            return "утро 07–10" if v < 10 else "10–13" if v < 13 else "13–16" if v < 16 else "16–19" if v < 19 else "вечер 19+"
+
+        sections = [
+            ("По VWAP", _grp("vwap", lambda e, v: ("сигнал по тренду VWAP" if v * e.direction > 0 else "сигнал против VWAP"))),
+            ("По дельте 15м", _grp("delta15", lambda e, v: ("дельта согласна" if v * e.direction > 0 else "дельта против" if v * e.direction < 0 else "дельта нейтральна"))),
+            ("По силе к рынку", _grp("rs", lambda e, v: ("сильнее рынка" if v > 0 else "слабее рынка" if v < 0 else "с рынком"))),
+            ("По времени дня", _grp("hour", _hour)),
+        ]
+        out = ["<b>В каких условиях сигналы работали</b>", "<pre>"]
+        any_rows = False
+        for title, rows in sections:
+            if not rows:
+                continue
+            any_rows = True
+            out.append(title)
+            for lab, n, hit, avg in rows:
+                out.append(f"  {lab:<24} n={n:<3} {hit:>3.0f}%  {avg:+.2f}%")
+        out.append("</pre>")
+        out.append("<i>% — попадания; последняя колонка — средний ход в сторону сигнала через 15 мин.</i>")
+        return "\n".join(out) if any_rows else ""

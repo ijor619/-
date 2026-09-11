@@ -154,7 +154,8 @@ class Overlay:
     vwap: float = 0.0
     walls: list = None            # [(price, qty_lots, side)] — плотности стакана
     delta: list = None            # кумулятивная дельта по свечам (лоты), len == len(cs)
-    realtime: bool = False        # свечи из T-Invest (без задержки)
+    realtime: bool = False
+    vol_levels: list = None       # [(price, vol_lots, buy_pct, held_tests)] — уровни по объёму        # свечи из T-Invest (без задержки)
 
 
 def render(info: SecurityInfo, p: Period, cs: list[Candle],
@@ -208,6 +209,15 @@ def render(info: SecurityInfo, p: Period, cs: list[Candle],
             ax.axhline(ov.vwap, color="#7c3aed", linewidth=0.9, linestyle="-.", alpha=0.8)
             ax.annotate(f"VWAP {fmt_price(ov.vwap, info.decimals)}", xy=(0, ov.vwap),
                         xytext=(3, 3), textcoords="offset points", fontsize=7, color="#6d28d9")
+        for price, vol, bp, held in (ov.vol_levels or []):
+            if _in_view(price):
+                col = UP if bp >= 55 else DOWN if bp <= 45 else "#6b7280"
+                ax.axhline(price, color=col, linewidth=1.0, alpha=0.55)
+                ax.annotate(f"уровень {fmt_price(price, info.decimals)} · {vol / 1000:.0f}k лот"
+                            + (f" · {held}✓" if held else ""),
+                            xy=(n * 0.5, price), xytext=(0, 2), textcoords="offset points",
+                            fontsize=6.5, color=col, ha="center",
+                            bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.7))
         for price, qty, side in (ov.walls or []):
             if _in_view(price):
                 c = UP if side == "B" else DOWN
@@ -334,7 +344,7 @@ async def _tinvest_candles(tk, inst, p: Period) -> tuple[list[Candle], list[Cand
 
 
 async def build_chart(sess: aiohttp.ClientSession, info: SecurityInfo,
-                      period: str, tk=None) -> Optional[bytes]:
+                      period: str, tk=None, vol_levels=None) -> Optional[bytes]:
     """PNG свечного графика или None, если данных нет.
 
     Свечи берутся из T-Invest (реальное время), если есть токен; иначе —
@@ -363,6 +373,8 @@ async def build_chart(sess: aiohttp.ClientSession, info: SecurityInfo,
         if p.base != 24:
             mins = base if p.base == 1 else await fetch_candles(sess, info, 1, timedelta(days=2))
     ov = Overlay(realtime=realtime)
+    if vol_levels and p.base != 24:
+        ov.vol_levels = vol_levels
     if p.base != 24 and mins:
         ov.day_high, ov.day_low, ov.vwap = day_levels(mins)
     if tk is not None and inst is not None and p.base != 24:

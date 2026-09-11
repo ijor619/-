@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from datetime import datetime, timedelta
 import re
 import sys
 
@@ -25,12 +26,13 @@ from aiogram.types import (BufferedInputFile, CallbackQuery, InputMediaPhoto,
 import charts
 import clusters as clu
 import moex
+import setup as stp
 import tape
 import tinkoff
 from flow import FlowMonitor
 from journal import Journal
 from news import NewsMonitor, NEWS_CHANNEL
-from keyboards import book_kb, chart_kb, cluster_kb, report_kb, tape_kb
+from keyboards import book_kb, chart_kb, cluster_kb, report_kb, setup_kb, tape_kb
 from config import (BOT_TOKEN, CHECK_INTERVAL_SEC, DATA_FILE,
                     DEFAULT_REPORT_MIN, DEFAULT_THRESHOLD_PCT)
 from formatting import cur_symbol, esc, fmt_pct, fmt_price
@@ -59,7 +61,8 @@ HELP = (
     "/backtest TICKER — прогнать детекторы по ленте за час\n"
     "/news — статус парсера новостей и последние релевантные\n"
     "/quiethours 23 9 — тихие часы (МСК), off — выключить\n"
-    "/clusters SBER [5m|15m|30m|1h|4h|1d] — кластеры: объём по ценам и времени, перевес покупок/продаж\n\n"
+    "/clusters SBER [5m|15m|30m|1h|4h|1d] — кластеры: объём по ценам и времени, перевес покупок/продаж\n"
+    "/setup SBER — сетап: уровни по объёму и их тесты, дельта, VWAP, стакан, сила к рынку, итог за/против\n\n"
     "Просто напиши тикер сообщением — добавлю в список.\n"
     "Цены — из официального ISS API Мосбиржи, обновление каждую минуту."
 )
@@ -145,7 +148,7 @@ _chart_msg: dict[int, int] = {}
 async def show_chart(bot: Bot, chat_id: int, sess: aiohttp.ClientSession,
                      store: Store, t: str, period: str,
                      current: Message | None = None, tk=None,
-                     reply_to: int | None = None) -> str | None:
+                     reply_to: int | None = None, flow: "FlowMonitor | None" = None) -> str | None:
     """Показать график, не плодя сообщений.
 
     Если `current` — уже сообщение с графиком, картинка заменяется на месте.
@@ -157,8 +160,16 @@ async def show_chart(bot: Bot, chat_id: int, sess: aiohttp.ClientSession,
     info = await moex.get_security_info(sess, t)
     if info is None:
         return f"❌ <b>{esc(t)}</b> — не найден на Мосбирже"
+    vol_levels = None
+    if flow is not None and tinkoff.enabled():
+        try:
+            price = flow._last_price.get(t) or info.prev_close
+            vol_levels = [(l.price, l.vol, l.buy_pct, sum(1 for x in l.tests if x.held is True))
+                          for l in flow.levels(t, price, info.decimals)]
+        except Exception:
+            log.exception("chart levels %s", t)
     png = await charts.build_chart(sess, info, period,
-                                   tk if tinkoff.enabled() else None)
+                                   tk if tinkoff.enabled() else None, vol_levels=vol_levels)
     if png is None:
         return f"Нет данных для графика {esc(t)}."
     file = BufferedInputFile(png, f"{t}_{period}.png")
@@ -250,7 +261,7 @@ async def cmd_list(m: Message, store: Store, sess: aiohttp.ClientSession,
 
 @router.message(Command("chart"))
 async def cmd_chart(m: Message, store: Store, sess: aiohttp.ClientSession,
-                    tk: tinkoff.TinkoffClient) -> None:
+                    tk: tinkoff.TinkoffClient, flow: FlowMonitor) -> None:
     args = (m.text or "").split()[1:]
     if not args:
         await m.answer("Использование: /chart SBER [1m|5m|15m|30m|1h|4h|1d]")
@@ -261,7 +272,7 @@ async def cmd_chart(m: Message, store: Store, sess: aiohttp.ClientSession,
         await m.answer("Не похоже на тикер.")
         return
     try:
-        err = await show_chart(m.bot, m.chat.id, sess, store, t, period, tk=tk)
+        err = await show_chart(m.bot, m.chat.id, sess, store, t, period, tk=tk, flow=flow)
     except Exception as e:
         log.exception("chart %s", t)
         err = f"⚠️ Не удалось построить график {esc(t)}:\n<code>{esc(e)}</code>"
@@ -519,6 +530,96 @@ async def cb_clusters(c: CallbackQuery, sess: aiohttp.ClientSession,
             pass
 
 
+# ---------------------------------------------------------------- сетап
+
+async def _setup_text(sess, tk: tinkoff.TinkoffClient, cstore: clu.ClusterStore,
+                      flow: FlowMonitor, t: str) -> str:
+    try:
+        inst = await tk.instrument(t)
+    except Exception as e:
+        return f"⚠️ T-Invest API недоступен: {esc(e)}"
+    if inst is None:
+        return f"❌ <b>{esc(t)}</b> — нет такого тикера на TQBR (Т-Банк)"
+    info = await moex.get_security_info(sess, t)
+    dec = info.decimals if info else 2
+    name = info.name if info else inst.name
+    trades, ob, ds, im = await asyncio.gather(
+        tk.last_trades(inst, minutes=60), tk.order_book(inst, depth=20),
+        flow._daystats(sess, t), flow.imoex(sess), return_exceptions=True)
+    if isinstance(trades, list):
+        cstore.ingest(t, trades)
+    if isinstance(ob, BaseException):
+        ob = None
+    price = (trades[-1].price if isinstance(trades, list) and trades
+             else ob.last if ob else flow._last_price.get(t, 0.0))
+    if not price:
+        return f"По {esc(t)} сейчас нет сделок — сетап считать не по чему."
+    cells = cstore.window(t, stp.LEVEL_LOOKBACK_MIN)
+    if not cells:
+        return (f"🎯 <b>{esc(t)}</b> — в базе пока нет ленты. Добавь бумагу в список "
+                f"(/watch {esc(t)}), через несколько минут появятся данные.")
+    ch15 = flow.price_change(t, 15)
+    day_chg = (price - info.prev_close) / info.prev_close * 100 if info and info.prev_close else None
+    im = im if isinstance(im, dict) else {}
+    rs15 = stp.rel_strength(ch15, im.get("15m"), "15 мин")
+    rsd = stp.rel_strength(day_chg, im.get("day"), "день")
+    hi, lo, vwap = (ds.high, ds.low, ds.vwap) if not isinstance(ds, BaseException) else (0, 0, 0)
+    s = await asyncio.to_thread(
+        stp.build_setup, t, price, info.prev_close if info else 0.0, hi, lo, vwap, ob,
+        cells, dec, inst.lot, flow.recent_signals(t), rs15, rsd)
+    cov = cstore.coverage(t)
+    text = stp.setup_text(s, name, dec)
+    if cov and (datetime.now() - cov) < timedelta(hours=6):
+        text += f"\n<i>История ленты копится с {cov:%d.%m %H:%M} МСК — уровни и тесты пока неполные.</i>"
+    return text
+
+
+@router.message(Command("setup"))
+async def cmd_setup(m: Message, store: Store, sess: aiohttp.ClientSession,
+                    tk: tinkoff.TinkoffClient, cstore: clu.ClusterStore, flow: FlowMonitor) -> None:
+    if not tinkoff.enabled():
+        await m.answer(NO_TK); return
+    args = (m.text or "").split()[1:]
+    if not args:
+        wl = store.get(m.from_user.id).watchlist
+        if len(wl) == 1:
+            args = [wl[0]]
+        else:
+            await m.answer("Использование: /setup SBER" + (f"\nТвой список: {', '.join(wl)}" if wl else ""))
+            return
+    t = args[0].upper()
+    wait = await m.answer("Собираю сетап…")
+    try:
+        text = await _setup_text(sess, tk, cstore, flow, t)
+    except Exception as e:
+        log.exception("setup %s", t); text = f"⚠️ Не удалось собрать сетап {esc(t)}: <code>{esc(e)}</code>"
+    try:
+        await wait.edit_text(text, reply_markup=setup_kb(t))
+    except TelegramBadRequest:
+        await m.answer(text, reply_markup=setup_kb(t))
+
+
+@router.callback_query(F.data.startswith("setup:"))
+async def cb_setup(c: CallbackQuery, sess: aiohttp.ClientSession, tk: tinkoff.TinkoffClient,
+                   cstore: clu.ClusterStore, flow: FlowMonitor) -> None:
+    parts = c.data.split(":")
+    t = parts[1]
+    await c.answer("Собираю сетап…")
+    if not tinkoff.enabled():
+        await c.bot.send_message(c.from_user.id, NO_TK); return
+    try:
+        text = await _setup_text(sess, tk, cstore, flow, t)
+    except Exception as e:
+        log.exception("setup %s", t); text = f"⚠️ Не удалось собрать сетап {esc(t)}: <code>{esc(e)}</code>"
+    if len(parts) > 2 and parts[2] == "r" and c.message and not c.message.photo:
+        try:
+            await c.message.edit_text(text, reply_markup=setup_kb(t)); return
+        except TelegramBadRequest as e:
+            if "not modified" in str(e): return
+    chat_id, reply_to = _reply_ctx(c)
+    await c.bot.send_message(chat_id, text, reply_markup=setup_kb(t), reply_to_message_id=reply_to)
+
+
 @router.message(Command("flow"))
 async def cmd_flow(m: Message, store: Store) -> None:
     args = (m.text or "").split()[1:]
@@ -724,7 +825,7 @@ def _reply_ctx(c: CallbackQuery) -> tuple[int, int | None]:
 
 @router.callback_query(F.data.startswith("chart:"))
 async def cb_chart(c: CallbackQuery, store: Store, sess: aiohttp.ClientSession,
-                   tk: tinkoff.TinkoffClient) -> None:
+                   tk: tinkoff.TinkoffClient, flow: FlowMonitor) -> None:
     parts = c.data.split(":")
     t, period = parts[1], (parts[2] if len(parts) > 2 else charts.DEFAULT_PERIOD)
     if c.message and c.message.photo:
@@ -736,7 +837,7 @@ async def cb_chart(c: CallbackQuery, store: Store, sess: aiohttp.ClientSession,
     await c.answer("Строю график…")
     try:
         err = await show_chart(c.bot, chat_id, sess, store, t, period,
-                               current=current, tk=tk, reply_to=reply_to)
+                               current=current, tk=tk, reply_to=reply_to, flow=flow)
     except Exception as e:
         log.exception("график %s", t)
         err = f"⚠️ Не удалось построить график {esc(t)}:\n<code>{esc(e)}</code>"
@@ -872,7 +973,7 @@ def main() -> None:
         health_task = asyncio.create_task(health_check(bot))
         try:
             await dp.start_polling(bot, store=store, sess=session, tk=tk,
-                                   journal=journal, newsmon=newsmon, cstore=cstore)
+                                   journal=journal, newsmon=newsmon, cstore=cstore, flow=flow)
         finally:
             cstore.save(force=True)
             monitor_task.cancel()
