@@ -165,6 +165,28 @@ class OrderBook:
     last: float
 
 
+@dataclass
+class TCandle:
+    begin: datetime   # MSK, naive (как у MOEX-свечей)
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float     # в лотах
+    complete: bool
+
+
+INTERVALS = {1: "CANDLE_INTERVAL_1_MIN", 5: "CANDLE_INTERVAL_5_MIN",
+             15: "CANDLE_INTERVAL_15_MIN", 30: "CANDLE_INTERVAL_30_MIN",
+             60: "CANDLE_INTERVAL_HOUR", 240: "CANDLE_INTERVAL_4_HOUR",
+             1440: "CANDLE_INTERVAL_DAY"}
+# максимальный период одного запроса по документации T-Invest
+_MAX_SPAN = {1: timedelta(days=1), 5: timedelta(days=7), 15: timedelta(days=21),
+             30: timedelta(days=21), 60: timedelta(days=90), 240: timedelta(days=90),
+             1440: timedelta(days=365 * 6)}
+_MSK = timezone(timedelta(hours=3))
+
+
 class TinkoffClient:
     def __init__(self) -> None:
         self._sess: Optional[aiohttp.ClientSession] = None
@@ -233,6 +255,54 @@ class TinkoffClient:
         if not bids and not asks:
             return None
         return OrderBook(datetime.now(timezone.utc), bids, asks, q2f(d.get("lastPrice")))
+
+    async def candles(self, inst: Instrument, minutes: int,
+                      depth: timedelta) -> list[TCandle]:
+        """Свечи в реальном времени (последняя — незавершённая)."""
+        interval = INTERVALS[minutes]
+        now = datetime.now(timezone.utc)
+        span = _MAX_SPAN[minutes]
+        # бьём на окна, если глубина больше допустимого периода запроса
+        windows = []
+        start = now - depth
+        while start < now:
+            end = min(start + span, now)
+            windows.append((start, end))
+            start = end
+        results = await asyncio.gather(*(self._call("MarketDataService/GetCandles", {
+            "instrumentId": inst.uid, "interval": interval,
+            "from": a.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "to": b.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "candleSourceType": "CANDLE_SOURCE_UNSPECIFIED", "limit": 2400,
+        }) for a, b in windows), return_exceptions=True)
+        seen: dict[str, TCandle] = {}
+        for r in results:
+            if isinstance(r, BaseException):
+                log.warning("T-Invest: свечи %s: %s", inst.ticker, r)
+                continue
+            for c in r.get("candles", []):
+                ts = datetime.fromisoformat(c["time"].replace("Z", "+00:00"))
+                begin = ts.astimezone(_MSK).replace(tzinfo=None)
+                seen[c["time"]] = TCandle(
+                    begin, q2f(c["open"]), q2f(c["high"]), q2f(c["low"]),
+                    q2f(c["close"]), float(c.get("volume") or 0),
+                    bool(c.get("isComplete", True)))
+        return [seen[k] for k in sorted(seen)]
+
+    async def last_prices(self, insts: list[Instrument]) -> dict[str, tuple[float, datetime]]:
+        """Последние цены: тикер -> (цена, время UTC)."""
+        if not insts:
+            return {}
+        d = await self._call("MarketDataService/GetLastPrices",
+                             {"instrumentId": [i.uid for i in insts]})
+        by_uid = {i.uid: i.ticker for i in insts}
+        out = {}
+        for p in d.get("lastPrices", []):
+            t = by_uid.get(p.get("instrumentUid"))
+            if t and p.get("price"):
+                ts = datetime.fromisoformat(p["time"].replace("Z", "+00:00"))
+                out[t] = (q2f(p["price"]), ts)
+        return out
 
     async def last_trades(self, inst: Instrument, minutes: int = 10) -> list[Trade]:
         now = datetime.now(timezone.utc)

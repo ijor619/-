@@ -154,6 +154,7 @@ class Overlay:
     vwap: float = 0.0
     walls: list = None            # [(price, qty_lots, side)] — плотности стакана
     delta: list = None            # кумулятивная дельта по свечам (лоты), len == len(cs)
+    realtime: bool = False        # свечи из T-Invest (без задержки)
 
 
 def render(info: SecurityInfo, p: Period, cs: list[Candle],
@@ -262,7 +263,8 @@ def render(info: SecurityInfo, p: Period, cs: list[Candle],
         for s in ("top", "right"):
             a.spines[s].set_visible(False)
         a.set_facecolor("white")
-    fig.text(0.99, 0.01, f"MOEX ISS · {now_msk():%d.%m %H:%M} МСК",
+    src = "T-Invest · реальное время" if ov.realtime else "MOEX ISS · задержка 15 мин"
+    fig.text(0.99, 0.01, f"{src} · {now_msk():%d.%m %H:%M} МСК",
              ha="right", fontsize=7, color="#9ca3af")
     fig.subplots_adjust(left=0.09, right=0.97, top=0.92, bottom=0.09)
 
@@ -313,26 +315,59 @@ def delta_series(cs: list[Candle], trades, minutes: int) -> Optional[list[float]
     return out
 
 
+async def _tinvest_candles(tk, inst, p: Period) -> tuple[list[Candle], list[Candle]]:
+    """(свечи периода, минутные свечи дня) из T-Invest — реальное время."""
+    minutes = 1440 if p.base == 24 else p.base * p.agg
+    depth = p.depth if p.base != 24 else timedelta(days=150)
+    if minutes == 1:
+        depth = timedelta(hours=8)   # 120 минутных свечей — хватит 1 торгового дня
+    tcs = await tk.candles(inst, minutes, depth)
+    cs = [Candle(c.begin, c.open, c.high, c.low, c.close, c.volume * inst.lot) for c in tcs]
+    mins: list[Candle] = []
+    if p.base != 24:
+        if minutes == 1:
+            mins = cs
+        else:
+            tm = await tk.candles(inst, 1, timedelta(hours=18))
+            mins = [Candle(c.begin, c.open, c.high, c.low, c.close, c.volume * inst.lot) for c in tm]
+    return cs, mins
+
+
 async def build_chart(sess: aiohttp.ClientSession, info: SecurityInfo,
                       period: str, tk=None) -> Optional[bytes]:
     """PNG свечного графика или None, если данных нет.
 
-    tk — TinkoffClient (опционально): добавляет стены стакана и дельту.
+    Свечи берутся из T-Invest (реальное время), если есть токен; иначе —
+    из MOEX ISS (задержка 15 минут). tk добавляет стены стакана и дельту.
     """
     p = PERIODS.get(period) or PERIODS[DEFAULT_PERIOD]
-    base = await fetch_candles(sess, info, p.base, p.depth)
-    cs = aggregate(base, p.base, p.agg)[-p.bars:]
-    if len(cs) < 2:
-        return None
-    ov = Overlay()
-    if p.base != 24:
-        # уровни дня считаем по минутным свечам (для 1м/5м/15м они уже есть)
-        mins = base if p.base == 1 else await fetch_candles(sess, info, 1, timedelta(days=2))
-        ov.day_high, ov.day_low, ov.vwap = day_levels(mins)
-    if tk is not None and p.base != 24:
+    inst = None
+    cs: list[Candle] = []
+    mins: list[Candle] = []
+    realtime = False
+    if tk is not None:
         try:
             inst = await tk.instrument(info.ticker)
             if inst is not None:
+                cs, mins = await _tinvest_candles(tk, inst, p)
+                cs = cs[-p.bars:]
+                realtime = len(cs) >= 2
+        except Exception as e:
+            log.warning("chart: T-Invest свечи %s: %s — беру MOEX", info.ticker, e)
+            cs = []
+    if len(cs) < 2:
+        base = await fetch_candles(sess, info, p.base, p.depth)
+        cs = aggregate(base, p.base, p.agg)[-p.bars:]
+        if len(cs) < 2:
+            return None
+        if p.base != 24:
+            mins = base if p.base == 1 else await fetch_candles(sess, info, 1, timedelta(days=2))
+    ov = Overlay(realtime=realtime)
+    if p.base != 24 and mins:
+        ov.day_high, ov.day_low, ov.vwap = day_levels(mins)
+    if tk is not None and inst is not None and p.base != 24:
+        try:
+            if True:
                 ob, trades = await asyncio.gather(
                     tk.order_book(inst, depth=20), tk.last_trades(inst, minutes=60),
                     return_exceptions=True)

@@ -107,18 +107,22 @@ async def _watch(m: Message, store: Store, sess: aiohttp.ClientSession,
     return "\n".join(lines)
 
 
-async def _list(m, store: Store, sess: aiohttp.ClientSession) -> str:
+async def _list(m, store: Store, sess: aiohttp.ClientSession, tk=None) -> str:
     prof = store.get(m.from_user.id)
     if not prof.watchlist:
         return "Список пуст. Добавь: /watch SBER GAZP"
     lines = [f"📋 <b>Твои акции</b> · {moex.now_msk().strftime('%d.%m %H:%M')} МСК"]
+    infos = {}
     for t in prof.watchlist:
         try:
             info = await moex.get_security_info(sess, t)
-            q = await moex.get_quote(sess, info) if info else None
         except Exception:
-            log.exception("не удалось получить данные %s", t)
-            q = None
+            info = None
+        if info:
+            infos[t] = info
+    quotes = await moex.fetch_quotes(sess, infos, {}, tk if tinkoff.enabled() else None)
+    for t in prof.watchlist:
+        q = quotes.get(t)
         if q is None:
             lines.append(f"⚪ <b>{esc(t)}</b> — нет данных")
         else:
@@ -235,9 +239,10 @@ async def cmd_unwatch(m: Message, store: Store) -> None:
 
 
 @router.message(Command("list"))
-async def cmd_list(m: Message, store: Store, sess: aiohttp.ClientSession) -> None:
+async def cmd_list(m: Message, store: Store, sess: aiohttp.ClientSession,
+                   tk: tinkoff.TinkoffClient) -> None:
     prof = store.get(m.from_user.id)
-    await m.answer(await _list(m, store, sess),
+    await m.answer(await _list(m, store, sess, tk),
                    reply_markup=report_kb(prof.watchlist) if prof.watchlist else None)
 
 
@@ -633,10 +638,11 @@ async def cb_chart(c: CallbackQuery, store: Store, sess: aiohttp.ClientSession,
 
 
 @router.callback_query(F.data == "refresh")
-async def cb_refresh(c: CallbackQuery, store: Store, sess: aiohttp.ClientSession) -> None:
+async def cb_refresh(c: CallbackQuery, store: Store, sess: aiohttp.ClientSession,
+                     tk: tinkoff.TinkoffClient) -> None:
     await c.answer("Обновляю…")
     prof = store.get(c.from_user.id)
-    text = await _list(c, store, sess)
+    text = await _list(c, store, sess, tk)
     try:
         await c.message.edit_text(text, reply_markup=report_kb(prof.watchlist))
     except TelegramBadRequest as e:
@@ -736,8 +742,8 @@ def main() -> None:
     dp = Dispatcher()
     dp.include_router(router)
     store = Store(DATA_FILE)
-    monitor = Monitor(bot, store)
     tk = tinkoff.TinkoffClient()
+    monitor = Monitor(bot, store, tk if tinkoff.enabled() else None)
     journal = Journal(os.path.join(os.path.dirname(DATA_FILE) or ".", "signals.json"))
     flow = FlowMonitor(bot, store, tk, journal)
     newsmon = NewsMonitor(bot, store,

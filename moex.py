@@ -178,9 +178,37 @@ async def get_quote(session: aiohttp.ClientSession, info: SecurityInfo,
 
 async def fetch_quotes(session: aiohttp.ClientSession,
                        infos: dict[str, SecurityInfo],
-                       hints: dict[str, datetime]) -> dict[str, Quote]:
-    """Параллельно скачать котировки для всех тикеров."""
+                       hints: dict[str, datetime],
+                       tk=None) -> dict[str, Quote]:
+    """Параллельно скачать котировки для всех тикеров.
+
+    Если передан TinkoffClient — цены берутся из T-Invest в реальном времени
+    (одним запросом на все бумаги), MOEX остаётся резервом для тех, по кому
+    T-Invest ничего не вернул. Без токена — MOEX ISS (задержка 15 мин).
+    """
     out: dict[str, Quote] = {}
+    if tk is not None:
+        try:
+            insts = []
+            for t in infos:
+                inst = await tk.instrument(t)
+                if inst is not None:
+                    insts.append(inst)
+            prices = await tk.last_prices(insts)
+            for t, (price, ts) in prices.items():
+                info = infos[t]
+                as_of = ts.astimezone(MSK).replace(tzinfo=None)
+                change = ((price - info.prev_close) / info.prev_close * 100.0
+                          if info.prev_close > 0 else 0.0)
+                trading = (now_msk() - as_of) < timedelta(minutes=FRESHNESS_MIN)
+                out[t] = Quote(info=info, price=price, as_of=as_of,
+                               change_pct=change, trading=trading)
+                hints[t] = as_of
+        except Exception as e:
+            log.warning("T-Invest last prices: %s — беру MOEX", e)
+    infos = {t: i for t, i in infos.items() if t not in out}
+    if not infos:
+        return out
 
     async def one(t: str) -> None:
         info = infos[t]

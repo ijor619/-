@@ -23,9 +23,10 @@ log = logging.getLogger(__name__)
 
 
 class Monitor:
-    def __init__(self, bot: Bot, store: Store) -> None:
+    def __init__(self, bot: Bot, store: Store, tk=None) -> None:
         self.bot = bot
         self.store = store
+        self.tk = tk
         self._hints: Dict[str, datetime] = {}                    # тикер -> конец последней свечи
         self._sec_cache: Dict[str, tuple[float, Optional[SecurityInfo]]] = {}
         self._last_alert: Dict[tuple[int, str], float] = {}      # (user, тикер) -> unix-время
@@ -53,7 +54,7 @@ class Monitor:
 
         infos = await self._load_infos(session, tickers)
         known = {t: i for t, i in infos.items() if i is not None}
-        quotes = await moex.fetch_quotes(session, known, self._hints)
+        quotes = await moex.fetch_quotes(session, known, self._hints, self.tk)
         now_ts = time.time()
 
         hour = now_msk().hour
