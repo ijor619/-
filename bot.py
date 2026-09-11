@@ -20,11 +20,13 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
-from aiogram.types import (BufferedInputFile, CallbackQuery, InputMediaPhoto,
-                           Message)
+from aiogram.types import (BotCommand, BotCommandScopeDefault, BufferedInputFile,
+                           CallbackQuery, InputMediaPhoto, KeyboardButton, Message,
+                           ReplyKeyboardMarkup)
 
 import charts
 import clusters as clu
+import cscalp
 import moex
 import setup as stp
 import tape
@@ -62,6 +64,7 @@ HELP = (
     "/news — статус парсера новостей и последние релевантные\n"
     "/quiethours 23 9 — тихие часы (МСК), off — выключить\n"
     "/clusters SBER [5m|15m|30m|1h|4h|1d] — кластеры: объём по ценам и времени, перевес покупок/продаж\n"
+    "/cscalp SBER — открыть бумагу в CScalp на вашем ПК (нужен мостик, см. README)\n"
     "/setup SBER — сетап: уровни по объёму и их тесты, дельта, VWAP, стакан, сила к рынку, итог за/против\n\n"
     "Просто напиши тикер сообщением — добавлю в список.\n"
     "Цены — из официального ISS API Мосбиржи, обновление каждую минуту."
@@ -213,13 +216,16 @@ async def cmd_start(m: Message, store: Store) -> None:
         "Привет! Я слежу за ценами акций на Мосбирже 📈\n\n"
         "Добавь тикеры: /watch SBER GAZP\n"
         "Или просто напиши тикер обычным сообщением.\n\n"
-        "Вся информация — /help"
+        "Вся информация — /help. Кнопки внизу — частые действия, "
+        "полный список команд — в кнопке «Меню» слева от поля ввода.",
+        reply_markup=main_kb(store.get(m.from_user.id).watchlist),
     )
 
 
 @router.message(Command("help"))
 async def cmd_help(m: Message, store: Store) -> None:
-    await m.answer(_help_text(store, m.from_user.id))
+    await m.answer(_help_text(store, m.from_user.id),
+                   reply_markup=main_kb(store.get(m.from_user.id).watchlist))
 
 
 @router.message(Command("watch"))
@@ -620,6 +626,40 @@ async def cb_setup(c: CallbackQuery, sess: aiohttp.ClientSession, tk: tinkoff.Ti
     await c.bot.send_message(chat_id, text, reply_markup=setup_kb(t), reply_to_message_id=reply_to)
 
 
+# ---------------------------------------------------------------- CScalp
+
+def _cscalp_allowed(uid: int) -> bool:
+    return cscalp.enabled() and (not cscalp.OWNER_ID or uid == cscalp.OWNER_ID)
+
+
+@router.message(Command("cscalp"))
+async def cmd_cscalp(m: Message, csq: cscalp.CScalpQueue) -> None:
+    if not cscalp.enabled():
+        await m.answer("Мостик CScalp не настроен: задай CSCALP_KEY (и OWNER_ID) у бота, "
+                       "запусти cscalp_bridge.py на ПК с CScalp."); return
+    if not _cscalp_allowed(m.from_user.id):
+        await m.answer("Кнопка CScalp доступна только владельцу бота."); return
+    args = (m.text or "").split()[1:]
+    if not args:
+        await m.answer(f"Использование: /cscalp SBER\nСтатус: {esc(csq.status_text())}"); return
+    t = args[0].upper()
+    csq.push(t)
+    await m.answer(f"⚡ {t} → CScalp" + ("" if csq.online else f"\n⚠️ {esc(csq.status_text())}"))
+
+
+@router.callback_query(F.data.startswith("cscalp:"))
+async def cb_cscalp(c: CallbackQuery, csq: cscalp.CScalpQueue) -> None:
+    t = c.data.split(":")[1]
+    if not _cscalp_allowed(c.from_user.id):
+        await c.answer("Только для владельца бота", show_alert=True); return
+    csq.push(t)
+    if csq.online:
+        await c.answer(f"⚡ {t} → CScalp")
+    else:
+        await c.answer(f"{t} поставлен в очередь, но мостик не на связи "
+                       f"(ПК выключен или скрипт не запущен)", show_alert=True)
+
+
 @router.message(Command("flow"))
 async def cmd_flow(m: Message, store: Store) -> None:
     args = (m.text or "").split()[1:]
@@ -902,6 +942,120 @@ async def on_added(ev) -> None:
 
 # ----------------------------------------------------------------- fallback
 
+# -------------------------------------------------------------------- меню
+
+BOT_COMMANDS = [
+    ("list", "Мои бумаги и цены"),
+    ("setup", "Сетап: за/против входа — /setup SBER"),
+    ("clusters", "Кластеры объёма — /clusters SBER 1h"),
+    ("chart", "Свечной график — /chart SBER 5m"),
+    ("book", "Стакан — /book SBER"),
+    ("tape", "Лента сделок — /tape SBER"),
+    ("watch", "Добавить бумаги — /watch SBER GAZP"),
+    ("unwatch", "Убрать бумагу"),
+    ("stats", "Точность сигналов — /stats 7"),
+    ("news", "Новости: статус и последние"),
+    ("flow", "Сигналы роботов вкл/выкл — /flow on|off"),
+    ("alert", "Порог алерта, % — /alert 3"),
+    ("report", "Сводка каждые N мин — /report 60"),
+    ("quiethours", "Тихие часы — /quiethours 23 9"),
+    ("backtest", "Прогнать детекторы за час — /backtest SBER"),
+    ("cscalp", "Открыть в CScalp (мостик)"),
+    ("settings", "Мои настройки"),
+    ("help", "Справка по всем командам"),
+]
+
+
+async def setup_menu(bot: Bot) -> None:
+    """Синяя кнопка «Меню» слева от поля ввода: список команд с подсказками.
+    Задаётся через API, BotFather не нужен."""
+    try:
+        await bot.set_my_commands(
+            [BotCommand(command=c, description=d[:256]) for c, d in BOT_COMMANDS],
+            scope=BotCommandScopeDefault())
+        log.info("меню команд обновлено (%d команд)", len(BOT_COMMANDS))
+    except Exception:
+        log.exception("не удалось задать меню команд")
+
+
+def main_kb(watchlist: list[str]) -> ReplyKeyboardMarkup:
+    """Постоянная клавиатура под полем ввода: частые действия одним нажатием."""
+    rows = [[KeyboardButton(text="📋 Список"), KeyboardButton(text="🎯 Сетап"),
+             KeyboardButton(text="🧮 Кластеры")],
+            [KeyboardButton(text="📈 График"), KeyboardButton(text="📚 Стакан"),
+             KeyboardButton(text="🧾 Лента")],
+            [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="📰 Новости"),
+             KeyboardButton(text="⚙️ Настройки")]]
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True,
+                               input_field_placeholder="Тикер или команда…")
+
+
+# кнопка → команда; для команд с тикером бот спросит бумагу, если в списке их больше одной
+MENU_MAP = {
+    "📋 Список": "list", "🎯 Сетап": "setup", "🧮 Кластеры": "clusters",
+    "📈 График": "chart", "📚 Стакан": "book", "🧾 Лента": "tape",
+    "📊 Статистика": "stats", "📰 Новости": "news", "⚙️ Настройки": "settings",
+}
+NEEDS_TICKER = {"setup", "clusters", "chart", "book", "tape"}
+
+
+def ticker_pick_kb(cmd: str, tickers: list[str]):
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    rows, row = [], []
+    for t in tickers:
+        row.append(InlineKeyboardButton(text=t, callback_data=f"pick:{cmd}:{t}"))
+        if len(row) == 4:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.message(F.text.in_(MENU_MAP.keys()))
+async def menu_button(m: Message, store: Store, **kw) -> None:
+    cmd = MENU_MAP[m.text]
+    prof = store.get(m.from_user.id)
+    if cmd in NEEDS_TICKER:
+        wl = prof.watchlist
+        if not wl:
+            await m.answer("Список пуст — добавь бумаги: /watch SBER GAZP"); return
+        if len(wl) > 1:
+            await m.answer(f"Какую бумагу? (/{cmd})", reply_markup=ticker_pick_kb(cmd, wl)); return
+        m = m.model_copy(update={"text": f"/{cmd} {wl[0]}"})
+    else:
+        m = m.model_copy(update={"text": f"/{cmd}"})
+    await _dispatch(m, store=store, **kw)
+
+
+@router.callback_query(F.data.startswith("pick:"))
+async def cb_pick(c: CallbackQuery, store: Store, **kw) -> None:
+    _, cmd, t = c.data.split(":")
+    await c.answer()
+    try:
+        await c.message.delete()
+    except Exception:
+        pass
+    m = c.message.model_copy(update={"text": f"/{cmd} {t}", "from_user": c.from_user})
+    await _dispatch(m, store=store, **kw)
+
+
+async def _dispatch(m: Message, **kw) -> None:
+    """Вызвать обработчик команды напрямую (кнопка меню / выбор тикера)."""
+    handlers = {
+        "list": cmd_list, "setup": cmd_setup, "clusters": cmd_clusters, "chart": cmd_chart,
+        "book": cmd_book, "tape": cmd_tape, "stats": cmd_stats, "news": cmd_news,
+        "settings": cmd_settings,
+    }
+    cmd = m.text.split()[0].lstrip("/")
+    fn = handlers.get(cmd)
+    if fn is None:
+        return
+    import inspect
+    params = inspect.signature(fn).parameters
+    args = {k: v for k, v in kw.items() if k in params}
+    await fn(m, **args)
+
+
 @router.message()
 async def fallback(m: Message, store: Store, sess: aiohttp.ClientSession) -> None:
     """Обычный текст: если похоже на тикер — добавляем в список."""
@@ -971,11 +1125,17 @@ def main() -> None:
         flow_task = asyncio.create_task(flow.run(session))
         news_task = asyncio.create_task(newsmon.run(session))
         health_task = asyncio.create_task(health_check(bot))
+        await setup_menu(bot)
+        csq = cscalp.CScalpQueue()
+        runner = await csq.start() if cscalp.enabled() else None
         try:
             await dp.start_polling(bot, store=store, sess=session, tk=tk,
-                                   journal=journal, newsmon=newsmon, cstore=cstore, flow=flow)
+                                   journal=journal, newsmon=newsmon, cstore=cstore, flow=flow,
+                                   csq=csq)
         finally:
             cstore.save(force=True)
+            if runner is not None:
+                await runner.cleanup()
             monitor_task.cancel()
             flow_task.cancel()
             news_task.cancel()
