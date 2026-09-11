@@ -636,8 +636,23 @@ def _cscalp_allowed(uid: int) -> bool:
     return cscalp.enabled() and (not cscalp.OWNER_ID or uid == cscalp.OWNER_ID)
 
 
+async def _cscalp_send(sess, csq: cscalp.CScalpQueue, t: str) -> str:
+    """Отправить тикер мостику и вернуть короткий текст для пользователя."""
+    if cscalp.HTTP_MODE:
+        csq.push(t)
+        return f"⚡ {t} → CScalp" if csq.online else \
+            f"{t} поставлен в очередь, но мостик не на связи (ПК выключен или скрипт не запущен)"
+    cid, err = await csq.relay_push(sess, t)
+    if err:
+        return f"⚠️ {t}: {err}"
+    res = await csq.relay_wait_ack(sess, cid)
+    if res is None:
+        return f"{t} отправлен, но мостик не ответил за 6 с (ПК выключен или скрипт не запущен)"
+    return f"⚡ {t} → CScalp" if res == "ok" else f"⚠️ {t}: {res}"
+
+
 @router.message(Command("cscalp"))
-async def cmd_cscalp(m: Message, csq: cscalp.CScalpQueue) -> None:
+async def cmd_cscalp(m: Message, csq: cscalp.CScalpQueue, sess) -> None:
     if not cscalp.enabled():
         await m.answer("Мостик CScalp не настроен: задай CSCALP_KEY (и OWNER_ID) у бота, "
                        "запусти cscalp_bridge.py на ПК с CScalp."); return
@@ -647,21 +662,16 @@ async def cmd_cscalp(m: Message, csq: cscalp.CScalpQueue) -> None:
     if not args:
         await m.answer(f"Использование: /cscalp SBER\nСтатус: {esc(csq.status_text())}"); return
     t = args[0].upper()
-    csq.push(t)
-    await m.answer(f"⚡ {t} → CScalp" + ("" if csq.online else f"\n⚠️ {esc(csq.status_text())}"))
+    await m.answer(esc(await _cscalp_send(sess, csq, t)))
 
 
 @router.callback_query(F.data.startswith("cscalp:"))
-async def cb_cscalp(c: CallbackQuery, csq: cscalp.CScalpQueue) -> None:
+async def cb_cscalp(c: CallbackQuery, csq: cscalp.CScalpQueue, sess) -> None:
     t = c.data.split(":")[1]
     if not _cscalp_allowed(c.from_user.id):
         await c.answer("Только для владельца бота", show_alert=True); return
-    csq.push(t)
-    if csq.online:
-        await c.answer(f"⚡ {t} → CScalp")
-    else:
-        await c.answer(f"{t} поставлен в очередь, но мостик не на связи "
-                       f"(ПК выключен или скрипт не запущен)", show_alert=True)
+    txt = await _cscalp_send(sess, csq, t)
+    await c.answer(txt, show_alert=not txt.startswith("⚡"))
 
 
 # --------------------------------------------------------------- очистка
@@ -1175,7 +1185,7 @@ def main() -> None:
         await setup_menu(bot)
         clean_task = asyncio.create_task(cleaner.run_daily(bot, sent, store, moex.now_msk))
         csq = cscalp.CScalpQueue()
-        runner = await csq.start() if cscalp.enabled() else None
+        runner = await csq.start() if (cscalp.enabled() and cscalp.HTTP_MODE) else None
         try:
             await dp.start_polling(bot, store=store, sess=session, tk=tk,
                                    journal=journal, newsmon=newsmon, cstore=cstore, flow=flow,

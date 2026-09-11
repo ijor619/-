@@ -5,19 +5,26 @@
   POST /cscalp/ack?key=…    ← {"id", "result"}
   GET  /cscalp/status?key=… → когда мостик последний раз выходил на связь
 
-Включается переменной CSCALP_KEY (любая длинная случайная строка); порт —
-PORT (Bothost прокидывает его наружу как публичный URL приложения).
+Два транспорта:
+  * relay (по умолчанию) — публичный URL у бота не нужен: команды идут через
+    бесплатный pub/sub-релей ntfy (CSCALP_RELAY, по умолчанию https://ntfy.sh),
+    имя топика = CSCALP_KEY (длинная случайная строка = секрет);
+  * http — бот сам слушает PORT (только если у приложения есть публичный URL).
+Мостик выбирает то же самое в cscalp_bridge.ini.
 Кнопка «⚡ CScalp» показывается только владельцу (OWNER_ID), команды
 ставятся в очередь тоже только от него.
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
 import secrets
 import time
 from typing import Optional
 
+import aiohttp
 from aiohttp import web
 
 log = logging.getLogger(__name__)
@@ -25,6 +32,8 @@ log = logging.getLogger(__name__)
 CSCALP_KEY = os.getenv("CSCALP_KEY", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
 PORT = int(os.getenv("PORT", "8080"))
+RELAY = os.getenv("CSCALP_RELAY", "https://ntfy.sh").rstrip("/")
+HTTP_MODE = os.getenv("CSCALP_HTTP", "").lower() in ("1", "true", "yes")
 
 
 def enabled() -> bool:
@@ -42,6 +51,49 @@ class CScalpQueue:
         # одна свежая команда важнее очереди старых
         self.pending = [{"id": cid, "ticker": ticker.upper(), "ts": time.time()}]
         return cid
+
+    # ---------------------------------------------------------- relay (ntfy)
+    @property
+    def topic(self) -> str:
+        return "cscalp-" + CSCALP_KEY
+
+    async def relay_push(self, session, ticker: str) -> tuple[str, str]:
+        """Отправить команду через релей. Возвращает (id, текст ошибки или '')."""
+        cid = self.push(ticker)
+        body = json.dumps({"id": cid, "ticker": ticker.upper(), "ts": time.time()})
+        try:
+            async with session.post(f"{RELAY}/{self.topic}", data=body,
+                                    headers={"Title": "cscalp", "Cache": "no"},
+                                    timeout=aiohttp.ClientTimeout(total=8)) as r:
+                if r.status != 200:
+                    return cid, f"релей ответил {r.status}"
+        except Exception as e:
+            return cid, f"релей недоступен: {e.__class__.__name__}"
+        return cid, ""
+
+    async def relay_wait_ack(self, session, cid: str, timeout: float = 6.0) -> Optional[str]:
+        """Подождать подтверждение от мостика (он публикует в топик …-ack)."""
+        deadline = time.time() + timeout
+        url = f"{RELAY}/{self.topic}-ack/json"
+        while time.time() < deadline:
+            try:
+                async with session.get(url, params={"poll": "1", "since": "30s"},
+                                       timeout=aiohttp.ClientTimeout(total=8)) as r:
+                    text = await r.text()
+                for line in text.splitlines():
+                    try:
+                        msg = json.loads(line)
+                        d = json.loads(msg.get("message", "{}"))
+                    except Exception:
+                        continue
+                    if d.get("id") == cid:
+                        self.last_seen = time.time()
+                        self.last_result = (str(d.get("ticker", "")), str(d.get("result", "")), time.time())
+                        return str(d.get("result", ""))
+            except Exception as e:
+                log.debug("relay ack: %s", e)
+            await asyncio.sleep(1.0)
+        return None
 
     @property
     def online(self) -> bool:
