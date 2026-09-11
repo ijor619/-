@@ -36,18 +36,31 @@ MSK = timezone(timedelta(hours=3))
 
 # ------------------------------------------------------------ источники
 # (id, название, url, тип)  тип: rss | moex
+# (id, название, url, тип). Тип: rss | moex (ISS json).
+# Первоисточники (ЦБ, MOEX, правительство, Минфин) — лёгкие ленты, их опрашиваем
+# чаще (FAST_INTERVAL_SEC); агентства и СМИ — раз в NEWS_INTERVAL_SEC.
 SOURCES: list[tuple[str, str, str, str]] = [
     ("interfax", "Интерфакс", "https://www.interfax.ru/rss.asp", "rss"),
     ("rbc", "РБК", "https://rssexport.rbc.ru/rbcnews/news/30/full.rss", "rss"),
     ("tass", "ТАСС", "https://tass.ru/rss/v2.xml", "rss"),
     ("kommersant", "Коммерсантъ", "https://www.kommersant.ru/RSS/news.xml", "rss"),
+    ("vedomosti", "Ведомости", "https://www.vedomosti.ru/rss/news", "rss"),
+    ("prime", "ПРАЙМ", "https://1prime.ru/export/rss2/index.xml", "rss"),
     ("finam", "Финам", "https://www.finam.ru/analysis/conews/rsspoint/", "rss"),
     ("smartlab", "Смарт-Лаб", "https://smart-lab.ru/news/rss/", "rss"),
-    ("edisclosure", "Раскрытие", "https://www.e-disclosure.ru/rss/rss.aspx", "rss"),
+    ("edisclosure", "Раскрытие", "https://www.e-disclosure.ru/rss/rss.aspx", "rss"),  # закрыт капчей, оставлен на случай открытия
+    # --- первоисточники (быстрый контур) ---
     ("moex", "MOEX", "https://iss.moex.com/iss/sitenews.json?iss.meta=off", "moex"),
     ("cbr", "Банк России", "https://www.cbr.ru/rss/RssPress", "rss"),
     ("cbr_ev", "Банк России", "https://www.cbr.ru/rss/eventrss", "rss"),
+    ("gov", "Правительство", "http://government.ru/all/rss/", "rss"),
+    ("minfin", "Минфин", "https://minfin.gov.ru/ru/rss/", "rss"),        # гео-блок вне РФ; с Bothost должно работать
+    ("rosstat", "Росстат", "https://rosstat.gov.ru/rss/news", "rss"),    # российский сертификат; RSS может отсутствовать
 ]
+FAST_SOURCES = {"moex", "cbr", "cbr_ev", "gov", "minfin", "rosstat"}
+FAST_INTERVAL_SEC = int(os.getenv("NEWS_FAST_INTERVAL_SEC", "8"))
+# сайты с сертификатами российских УЦ (НУЦ Минцифры)
+RU_CA_HOSTS = ("rosstat.gov.ru", "minfin.gov.ru", "government.ru", "cbr.ru", "moex.com")
 
 # ------------------------------------------------------------ словари
 # тикер -> синонимы (нижний регистр, основы слов)
@@ -71,7 +84,7 @@ COMPANY_ALIASES: dict[str, list[str]] = {
     "NLMK": ["нлмк", "лисин"],
     "MAGN": ["ммк", "магнитогорск"],
     "PHOR": ["фосагро"],
-    "AFLT": ["аэрофлот"],
+    "AFLT": ["аэрофлот", "«победа»"],
     "MOEX": ["мосбирж", "московская биржа", "московской бирж", "московскую бирж"],
     "OZON": ["ozon", "озон"],
     "T": ["т-банк", "тбанк", "т-технолог", "тинькофф", "т-инвестиц"],
@@ -154,7 +167,6 @@ COMPANY_ALIASES: dict[str, list[str]] = {
     "NKHP": ["нкхп"],
     "MSTT": ["мостотрест"],
     "SFIN": ["эсэфай", "холдинг сфи"],
-    "MGKL": ["мосгорломбард"],
     "CARM": ["carmoney", "кармани"],
     "ZAYM": ["займер"],
     "CBOM": ["мкб ", "московский кредитный банк"],
@@ -173,6 +185,22 @@ COMPANY_ALIASES: dict[str, list[str]] = {
     "IRKT": ["пао яковлев", "корпорация иркут", "мс-21"],
     "KLSB": ["калужская сбытов"],
     "NSVZ": ["наука-связь"],
+    "EUTR": ["евротранс", "трасса"],
+    "MGKL": ["мгкл", "мосгорломбард"],
+    "SPBE": ["спб биржа", "спб бирж"],
+    "RAGR": ["русагро"],
+    "TGKN": ["тгк-14"],
+    "KZOS": ["казаньоргсинтез"],
+    "MFON": ["мегафон"],
+    "LSNG": ["россети ленэнерго", "ленэнерго"],
+    "GAZA": ["группа газ", "горьковский автозавод"],
+    "SVET": ["светофор"],
+    "ARSA": ["элемент-лизинг"],
+    "HNFG": ["henderson", "хендерсон"],
+    "SOFT": [],
+    "ZILL": ["зил"],
+    "APRI": ["апри"],
+    "VSEH": ["всеинструменты"],
     "NAUK": ["нпо наука"],
     "SPBE": ["спб биржа", "спб-биржа"],
 }
@@ -205,6 +233,9 @@ MARKET_TRIGGERS: list[tuple[re.Pattern, str, int]] = [
     (re.compile(r"перемир|переговор\w* (по|об) украин|мирн\w* (план|соглашен)", re.I), "геополитика", 2),
     (re.compile(r"налог\w* на (прибыль|сверхприбыль)|windfall|ндпи", re.I), "налоги", 2),
     (re.compile(r"минфин.*(размещ|офз)|аукцион\w* офз", re.I), "ОФЗ", 1),
+    (re.compile(r"(индекс мосбиржи|imoex|рынок акций|российский рынок|рынок рф).{0,60}"
+                r"(упал|обвал|рухн|снизился|растет|вырос|подскочил|превысил|опустился|ниже|выше).{0,40}"
+                r"(\d(,\d)?\s?%|\d{4} пункт)", re.I), "рынок", 2),
 ]
 # триггеры по бумаге: усиливают приоритет
 STOCK_TRIGGERS: list[tuple[re.Pattern, str, int]] = [
@@ -220,6 +251,17 @@ STOCK_TRIGGERS: list[tuple[re.Pattern, str, int]] = [
     (re.compile(r"авари|пожар|взрыв|атак\w* (бпла|дрон)|остановк\w* (производ|завод|нпз)", re.I), "ЧП", 3),
 ]
 PRIORITY_EMOJI = {3: "⚡️", 2: "❗️", 1: "ℹ️", 0: "📰"}
+PR_NOISE = re.compile(
+    r"мошенни|дроппер|хищени|антифрод|киберпреступ|рассказали, как|рассказал[аи]?, (как|почему|что)|"
+    r"объяснил[аи]?, (как|почему)|совет\w* (по|при) |возглавил\w* .{0,30}(совет|ассоциац)|"
+    r"внедрит|запустил\w* (сервис|приложени|программу лояльности|акцию)|ии-сервис|"
+    r"опрос\w*|исследовани\w* (показал|выявил)|россияне (стали|чаще|реже)|"
+    r"благотворител|волонт[её]р|фестивал|турнир|премии|конкурс|"
+    r"подушк\w* безопасности|финансов\w* грамотност|ипотечн\w* ставк\w* (для|по) (клиент|программ)|"
+    r"рекорд\w* (спрос|число клиентов)|карт\w* (мир|unionpay)|бонус|кэшбэк|кешбэк|"
+    r"главное(\.| за день| к утру)|военн\w* операци|представил\w* (gigachat|нейросет|новую версию)|"
+    r"подстанци|включил\w* (в работу|новую)|ростехнадзор подтвердил|пассажиропоток|перевозки пассажиров|"
+    r"эксперт (рассказал|объяснил|назвал)|напоминалка|рейтинг\w* экспорт|признаны экстремист", re.I)
 _STOP = {"россии", "россия", "банка", "банк", "заявил", "заявила", "сообщил", "сообщила",
          "рассказал", "рассказала", "назвал", "назвала", "стало", "может", "будет", "после",
          "того", "этом", "также", "году", "года", "компания", "компании"}
@@ -304,6 +346,9 @@ def _alias_match(alias: str, text: str) -> bool:
 def classify(item: NewsItem, watch: dict[str, list[str]]) -> None:
     """Проставить tickers / tags / priority. watch: тикер -> синонимы."""
     text = f"{item.title} {item.summary}".lower()
+    # дайджесты («Главное», «Что важно», «Итоги дня») — тикеры только из заголовка
+    if re.search(r"главное|что важно|итоги (дня|недели|торгов)|обзор рынка|дайджест", item.title.lower()):
+        text = item.title.lower()
     tickers = []
     for t, aliases in watch.items():
         if len(t) >= 4 and re.search(rf"(?<![a-z0-9]){re.escape(t.lower())}(?![a-z0-9])", text):
@@ -313,6 +358,9 @@ def classify(item: NewsItem, watch: dict[str, list[str]]) -> None:
             if _alias_match(a, text):
                 tickers.append(t)
                 break
+    # «на Мосбирже» — это площадка, не эмитент; MOEX оставляем только если она — тема
+    if "MOEX" in tickers and len(tickers) > 1 and re.search(r"на мосбирж|на московской бирж", text):
+        tickers.remove("MOEX")
     item.tickers = tickers
     tags, prio = [], 0
     if tickers:
@@ -332,6 +380,10 @@ def classify(item: NewsItem, watch: dict[str, list[str]]) -> None:
             item.tickers = [m.group(1)]
             tags.append("MOEX торги")
             prio = 3
+    # PR/корпоративная рутина без влияния на цену: тикер есть, триггеров нет,
+    # заголовок про мошенников, сервисы, опросы, назначения в советы — не постим
+    if tickers and prio <= 1 and not tags and PR_NOISE.search(text):
+        prio = 0
     item.tags = list(dict.fromkeys(tags))
     item.priority = prio
 
@@ -342,7 +394,7 @@ def is_relevant(item: NewsItem, mode: str) -> bool:
     if mode == "all":
         return True
     if item.tickers:
-        return True
+        return item.priority >= 1   # 0 = PR-шум по тикеру, отфильтрован в classify
     if mode == "watch":
         return False
     # рыночные события уровня ⚡️/❗️ (ставка, санкции, MOEX-торги, геополитика…)
@@ -379,6 +431,8 @@ class NewsMonitor:
         self._load()
         self._first = True
         self.channel = NEWS_CHANNEL
+        self._src_err_ts: dict[str, float] = {}
+        self._src_ok: set = set()
 
     def _load(self) -> None:
         try:
@@ -425,24 +479,41 @@ class NewsMonitor:
 
     async def fetch_source(self, sess: aiohttp.ClientSession,
                            sid: str, name: str, url: str, kind: str) -> list[NewsItem]:
+        kw = {}
+        if any(h in url for h in RU_CA_HOSTS):
+            try:
+                from tinkoff import ssl_context
+                kw["ssl"] = ssl_context()
+            except Exception:
+                pass
         try:
             async with sess.get(url, headers={"User-Agent": UA},
-                                timeout=aiohttp.ClientTimeout(total=15)) as r:
+                                timeout=aiohttp.ClientTimeout(total=15), **kw) as r:
                 if r.status != 200:
-                    log.debug("news: %s HTTP %s", sid, r.status)
+                    self._src_err(sid, f"HTTP {r.status}")
                     return []
                 raw = await r.text(errors="ignore")
         except Exception as e:
-            log.debug("news: %s: %s", sid, e)
+            self._src_err(sid, f"{type(e).__name__}: {e}")
             return []
+        self._src_ok.add(sid)
         if kind == "moex":
             return _parse_moex(sid, name, raw)
         if "<rss" not in raw[:2000] and "<feed" not in raw[:2000]:
             return []
         return _parse_rss(sid, name, raw)
 
-    async def fetch_all(self, sess: aiohttp.ClientSession) -> list[NewsItem]:
-        res = await asyncio.gather(*(self.fetch_source(sess, *s) for s in SOURCES),
+    def _src_err(self, sid: str, msg: str) -> None:
+        """Ошибки источника — в лог не чаще раза в 30 мин, чтобы видеть, что не работает."""
+        now = time.time()
+        if now - self._src_err_ts.get(sid, 0) > 1800:
+            self._src_err_ts[sid] = now
+            log.warning("news: источник %s недоступен: %s", sid, msg)
+
+    async def fetch_all(self, sess: aiohttp.ClientSession,
+                        only: Optional[set] = None) -> list[NewsItem]:
+        srcs = [s for s in SOURCES if only is None or s[0] in only]
+        res = await asyncio.gather(*(self.fetch_source(sess, *s) for s in srcs),
                                    return_exceptions=True)
         items: list[NewsItem] = []
         for r in res:
@@ -457,18 +528,22 @@ class NewsMonitor:
             return
         log.info("news: парсер запущен → %s, опрос каждые %s c, режим %s",
                  self.channel, NEWS_INTERVAL_SEC, self.mode)
+        last_full = 0.0
         while True:
             t0 = time.monotonic()
+            full = t0 - last_full >= NEWS_INTERVAL_SEC
             try:
-                await self.tick(sess)
+                await self.tick(sess, only=None if full else FAST_SOURCES)
             except Exception:
                 log.exception("news: ошибка тика")
-            await asyncio.sleep(max(10.0, NEWS_INTERVAL_SEC - (time.monotonic() - t0)))
+            if full:
+                last_full = t0
+            await asyncio.sleep(max(2.0, FAST_INTERVAL_SEC - (time.monotonic() - t0)))
 
-    async def tick(self, sess: aiohttp.ClientSession) -> None:
+    async def tick(self, sess: aiohttp.ClientSession, only: Optional[set] = None) -> None:
         from keyboards import news_kb  # локальный импорт — избегаем цикла
         watch = self.watch_dict()
-        items = await self.fetch_all(sess)
+        items = await self.fetch_all(sess, only)
         now = datetime.now(timezone.utc)
         posted = 0
         for it in items:
