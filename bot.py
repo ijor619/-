@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Optional
 import logging
 import os
 from datetime import datetime, timedelta
@@ -636,19 +637,34 @@ def _cscalp_allowed(uid: int) -> bool:
     return cscalp.enabled() and (not cscalp.OWNER_ID or uid == cscalp.OWNER_ID)
 
 
-async def _cscalp_send(sess, csq: cscalp.CScalpQueue, t: str) -> str:
-    """Отправить тикер мостику и вернуть короткий текст для пользователя."""
+async def _cscalp_send(sess, csq: cscalp.CScalpQueue, t: str) -> tuple[str, Optional[str]]:
+    """Отправить тикер мостику. Возвращает (текст для мгновенного ответа, id команды
+    для фонового ожидания подтверждения или None)."""
     if cscalp.HTTP_MODE:
         csq.push(t)
-        return f"⚡ {t} → CScalp" if csq.online else \
-            f"{t} поставлен в очередь, но мостик не на связи (ПК выключен или скрипт не запущен)"
+        return (f"⚡ {t} → CScalp" if csq.online else
+                f"{t} поставлен в очередь, но мостик не на связи (ПК выключен или скрипт не запущен)"), None
     cid, err = await csq.relay_push(sess, t)
     if err:
-        return f"⚠️ {t}: {err}"
-    res = await csq.relay_wait_ack(sess, cid)
+        return f"⚠️ {t}: {err}", None
+    return f"⚡ {t} → CScalp", cid
+
+
+async def _cscalp_confirm(bot: Bot, chat_id: int, sess, csq: cscalp.CScalpQueue, t: str, cid: str) -> None:
+    """Фон: ждём подтверждение мостика до 20 с; беспокоим пользователя только при проблеме."""
+    res = await csq.relay_wait_ack(sess, cid, timeout=20.0)
     if res is None:
-        return f"{t} отправлен, но мостик не ответил за 6 с (ПК выключен или скрипт не запущен)"
-    return f"⚡ {t} → CScalp" if res == "ok" else f"⚠️ {t}: {res}"
+        txt = f"⚠️ {t}: мостик CScalp не ответил за 20 с (ПК выключен или скрипт не запущен)"
+    elif res != "ok":
+        txt = f"⚠️ {t}: {res}"
+    else:
+        return
+    try:
+        m = await bot.send_message(chat_id, esc(txt))
+        await asyncio.sleep(15)
+        await m.delete()
+    except Exception:
+        pass
 
 
 @router.message(Command("cscalp"))
@@ -662,7 +678,10 @@ async def cmd_cscalp(m: Message, csq: cscalp.CScalpQueue, sess) -> None:
     if not args:
         await m.answer(f"Использование: /cscalp SBER\nСтатус: {esc(csq.status_text())}"); return
     t = args[0].upper()
-    await m.answer(esc(await _cscalp_send(sess, csq, t)))
+    txt, cid = await _cscalp_send(sess, csq, t)
+    await m.answer(esc(txt))
+    if cid:
+        asyncio.create_task(_cscalp_confirm(m.bot, m.chat.id, sess, csq, t, cid))
 
 
 @router.callback_query(F.data.startswith("cscalp:"))
@@ -670,8 +689,10 @@ async def cb_cscalp(c: CallbackQuery, csq: cscalp.CScalpQueue, sess) -> None:
     t = c.data.split(":")[1]
     if not _cscalp_allowed(c.from_user.id):
         await c.answer("Только для владельца бота", show_alert=True); return
-    txt = await _cscalp_send(sess, csq, t)
+    txt, cid = await _cscalp_send(sess, csq, t)
     await c.answer(txt, show_alert=not txt.startswith("⚡"))
+    if cid and c.message:
+        asyncio.create_task(_cscalp_confirm(c.bot, c.message.chat.id, sess, csq, t, cid))
 
 
 # --------------------------------------------------------------- очистка
