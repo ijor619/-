@@ -138,7 +138,8 @@ _chart_msg: dict[int, int] = {}
 
 async def show_chart(bot: Bot, chat_id: int, sess: aiohttp.ClientSession,
                      store: Store, t: str, period: str,
-                     current: Message | None = None, tk=None) -> str | None:
+                     current: Message | None = None, tk=None,
+                     reply_to: int | None = None) -> str | None:
     """Показать график, не плодя сообщений.
 
     Если `current` — уже сообщение с графиком, картинка заменяется на месте.
@@ -168,6 +169,11 @@ async def show_chart(bot: Bot, chat_id: int, sess: aiohttp.ClientSession,
         except Exception:
             log.exception("edit_media %s", t)
 
+    if reply_to is not None:
+        # график в ответ на новость/сигнал: цитатой, старые не трогаем
+        await bot.send_photo(chat_id, file, reply_markup=kb,
+                             reply_to_message_id=reply_to)
+        return None
     old = _chart_msg.get(chat_id)
     if old is not None:
         try:
@@ -523,18 +529,19 @@ async def cb_book(c: CallbackQuery, sess: aiohttp.ClientSession, tk: tinkoff.Tin
     t = parts[1]
     await c.answer("Загружаю стакан…")
     if not tinkoff.enabled():
-        await c.bot.send_message(c.from_user.id, NO_TK); return
+        await c.message.answer(NO_TK); return
     try:
         text = await _book_text(sess, tk, t)
     except Exception as e:
         log.exception("book %s", t); text = f"Не удалось получить стакан {t}: {esc(e)}"
-    chat_id, from_channel = _reply_chat(c)
-    if len(parts) > 2 and parts[2] == "r" and not from_channel:
+    chat_id, reply_to = _reply_ctx(c)
+    if len(parts) > 2 and parts[2] == "r":
         try:
             await c.message.edit_text(text, reply_markup=book_kb(t)); return
         except TelegramBadRequest as e:
             if "not modified" in str(e): return
-    await c.bot.send_message(chat_id, text, reply_markup=book_kb(t))
+    await c.bot.send_message(chat_id, text, reply_markup=book_kb(t),
+                             reply_to_message_id=reply_to)
 
 
 @router.callback_query(F.data.startswith("tape:"))
@@ -543,18 +550,19 @@ async def cb_tape(c: CallbackQuery, sess: aiohttp.ClientSession, tk: tinkoff.Tin
     t = parts[1]
     await c.answer("Загружаю ленту…")
     if not tinkoff.enabled():
-        await c.bot.send_message(c.from_user.id, NO_TK); return
+        await c.message.answer(NO_TK); return
     try:
         text = await _tape_text(sess, tk, t)
     except Exception as e:
         log.exception("tape %s", t); text = f"Не удалось получить ленту {t}: {esc(e)}"
-    chat_id, from_channel = _reply_chat(c)
-    if len(parts) > 2 and parts[2] == "r" and not from_channel:
+    chat_id, reply_to = _reply_ctx(c)
+    if len(parts) > 2 and parts[2] == "r":
         try:
             await c.message.edit_text(text, reply_markup=tape_kb(t)); return
         except TelegramBadRequest as e:
             if "not modified" in str(e): return
-    await c.bot.send_message(chat_id, text, reply_markup=tape_kb(t))
+    await c.bot.send_message(chat_id, text, reply_markup=tape_kb(t),
+                             reply_to_message_id=reply_to)
 
 
 @router.callback_query(F.data == "flow:off")
@@ -579,34 +587,40 @@ async def cb_chart_close(c: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("chart:"))
-def _reply_chat(c: CallbackQuery) -> tuple[int, bool]:
-    """Куда отвечать на нажатие: (chat_id, from_channel).
-    В канале отвечаем нажавшему в личку, а не в сам канал."""
-    if c.message and c.message.chat.type == "private":
-        return c.message.chat.id, False
-    return c.from_user.id, True
+def _reply_ctx(c: CallbackQuery) -> tuple[int, int | None]:
+    """Куда отвечать на нажатие: (chat_id, reply_to_message_id).
+
+    Если кнопка под новостью (есть #ТИКЕР в тексте) или пост в канале —
+    отвечаем цитатой на это сообщение, чтобы ответ был привязан к новости.
+    Под графиком/стаканом в личке — обычное поведение (без цитаты).
+    """
+    m = c.message
+    if m is None:
+        return c.from_user.id, None
+    is_news = bool(m.text and "#" in m.text and "Источник" in m.text)
+    if m.chat.type != "private" or is_news:
+        return m.chat.id, m.message_id
+    return m.chat.id, None
 
 
 async def cb_chart(c: CallbackQuery, store: Store, sess: aiohttp.ClientSession,
                    tk: tinkoff.TinkoffClient) -> None:
     parts = c.data.split(":")
     t, period = parts[1], (parts[2] if len(parts) > 2 else charts.DEFAULT_PERIOD)
-    chat_id, from_channel = _reply_chat(c)
-    await c.answer("Строю график…" + (" (пришлю в личку)" if from_channel else ""))
+    chat_id, reply_to = _reply_ctx(c)
+    await c.answer("Строю график…")
     try:
         err = await show_chart(c.bot, chat_id, sess, store, t, period,
-                               current=None if from_channel else c.message, tk=tk)
+                               current=None if reply_to else c.message, tk=tk,
+                               reply_to=reply_to)
     except Exception as e:
         log.exception("график %s", t)
         err = f"Не удалось построить график {esc(t)}: {esc(e)}"
     if err:
-        if from_channel:
-            try:
-                await c.bot.send_message(chat_id, err)
-            except Exception:
-                pass
-        else:
-            await c.answer(err.replace("<b>", "").replace("</b>", ""), show_alert=True)
+        try:
+            await c.bot.send_message(chat_id, err, reply_to_message_id=reply_to)
+        except Exception:
+            log.exception("chart error notify")
 
 
 @router.callback_query(F.data == "refresh")
