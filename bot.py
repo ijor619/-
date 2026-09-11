@@ -25,6 +25,7 @@ from aiogram.types import (BotCommand, BotCommandScopeDefault, BufferedInputFile
                            ReplyKeyboardMarkup)
 
 import charts
+import cleaner
 import clusters as clu
 import cscalp
 import moex
@@ -64,6 +65,7 @@ HELP = (
     "/news — статус парсера новостей и последние релевантные\n"
     "/quiethours 23 9 — тихие часы (МСК), off — выключить\n"
     "/clusters SBER [5m|15m|30m|1h|4h|1d] — кластеры: объём по ценам и времени, перевес покупок/продаж\n"
+    "/clear — удалить сообщения бота в этом чате сейчас; /autoclear 3|off — ежедневная очистка в N часов МСК\n"
     "/cscalp SBER — открыть бумагу в CScalp на вашем ПК (нужен мостик, см. README)\n"
     "/setup SBER — сетап: уровни по объёму и их тесты, дельта, VWAP, стакан, сила к рынку, итог за/против\n\n"
     "Просто напиши тикер сообщением — добавлю в список.\n"
@@ -86,6 +88,8 @@ def _help_text(store: Store, user_id: int) -> str:
            else "включены" if p.flow_alerts else "выключены")
         + "\nТихие часы: "
         + (f"{p.quiet_from:02d}:00–{p.quiet_to:02d}:00 МСК" if p.quiet_from >= 0 else "нет")
+        + "\nАвтоочистка чата: "
+        + (f"ежедневно в {p.clear_hour:02d}:00 МСК" if p.clear_hour >= 0 else "выключена")
     )
 
 
@@ -660,6 +664,45 @@ async def cb_cscalp(c: CallbackQuery, csq: cscalp.CScalpQueue) -> None:
                        f"(ПК выключен или скрипт не запущен)", show_alert=True)
 
 
+# --------------------------------------------------------------- очистка
+
+@router.message(Command("clear"))
+async def cmd_clear(m: Message, sent: cleaner.SentLog) -> None:
+    args = (m.text or "").split()[1:]
+    hours = 0.0
+    if args and args[0].replace(".", "", 1).isdigit():
+        hours = float(args[0])
+    n = await cleaner.clear_chat(m.bot, sent, m.chat.id, hours * 3600)
+    note = await m.answer(f"🧹 Удалено {n} сообщений бота" + (f" старше {hours:g} ч" if hours else "")
+                          + ".\nСвои сообщения (команды) Telegram удалять боту не даёт.")
+    await asyncio.sleep(5)
+    try:
+        await note.delete()
+        sent.take(m.chat.id, keep=None)  # note уже учтён и удалён
+    except Exception:
+        pass
+
+
+@router.message(Command("autoclear"))
+async def cmd_autoclear(m: Message, store: Store) -> None:
+    prof = store.get(m.from_user.id)
+    args = (m.text or "").split()[1:]
+    if not args:
+        cur = f"каждый день в {prof.clear_hour:02d}:00 МСК" if prof.clear_hour >= 0 else "выключена"
+        await m.answer(f"Автоочистка: {cur}.\n/autoclear 3 — час МСК, /autoclear off — выключить.")
+        return
+    if args[0].lower() in ("off", "выкл", "0ff"):
+        prof.clear_hour = -1
+        store.save()
+        await m.answer("Автоочистка выключена."); return
+    if not args[0].isdigit() or not 0 <= int(args[0]) <= 23:
+        await m.answer("Укажи час 0–23 МСК или off."); return
+    prof.clear_hour = int(args[0])
+    store.save()
+    await m.answer(f"🧹 Буду чистить чат ежедневно в {prof.clear_hour:02d}:00 МСК "
+                   f"(удаляются только сообщения бота, не старше 48 ч).")
+
+
 @router.message(Command("flow"))
 async def cmd_flow(m: Message, store: Store) -> None:
     args = (m.text or "").split()[1:]
@@ -960,6 +1003,8 @@ BOT_COMMANDS = [
     ("report", "Сводка каждые N мин — /report 60"),
     ("quiethours", "Тихие часы — /quiethours 23 9"),
     ("backtest", "Прогнать детекторы за час — /backtest SBER"),
+    ("clear", "Удалить сообщения бота в чате"),
+    ("autoclear", "Ежедневная очистка — /autoclear 3|off"),
     ("cscalp", "Открыть в CScalp (мостик)"),
     ("settings", "Мои настройки"),
     ("help", "Справка по всем командам"),
@@ -1104,6 +1149,8 @@ def main() -> None:
 
     bot = Bot(token=BOT_TOKEN,
               default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    sent = cleaner.SentLog(os.path.join(os.path.dirname(DATA_FILE) or ".", "sent.json"))
+    bot.session.middleware(cleaner.TrackOutgoing(sent))
     dp = Dispatcher()
     dp.include_router(router)
     store = Store(DATA_FILE)
@@ -1126,14 +1173,17 @@ def main() -> None:
         news_task = asyncio.create_task(newsmon.run(session))
         health_task = asyncio.create_task(health_check(bot))
         await setup_menu(bot)
+        clean_task = asyncio.create_task(cleaner.run_daily(bot, sent, store, moex.now_msk))
         csq = cscalp.CScalpQueue()
         runner = await csq.start() if cscalp.enabled() else None
         try:
             await dp.start_polling(bot, store=store, sess=session, tk=tk,
                                    journal=journal, newsmon=newsmon, cstore=cstore, flow=flow,
-                                   csq=csq)
+                                   csq=csq, sent=sent)
         finally:
             cstore.save(force=True)
+            clean_task.cancel()
+            sent.save()
             if runner is not None:
                 await runner.cleanup()
             monitor_task.cancel()

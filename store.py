@@ -8,7 +8,8 @@ from typing import Dict, Iterator
 
 class UserProfile:
     __slots__ = ("watchlist", "threshold_pct", "cooldown_min",
-                 "report_min", "last_report_ts", "flow_alerts", "quiet_from", "quiet_to")
+                 "report_min", "last_report_ts", "flow_alerts", "quiet_from", "quiet_to",
+                 "clear_hour")
 
     def __init__(self) -> None:
         self.watchlist: list[str] = []      # тикеры в верхнем регистре
@@ -19,6 +20,7 @@ class UserProfile:
         self.flow_alerts: bool = True       # сигналы по ленте/стакану (роботы)
         self.quiet_from: int = -1           # тихие часы, час МСК начала (-1 = выкл)
         self.quiet_to: int = -1             # час МСК окончания
+        self.clear_hour: int = 3            # автоочистка чата, час МСК (-1 = выкл)
 
     def to_dict(self) -> dict:
         return {
@@ -30,6 +32,7 @@ class UserProfile:
             "flow_alerts": self.flow_alerts,
             "quiet_from": self.quiet_from,
             "quiet_to": self.quiet_to,
+            "clear_hour": self.clear_hour,
         }
 
     @classmethod
@@ -43,6 +46,7 @@ class UserProfile:
         p.flow_alerts = bool(d.get("flow_alerts", True))
         p.quiet_from = int(d.get("quiet_from", -1))
         p.quiet_to = int(d.get("quiet_to", -1))
+        p.clear_hour = int(d.get("clear_hour", 3))
         return p
 
     def is_quiet(self, hour_msk: int) -> bool:
