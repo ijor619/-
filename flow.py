@@ -61,8 +61,9 @@ class DayStats:
 
 class FlowMonitor:
     def __init__(self, bot: Bot, store: Store, tk: TinkoffClient,
-                 journal: Journal) -> None:
+                 journal: Journal, clusters=None) -> None:
         self.bot, self.store, self.tk, self.journal = bot, store, tk, journal
+        self.clusters = clusters
         self._books: Dict[str, tape.BookState] = {}
         self._base: Dict[str, tape.Baseline] = {}
         self._day: Dict[str, DayStats] = {}
@@ -138,7 +139,8 @@ class FlowMonitor:
     # ------------------------------------------------------------------ tick
     async def tick(self, sess) -> None:
         users = [(u, p) for u, p in self.store.all() if p.flow_alerts and p.watchlist]
-        tickers = sorted({t for _, p in users for t in p.watchlist})
+        # ленту копим для кластеров по всем спискам, даже если сигналы выключены
+        tickers = sorted({t for _, p in self.store.all() for t in p.watchlist})
         if not tickers:
             return
         results = await asyncio.gather(*(self._analyze(sess, t) for t in tickers),
@@ -221,6 +223,11 @@ class FlowMonitor:
         out: list[tape.Signal] = []
         if isinstance(trades, list) and trades:
             self._last_price[t] = trades[-1].price
+            if self.clusters is not None:
+                try:
+                    self.clusters.ingest(t, trades)
+                except Exception:
+                    log.exception("clusters: ingest %s", t)
             base = self._base.setdefault(t, tape.Baseline())
             base.update(trades[-300:], inst.lot)
             if self._main_session():

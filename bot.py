@@ -23,13 +23,14 @@ from aiogram.types import (BufferedInputFile, CallbackQuery, InputMediaPhoto,
                            Message)
 
 import charts
+import clusters as clu
 import moex
 import tape
 import tinkoff
 from flow import FlowMonitor
 from journal import Journal
 from news import NewsMonitor, NEWS_CHANNEL
-from keyboards import book_kb, chart_kb, report_kb, tape_kb
+from keyboards import book_kb, chart_kb, cluster_kb, report_kb, tape_kb
 from config import (BOT_TOKEN, CHECK_INTERVAL_SEC, DATA_FILE,
                     DEFAULT_REPORT_MIN, DEFAULT_THRESHOLD_PCT)
 from formatting import cur_symbol, esc, fmt_pct, fmt_price
@@ -57,7 +58,8 @@ HELP = (
     "/stats [7] [TICKER] — точность сигналов за N дней\n"
     "/backtest TICKER — прогнать детекторы по ленте за час\n"
     "/news — статус парсера новостей и последние релевантные\n"
-    "/quiethours 23 9 — тихие часы (МСК), off — выключить\n\n"
+    "/quiethours 23 9 — тихие часы (МСК), off — выключить\n"
+    "/clusters SBER [5m|15m|30m|1h|4h|1d] — кластеры: объём по ценам и времени, перевес покупок/продаж\n\n"
     "Просто напиши тикер сообщением — добавлю в список.\n"
     "Цены — из официального ISS API Мосбиржи, обновление каждую минуту."
 )
@@ -409,6 +411,114 @@ async def cmd_tape(m: Message, sess: aiohttp.ClientSession, tk: tinkoff.TinkoffC
     await m.answer(text, reply_markup=tape_kb(t))
 
 
+# ------------------------------------------------------------- кластеры
+
+async def _cluster_view(sess, tk: tinkoff.TinkoffClient, cstore: clu.ClusterStore,
+                        t: str, window: str) -> tuple[str, bytes | None]:
+    """Текст + PNG кластерного анализа. Перед расчётом подтягивает свежую ленту."""
+    if window not in clu.WINDOWS:
+        window = clu.DEFAULT_WINDOW
+    try:
+        inst = await tk.instrument(t)
+    except Exception as e:
+        return f"⚠️ T-Invest API недоступен: {esc(e)}", None
+    if inst is None:
+        return f"❌ <b>{esc(t)}</b> — нет такого тикера на TQBR (Т-Банк)", None
+    info = await moex.get_security_info(sess, t)
+    dec = info.decimals if info else 2
+    name = info.name if info else inst.name
+    try:
+        trades = await tk.last_trades(inst, minutes=60)
+        cstore.ingest(t, trades)
+    except Exception as e:
+        log.warning("clusters: лента %s: %s", t, e)
+    minutes = clu.WINDOWS[window][1]
+    an = clu.analyze(t, window, cstore.window(t, minutes), inst.lot, dec)
+    text = clu.cluster_text(an, t, window, name, cstore.coverage(t), cstore.started_at)
+    png = None
+    if an is not None and an.n >= 3:
+        try:
+            png = await asyncio.to_thread(clu.render, an, name)
+        except Exception:
+            log.exception("clusters: render %s", t)
+    return text, png
+
+
+async def _send_clusters(bot: Bot, chat_id: int, sess, tk, cstore, t: str, window: str,
+                         reply_to: int | None = None, current: Message | None = None) -> None:
+    text, png = await _cluster_view(sess, tk, cstore, t, window)
+    kb = cluster_kb(t, window)
+    if png:
+        media = InputMediaPhoto(media=BufferedInputFile(png, f"{t}_clusters_{window}.png"),
+                                caption=text[:1024])
+        if current is not None and current.photo:
+            try:
+                await current.edit_media(media, reply_markup=kb); return
+            except TelegramBadRequest as e:
+                if "not modified" in str(e): return
+                log.warning("clusters edit_media %s: %s", t, e)
+        await bot.send_photo(chat_id, media.media, caption=text[:1024], reply_markup=kb,
+                             reply_to_message_id=reply_to)
+        return
+    if current is not None and not current.photo:
+        try:
+            await current.edit_text(text, reply_markup=kb); return
+        except TelegramBadRequest as e:
+            if "not modified" in str(e): return
+    await bot.send_message(chat_id, text, reply_markup=kb, reply_to_message_id=reply_to)
+
+
+@router.message(Command("clusters"))
+async def cmd_clusters(m: Message, store: Store, sess: aiohttp.ClientSession,
+                       tk: tinkoff.TinkoffClient, cstore: clu.ClusterStore) -> None:
+    if not tinkoff.enabled():
+        await m.answer(NO_TK); return
+    args = (m.text or "").split()[1:]
+    if not args:
+        wl = store.get(m.from_user.id).watchlist
+        if len(wl) == 1:
+            args = [wl[0]]
+        else:
+            await m.answer("Использование: /clusters SBER [5m|15m|30m|1h|4h|1d]"
+                           + (f"\nТвой список: {', '.join(wl)}" if wl else ""))
+            return
+    t = args[0].upper()
+    window = args[1].lower() if len(args) > 1 else clu.DEFAULT_WINDOW
+    window = {"5м": "5m", "15м": "15m", "30м": "30m", "1ч": "1h", "4ч": "4h", "1д": "1d",
+              "day": "1d", "d": "1d", "день": "1d"}.get(window, window)
+    if window not in clu.WINDOWS:
+        await m.answer("Окно: 5m, 15m, 30m, 1h, 4h или 1d"); return
+    await _send_clusters(m.bot, m.chat.id, sess, tk, cstore, t, window)
+
+
+@router.callback_query(F.data.startswith("clu:"))
+async def cb_clusters(c: CallbackQuery, sess: aiohttp.ClientSession,
+                      tk: tinkoff.TinkoffClient, cstore: clu.ClusterStore) -> None:
+    parts = c.data.split(":")
+    t, window = parts[1], (parts[2] if len(parts) > 2 else clu.DEFAULT_WINDOW)
+    await c.answer("Считаю кластеры…")
+    if not tinkoff.enabled():
+        await c.bot.send_message(c.from_user.id, NO_TK); return
+    # кнопка под самими кластерами (подпись начинается с 🧮) — обновляем на месте
+    cap = (c.message.caption or c.message.text or "") if c.message else ""
+    own = cap.startswith("🧮")
+    if own:
+        chat_id, reply_to, current = c.message.chat.id, None, c.message
+    else:
+        chat_id, reply_to = _reply_ctx(c)
+        current = None
+    try:
+        await _send_clusters(c.bot, chat_id, sess, tk, cstore, t, window,
+                             reply_to=reply_to, current=current)
+    except Exception as e:
+        log.exception("clusters %s", t)
+        try:
+            await c.bot.send_message(chat_id, f"⚠️ Не удалось посчитать кластеры {esc(t)}:\n<code>{esc(e)}</code>",
+                                     reply_to_message_id=reply_to)
+        except Exception:
+            pass
+
+
 @router.message(Command("flow"))
 async def cmd_flow(m: Message, store: Store) -> None:
     args = (m.text or "").split()[1:]
@@ -745,7 +855,8 @@ def main() -> None:
     tk = tinkoff.TinkoffClient()
     monitor = Monitor(bot, store, tk if tinkoff.enabled() else None)
     journal = Journal(os.path.join(os.path.dirname(DATA_FILE) or ".", "signals.json"))
-    flow = FlowMonitor(bot, store, tk, journal)
+    cstore = clu.ClusterStore(os.path.join(os.path.dirname(DATA_FILE) or ".", "clusters.json"))
+    flow = FlowMonitor(bot, store, tk, journal, cstore)
     newsmon = NewsMonitor(bot, store,
                           os.path.join(os.path.dirname(DATA_FILE) or ".", "news_seen.json"),
                           mode=os.getenv("NEWS_MODE", "stocks"))
@@ -761,8 +872,9 @@ def main() -> None:
         health_task = asyncio.create_task(health_check(bot))
         try:
             await dp.start_polling(bot, store=store, sess=session, tk=tk,
-                                   journal=journal, newsmon=newsmon)
+                                   journal=journal, newsmon=newsmon, cstore=cstore)
         finally:
+            cstore.save(force=True)
             monitor_task.cancel()
             flow_task.cancel()
             news_task.cancel()
