@@ -148,8 +148,8 @@ def chart_kb(ticker: str, period: str,
             tick_row = []
     if tick_row:
         rows.append(tick_row)
-    rows.append([setup_btn(ticker), cluster_btn(ticker)],
-        [tinvest_btn(ticker), terminal_btn(ticker)])
+    rows.append([setup_btn(ticker), cluster_btn(ticker)])
+    rows.append([tinvest_btn(ticker), terminal_btn(ticker)])
     rows.append([
         InlineKeyboardButton(text="🔄 Обновить", callback_data=f"chart:{ticker}:{period}:r"),
         InlineKeyboardButton(text="✖️ Закрыть", callback_data="chart:close"),
