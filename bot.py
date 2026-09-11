@@ -28,6 +28,7 @@ import tape
 import tinkoff
 from flow import FlowMonitor
 from journal import Journal
+from news import NewsMonitor, NEWS_CHANNEL
 from keyboards import book_kb, chart_kb, report_kb, tape_kb
 from config import (BOT_TOKEN, CHECK_INTERVAL_SEC, DATA_FILE,
                     DEFAULT_REPORT_MIN, DEFAULT_THRESHOLD_PCT)
@@ -55,6 +56,7 @@ HELP = (
     "/flow on|off — сигналы о роботах (айсберги, спуфинг, перекосы)\n"
     "/stats [7] [TICKER] — точность сигналов за N дней\n"
     "/backtest TICKER — прогнать детекторы по ленте за час\n"
+    "/news — статус парсера новостей и последние релевантные\n"
     "/quiethours 23 9 — тихие часы (МСК), off — выключить\n\n"
     "Просто напиши тикер сообщением — добавлю в список.\n"
     "Цены — из официального ISS API Мосбиржи, обновление каждую минуту."
@@ -477,6 +479,32 @@ async def cmd_backtest(m: Message, sess: aiohttp.ClientSession,
     await m.answer("\n\n".join(lines))
 
 
+@router.message(Command("news"))
+async def cmd_news(m: Message, sess: aiohttp.ClientSession, newsmon: NewsMonitor) -> None:
+    """Статус парсера + последние релевантные новости прямо сейчас (в личку)."""
+    args = (m.text or "").split()[1:]
+    if not NEWS_CHANNEL:
+        await m.answer("Канал новостей не настроен: задай переменную NEWS_CHANNEL "
+                       "(@username канала или его id вида -100…), бот должен быть админом.")
+        return
+    from news import classify, format_item, is_relevant, SOURCES
+    from keyboards import news_kb
+    items = await newsmon.fetch_all(sess)
+    watch = newsmon.watch_dict()
+    rel = []
+    for it in items:
+        classify(it, watch)
+        if is_relevant(it, "all" if args and args[0] == "all" else newsmon.mode):
+            rel.append(it)
+    ok = len({i.source_id for i in items})
+    head = (f"📰 Источники: {ok}/{len(SOURCES)} отвечают · всего {len(items)} новостей · "
+            f"релевантных {len(rel)} · канал {esc(NEWS_CHANNEL)}")
+    await m.answer(head)
+    for it in rel[-3:]:
+        await m.answer(format_item(it), reply_markup=news_kb(it.tickers),
+                       disable_web_page_preview=True)
+
+
 @router.message(Command("stats"))
 async def cmd_stats(m: Message, journal: Journal) -> None:
     args = (m.text or "").split()[1:]
@@ -495,17 +523,18 @@ async def cb_book(c: CallbackQuery, sess: aiohttp.ClientSession, tk: tinkoff.Tin
     t = parts[1]
     await c.answer("Загружаю стакан…")
     if not tinkoff.enabled():
-        await c.message.answer(NO_TK); return
+        await c.bot.send_message(c.from_user.id, NO_TK); return
     try:
         text = await _book_text(sess, tk, t)
     except Exception as e:
         log.exception("book %s", t); text = f"Не удалось получить стакан {t}: {esc(e)}"
-    if len(parts) > 2 and parts[2] == "r":
+    chat_id, from_channel = _reply_chat(c)
+    if len(parts) > 2 and parts[2] == "r" and not from_channel:
         try:
             await c.message.edit_text(text, reply_markup=book_kb(t)); return
         except TelegramBadRequest as e:
             if "not modified" in str(e): return
-    await c.message.answer(text, reply_markup=book_kb(t))
+    await c.bot.send_message(chat_id, text, reply_markup=book_kb(t))
 
 
 @router.callback_query(F.data.startswith("tape:"))
@@ -514,17 +543,18 @@ async def cb_tape(c: CallbackQuery, sess: aiohttp.ClientSession, tk: tinkoff.Tin
     t = parts[1]
     await c.answer("Загружаю ленту…")
     if not tinkoff.enabled():
-        await c.message.answer(NO_TK); return
+        await c.bot.send_message(c.from_user.id, NO_TK); return
     try:
         text = await _tape_text(sess, tk, t)
     except Exception as e:
         log.exception("tape %s", t); text = f"Не удалось получить ленту {t}: {esc(e)}"
-    if len(parts) > 2 and parts[2] == "r":
+    chat_id, from_channel = _reply_chat(c)
+    if len(parts) > 2 and parts[2] == "r" and not from_channel:
         try:
             await c.message.edit_text(text, reply_markup=tape_kb(t)); return
         except TelegramBadRequest as e:
             if "not modified" in str(e): return
-    await c.message.answer(text, reply_markup=tape_kb(t))
+    await c.bot.send_message(chat_id, text, reply_markup=tape_kb(t))
 
 
 @router.callback_query(F.data == "flow:off")
@@ -549,19 +579,34 @@ async def cb_chart_close(c: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("chart:"))
+def _reply_chat(c: CallbackQuery) -> tuple[int, bool]:
+    """Куда отвечать на нажатие: (chat_id, from_channel).
+    В канале отвечаем нажавшему в личку, а не в сам канал."""
+    if c.message and c.message.chat.type == "private":
+        return c.message.chat.id, False
+    return c.from_user.id, True
+
+
 async def cb_chart(c: CallbackQuery, store: Store, sess: aiohttp.ClientSession,
                    tk: tinkoff.TinkoffClient) -> None:
     parts = c.data.split(":")
     t, period = parts[1], (parts[2] if len(parts) > 2 else charts.DEFAULT_PERIOD)
-    await c.answer("Строю график…")
+    chat_id, from_channel = _reply_chat(c)
+    await c.answer("Строю график…" + (" (пришлю в личку)" if from_channel else ""))
     try:
-        err = await show_chart(c.bot, c.message.chat.id, sess, store, t, period,
-                               current=c.message, tk=tk)
+        err = await show_chart(c.bot, chat_id, sess, store, t, period,
+                               current=None if from_channel else c.message, tk=tk)
     except Exception as e:
         log.exception("график %s", t)
         err = f"Не удалось построить график {esc(t)}: {esc(e)}"
     if err:
-        await c.answer(err.replace("<b>", "").replace("</b>", ""), show_alert=True)
+        if from_channel:
+            try:
+                await c.bot.send_message(chat_id, err)
+            except Exception:
+                pass
+        else:
+            await c.answer(err.replace("<b>", "").replace("</b>", ""), show_alert=True)
 
 
 @router.callback_query(F.data == "refresh")
@@ -598,6 +643,21 @@ async def cb_unwatch(c: CallbackQuery, store: Store) -> None:
         await c.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
+
+
+# ----------------------------------------------------------------- канал
+
+@router.channel_post()
+async def on_channel_post(m: Message) -> None:
+    """Помогает узнать id канала: бот пишет его в лог при любом посте."""
+    log.info("канал: id=%s title=%r — используй NEWS_CHANNEL=%s",
+             m.chat.id, m.chat.title, m.chat.id)
+
+
+@router.my_chat_member()
+async def on_added(ev) -> None:
+    log.info("бота добавили/изменили в чате id=%s (%s) статус=%s",
+             ev.chat.id, ev.chat.title or ev.chat.type, ev.new_chat_member.status)
 
 
 # ----------------------------------------------------------------- fallback
@@ -657,6 +717,9 @@ def main() -> None:
     tk = tinkoff.TinkoffClient()
     journal = Journal(os.path.join(os.path.dirname(DATA_FILE) or ".", "signals.json"))
     flow = FlowMonitor(bot, store, tk, journal)
+    newsmon = NewsMonitor(bot, store,
+                          os.path.join(os.path.dirname(DATA_FILE) or ".", "news_seen.json"),
+                          mode=os.getenv("NEWS_MODE", "stocks"))
 
     async def amain() -> None:
         session = aiohttp.ClientSession(
@@ -665,13 +728,15 @@ def main() -> None:
         )
         monitor_task = asyncio.create_task(monitor.run(session))
         flow_task = asyncio.create_task(flow.run(session))
+        news_task = asyncio.create_task(newsmon.run(session))
         health_task = asyncio.create_task(health_check(bot))
         try:
             await dp.start_polling(bot, store=store, sess=session, tk=tk,
-                                   journal=journal)
+                                   journal=journal, newsmon=newsmon)
         finally:
             monitor_task.cancel()
             flow_task.cancel()
+            news_task.cancel()
             health_task.cancel()
             await tk.close()
             await session.close()

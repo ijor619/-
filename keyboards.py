@@ -113,3 +113,20 @@ def chart_kb(ticker: str, period: str,
         InlineKeyboardButton(text="✖️ Закрыть", callback_data="chart:close"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def news_kb(tickers: list[str]) -> InlineKeyboardMarkup | None:
+    """Под новостью в канале: по каждой бумаге — график/стакан/лента + Т-Инвестиции.
+
+    Callback-кнопки в канале обрабатывает тот же бот, ответ приходит нажавшему
+    в личку (бот не пишет в канал в ответ на нажатия).
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    for t in tickers[:3]:
+        rows.append([
+            InlineKeyboardButton(text=f"📈 {t}", callback_data=f"chart:{t}:5m"),
+            InlineKeyboardButton(text="📚 Стакан", callback_data=f"book:{t}"),
+            InlineKeyboardButton(text="🧾 Лента", callback_data=f"tape:{t}"),
+        ])
+        rows.append([tinvest_btn(t), terminal_btn(t)])
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
