@@ -166,6 +166,7 @@ async def show_chart(bot: Bot, chat_id: int, sess: aiohttp.ClientSession,
         except TelegramBadRequest as e:
             if "not modified" in str(e):
                 return None
+            log.warning("edit_media %s: %s — шлю новое сообщение", t, e)
         except Exception:
             log.exception("edit_media %s", t)
 
@@ -252,7 +253,11 @@ async def cmd_chart(m: Message, store: Store, sess: aiohttp.ClientSession,
     if not TICKER_RE.match(t):
         await m.answer("Не похоже на тикер.")
         return
-    err = await show_chart(m.bot, m.chat.id, sess, store, t, period, tk=tk)
+    try:
+        err = await show_chart(m.bot, m.chat.id, sess, store, t, period, tk=tk)
+    except Exception as e:
+        log.exception("chart %s", t)
+        err = f"⚠️ Не удалось построить график {esc(t)}:\n<code>{esc(e)}</code>"
     if err:
         await m.answer(err)
 
@@ -607,15 +612,19 @@ async def cb_chart(c: CallbackQuery, store: Store, sess: aiohttp.ClientSession,
                    tk: tinkoff.TinkoffClient) -> None:
     parts = c.data.split(":")
     t, period = parts[1], (parts[2] if len(parts) > 2 else charts.DEFAULT_PERIOD)
-    chat_id, reply_to = _reply_ctx(c)
+    if c.message and c.message.photo:
+        # кнопка под самим графиком: заменяем картинку на месте
+        chat_id, reply_to, current = c.message.chat.id, None, c.message
+    else:
+        chat_id, reply_to = _reply_ctx(c)
+        current = None
     await c.answer("Строю график…")
     try:
         err = await show_chart(c.bot, chat_id, sess, store, t, period,
-                               current=None if reply_to else c.message, tk=tk,
-                               reply_to=reply_to)
+                               current=current, tk=tk, reply_to=reply_to)
     except Exception as e:
         log.exception("график %s", t)
-        err = f"Не удалось построить график {esc(t)}: {esc(e)}"
+        err = f"⚠️ Не удалось построить график {esc(t)}:\n<code>{esc(e)}</code>"
     if err:
         try:
             await c.bot.send_message(chat_id, err, reply_to_message_id=reply_to)
