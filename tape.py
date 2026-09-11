@@ -50,8 +50,18 @@ WALL_MULT = 8.0              # уровень к медиане остальны
 WALL_MIN_LEVELS = 8
 SPOOF_MULT = 6.0
 SPOOF_MAX_LIFE_SEC = 90
-WHALE_MIN_RUB = 20_000_000    # одна сделка от N ₽ — «кит»
-WHALE_MULT = 25.0             # и не меньше чем в N раз типичной сделки
+# --- кит: одиночная сделка, крупная ОТНОСИТЕЛЬНО ленты этой бумаги -------
+# порог = max(p99.9 размеров сделок бумаги за последние дни, рублёвый пол).
+WHALE_QUANTILE = 0.999
+WHALE_FLOOR_RUB = {           # рублёвый пол по бумагам (откалибровано 11.09.2026)
+    "SBER": 50_000_000,
+    "GAZP": 5_000_000, "YDEX": 5_000_000, "PLZL": 5_000_000,
+    "RUAL": 3_000_000,
+}
+WHALE_FLOOR_DEFAULT = 5_000_000
+WHALE_SERIES_MIN = 3          # серия: N+ крупных сделок одной стороны
+WHALE_SERIES_SEC = 120        # за это время
+WHALE_SERIES_QUANTILE = 0.99  # сделки серии — от p99 ленты
 WALL_EATEN_MIN_SHARE = 0.7    # стена считается съеденной, если исполнено ≥70%
 
 
@@ -66,10 +76,33 @@ class Baseline:
     avg_qty: float = 0.0          # средний размер сделки, лот.
     avg_rub: float = 0.0          # средний размер сделки, ₽
     n: int = 0                    # сколько минут учтено
+    # выборка размеров сделок (₽) для квантилей кита; хвост ленты ~2 дня
+    sizes: list = field(default_factory=list)
+    _sizes_last: Optional[datetime] = None
+
+    def add_sizes(self, trades: list["Trade"], lot: int) -> None:
+        new = [t for t in trades if self._sizes_last is None or t.ts > self._sizes_last]
+        if not new:
+            return
+        self._sizes_last = new[-1].ts
+        self.sizes.extend(t.qty * t.price * lot for t in new)
+        if len(self.sizes) > 150_000:
+            del self.sizes[: len(self.sizes) - 150_000]
+
+    def quantile(self, q: float) -> Optional[float]:
+        """Квантиль размера сделки; None, пока выборка мала (< 2000 сделок)."""
+        if len(self.sizes) < 2000:
+            return None
+        srt = sorted(self.sizes)
+        return srt[min(len(srt) - 1, int(len(srt) * q))]
+
+    def median_rub(self) -> float:
+        return statistics.median(self.sizes) if self.sizes else self.avg_rub
 
     def update(self, trades: list["Trade"], lot: int) -> None:
         if not trades:
             return
+        self.add_sizes(trades, lot)
         span = max(1.0, (trades[-1].ts - trades[0].ts).total_seconds() / 60)
         tpm = len(trades) / span
         aq = statistics.fmean(t.qty for t in trades)
@@ -105,19 +138,8 @@ def analyze_trades(ticker: str, trades: list[Trade], lot: int,
         iceberg_min = max(ICEBERG_MIN_TRADES, int(base.trades_per_min * 0.5))
         burst_min = max(BURST_MIN_TRADES, int(base.trades_per_min * BURST_MULT))
 
-    # --- кит: одна сделка на крупную сумму ---------------------------------
-    for t in trades[-60:]:
-        rub = t.qty * t.price * lot
-        typical = base.avg_rub if (base and base.ready and base.avg_rub) else 0
-        if rub >= WHALE_MIN_RUB and (not typical or rub >= WHALE_MULT * typical):
-            out.append(Signal(
-                "whale", ticker,
-                f"🐋 <b>{ticker}</b> — крупная сделка\n"
-                f"{fmt_n(rub)} ₽ одной сделкой "
-                f"({'покупка' if t.side == 'B' else 'продажа'}, "
-                f"{fmt_n(t.qty * lot)} шт. по {fmt_price(t.price, decimals)})"
-                + (f"\nВ {rub / typical:.0f}× больше типичной сделки" if typical else ""),
-                f"whale:{t.ts.isoformat()}:{t.price}"))
+    # --- кит: одиночная сделка, крупная относительно ленты бумаги -----------
+    out += whale_signals(ticker, trades, lot, decimals, base)
     recent = [t for t in trades if now - t.ts <= timedelta(seconds=ICEBERG_WINDOW_SEC)]
 
     # --- айсберг: одинаковые (цена, объём, сторона) ------------------------
@@ -356,3 +378,97 @@ def tape_text(ticker: str, trades: list[Trade], lot: int, decimals: int,
     lines.append(f"За {span:.0f} мин ({len(win)} сделок): покупки {vb} / продажи {vs} лот."
                  + (f" · {vb / (vb + vs) * 100:.0f}% покупок" if vb + vs else ""))
     return "\n".join(lines)
+
+
+# =============================================================== киты
+
+def fmt_rub(rub: float) -> str:
+    return (f"{rub / 1e6:.1f} млн ₽" if rub >= 1e6 else f"{rub / 1e3:.0f} тыс ₽").replace(".", ",")
+
+
+def whale_thresholds(ticker: str, base: Optional[Baseline]) -> tuple[float, float, bool]:
+    """(порог одиночного кита ₽, порог сделки для серии ₽, адаптивен ли)."""
+    floor = WHALE_FLOOR_RUB.get(ticker, WHALE_FLOOR_DEFAULT)
+    q999 = base.quantile(WHALE_QUANTILE) if base else None
+    q99 = base.quantile(WHALE_SERIES_QUANTILE) if base else None
+    single = max(floor, q999) if q999 else floor
+    # сделки серии: от p99 ленты, но не мельче 1/10 пола (SBER 5 млн, GAZP 0,5 млн, RUAL 0,3 млн)
+    series = max(floor * 0.1, q99) if q99 else floor * 0.1
+    return single, series, q999 is not None
+
+
+def whale_signals(ticker: str, trades: list[Trade], lot: int, decimals: int,
+                  base: Optional[Baseline]) -> list[Signal]:
+    out: list[Signal] = []
+    if not trades:
+        return out
+    msk = timezone(timedelta(hours=3))
+    single_th, series_th, adaptive = whale_thresholds(ticker, base)
+    typical = base.median_rub() if base else 0.0
+    now = trades[-1].ts
+    recent = [t for t in trades if now - t.ts <= timedelta(seconds=90)]
+
+    # одиночные
+    for t in recent:
+        rub = t.qty * t.price * lot
+        if rub < single_th:
+            continue
+        before = [x for x in trades if t.ts - timedelta(minutes=2) <= x.ts < t.ts]
+        ctx = ""
+        if len(before) >= 5:
+            vb = sum(x.qty for x in before if x.side == "B")
+            vs = sum(x.qty for x in before if x.side == "S")
+            lo = min(x.price for x in before); hi = max(x.price for x in before)
+            ctx = (f"\nЗа 2 мин до сделки: покупки {vb / (vb + vs) * 100:.0f}%, "
+                   f"цена {fmt_price(lo, decimals)}–{fmt_price(hi, decimals)}.")
+        rel = (f"Крупнее {WHALE_QUANTILE * 100:g}% сделок бумаги" if adaptive else "Выше порога по бумаге")
+        if typical:
+            rel += f", в {fmt_n(rub / typical)}× больше типичной ({fmt_rub(typical)})"
+        out.append(Signal(
+            "whale", ticker,
+            f"🐋 <b>{ticker}</b> · кит · <b>{'покупка' if t.side == 'B' else 'продажа'}</b>\n"
+            f"{t.ts.astimezone(msk):%H:%M:%S} МСК · <b>{fmt_n(t.qty * lot)} шт.</b> ({fmt_n(t.qty)} лот) "
+            f"по <b>{fmt_price(t.price, decimals)}</b> ≈ <b>{fmt_rub(rub)}</b>\n\n{rel}.{ctx}",
+            f"whale:{t.ts.isoformat()}:{t.price}:{t.qty}"))
+
+    # серия: N+ крупных сделок одной стороны за WHALE_SERIES_SEC
+    big = [t for t in trades if t.qty * t.price * lot >= series_th
+           and now - t.ts <= timedelta(seconds=WHALE_SERIES_SEC + 60)]
+    for side in ("B", "S"):
+        ss = [t for t in big if t.side == side]
+        if len(ss) < WHALE_SERIES_MIN:
+            continue
+        # берём самое свежее окно WHALE_SERIES_SEC, в котором есть >= N сделок
+        best: list[Trade] = []
+        for i in range(len(ss)):
+            win = [x for x in ss[i:] if x.ts - ss[i].ts <= timedelta(seconds=WHALE_SERIES_SEC)]
+            if len(win) >= WHALE_SERIES_MIN and len(win) >= len(best):
+                best = win
+        if not best or now - best[-1].ts > timedelta(seconds=90):
+            continue
+        total_rub = sum(t.qty * t.price * lot for t in best)
+        total_qty = sum(t.qty for t in best)
+        p0, p1 = best[0].price, best[-1].price
+        chg = (p1 - p0) / p0 * 100 if p0 else 0.0
+        win_all = [t for t in trades if now - t.ts <= timedelta(minutes=15)]
+        share = total_qty / sum(t.qty for t in win_all) * 100 if win_all else 0.0
+        if side == "S":
+            verdict = ("продают по рынку, бид <b>поглощает</b> (цена почти не сдвинулась)"
+                       if chg > -0.1 else "продают по рынку и <b>продавливают</b> цену")
+        else:
+            verdict = ("покупают по рынку, аск <b>поглощает</b> (цена почти не сдвинулась)"
+                       if chg < 0.1 else "покупают по рынку и <b>двигают</b> цену вверх")
+        rows = "\n".join(
+            f"{t.ts.astimezone(msk):%H:%M:%S}  {'▲' if side == 'B' else '▼'}  "
+            f"{fmt_price(t.price, decimals):>8}  {fmt_n(t.qty * lot):>10} шт.  {fmt_rub(t.qty * t.price * lot):>11}"
+            for t in best[-8:])
+        out.append(Signal(
+            "whale_series", ticker,
+            f"🐋🐋 <b>{ticker}</b> · серия китов · <b>{'покупка' if side == 'B' else 'продажа'}</b>\n"
+            f"{best[0].ts.astimezone(msk):%H:%M:%S}–{best[-1].ts.astimezone(msk):%H:%M:%S} МСК · "
+            f"<b>{len(best)} сделок</b> на <b>{fmt_rub(total_rub)}</b> ({fmt_n(total_qty * lot)} шт.)\n"
+            f"<pre>{rows}</pre>"
+            f"Цена за серию {fmt_price(p0, decimals)} → {fmt_price(p1, decimals)} ({fmt_pct(chg)}) — {verdict}. "
+            f"Это {share:.0f}% всего объёма за 15 мин.",
+            f"whale_series:{side}:{best[0].ts.strftime('%H:%M')}"))
+    return out

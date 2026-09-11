@@ -32,17 +32,17 @@ from tinkoff import OrderBook, TinkoffClient, Trade, enabled
 
 log = logging.getLogger(__name__)
 
-FLOW_INTERVAL_SEC = 20          # опрос ленты/стакана
-SIGNAL_COOLDOWN_SEC = 15 * 60   # один и тот же сигнал по бумаге — не чаще
-KIND_COOLDOWN_SEC = 5 * 60      # один и тот же ТИП сигнала по бумаге — не чаще
-DIGEST_SEC = 120                # сигналы по бумаге копятся и уходят пачкой
+FLOW_INTERVAL_SEC = 30          # опрос ленты/стакана
+SIGNAL_COOLDOWN_SEC = 30 * 60   # один и тот же сигнал по бумаге — не чаще
+KIND_COOLDOWN_SEC = 10 * 60     # один и тот же ТИП сигнала по бумаге — не чаще
+DIGEST_SEC = 300                # сигналы по бумаге копятся и уходят пачкой
 MAX_SIGNALS_PER_MSG = 4
 DAYSTATS_TTL = 60               # как часто обновлять high/low/VWAP
 
 # направление сигнала для оценки «попаданий»
 def _direction(sig: tape.Signal) -> int:
     t = sig.text
-    if sig.kind in ("iceberg", "whale", "imbalance", "rhythm"):
+    if sig.kind in ("iceberg", "whale", "whale_series", "imbalance", "rhythm"):
         return 1 if "покуп" in t else -1 if "прода" in t else 0
     if sig.kind == "eaten":
         return 1 if "вверх" in t else -1 if "вниз" in t else 0
@@ -302,6 +302,9 @@ class FlowMonitor:
             ctx += (f"\n📊 15 мин: бумага {fmt_pct(ch15)}, IMOEX {fmt_pct(im['15m'])} — "
                     + ("сильнее рынка" if rs > 0 else "слабее рынка" if rs < 0 else "с рынком"))
         body = "\n\n".join(s.text for s in sigs)
+        # под китами контекст не показываем — перегружает (по просьбе пользователя)
+        if all(s.kind in ("whale", "whale_series") for s in sigs):
+            ctx = ""
         text = body + ("\n\n" + ctx if ctx else "")
         try:
             msg = await self.bot.send_message(uid, text, reply_markup=flow_kb(t))

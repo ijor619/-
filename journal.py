@@ -16,12 +16,12 @@ from typing import Optional
 KIND_EMOJI = {
     "iceberg": "🧊", "rhythm": "🤖", "imbalance": "⚖️", "burst": "🔥",
     "wall": "🧱", "spoof": "👻", "whale": "🐋", "eaten": "🍽",
-    "level": "📏", "volume": "📊",
+    "level": "📏", "volume": "📊", "whale_series": "🐋🐋",
 }
 KIND_NAME = {
     "iceberg": "айсберг", "rhythm": "ритм", "imbalance": "перекос",
     "burst": "всплеск", "wall": "плотность", "spoof": "спуфинг",
-    "whale": "кит", "eaten": "стену съели", "level": "уровень", "volume": "объём",
+    "whale": "кит", "eaten": "стену съели", "level": "уровень", "volume": "объём", "whale_series": "серия китов",
 }
 # ожидаемое направление сигнала: +1 — рост, -1 — падение, 0 — неизвестно
 CHECKPOINTS = (5, 15)  # минуты
