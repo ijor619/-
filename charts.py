@@ -15,11 +15,16 @@ from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import aiohttp
-import matplotlib
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
-from matplotlib import gridspec  # noqa: E402
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib import gridspec
+    HAVE_MPL = True
+except Exception as _e:  # matplotlib не установлен / не собрался
+    HAVE_MPL = False
+    _MPL_ERR = repr(_e)
 
 import moex  # noqa: E402
 from formatting import cur_symbol, fmt_pct, fmt_price  # noqa: E402
@@ -153,6 +158,9 @@ class Overlay:
 
 def render(info: SecurityInfo, p: Period, cs: list[Candle],
            ov: Optional[Overlay] = None) -> bytes:
+    if not HAVE_MPL:
+        raise RuntimeError(f"matplotlib недоступен на сервере: {_MPL_ERR}. "
+                           "Проверь установку зависимостей (requirements.txt) и объём RAM.")
     cur = cur_symbol(info.currency)
     n = len(cs)
     ov = ov or Overlay()
