@@ -591,7 +591,6 @@ async def cb_chart_close(c: CallbackQuery) -> None:
         pass
 
 
-@router.callback_query(F.data.startswith("chart:"))
 def _reply_ctx(c: CallbackQuery) -> tuple[int, int | None]:
     """Куда отвечать на нажатие: (chat_id, reply_to_message_id).
 
@@ -608,6 +607,7 @@ def _reply_ctx(c: CallbackQuery) -> tuple[int, int | None]:
     return m.chat.id, None
 
 
+@router.callback_query(F.data.startswith("chart:"))
 async def cb_chart(c: CallbackQuery, store: Store, sess: aiohttp.ClientSession,
                    tk: tinkoff.TinkoffClient) -> None:
     parts = c.data.split(":")
