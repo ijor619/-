@@ -27,6 +27,7 @@ from aiogram.types import (BotCommand, BotCommandScopeDefault, BufferedInputFile
 
 import charts
 import cleaner
+import screener as scrmod
 import clusters as clu
 import cscalp
 import moex
@@ -36,7 +37,7 @@ import tinkoff
 from flow import FlowMonitor
 from journal import Journal
 from news import NewsMonitor, NEWS_CHANNEL
-from keyboards import book_kb, chart_kb, cluster_kb, report_kb, setup_kb, tape_kb
+from keyboards import book_kb, chart_kb, cluster_kb, report_kb, setup_kb, tape_kb, screener_kb
 from config import (BOT_TOKEN, CHECK_INTERVAL_SEC, DATA_FILE,
                     DEFAULT_REPORT_MIN, DEFAULT_THRESHOLD_PCT)
 from formatting import cur_symbol, esc, fmt_pct, fmt_price
@@ -54,6 +55,7 @@ HELP = (
     "<b>Команды</b>\n"
     "/watch TICKER [TICKER …] — добавить акции, напр. /watch SBER GAZP\n"
     "/unwatch TICKER — убрать из списка\n"
+    "/screener [15m|30m|1h|4h|1d] — скринер: топ-10 роста и падения по ликвидным акциям\n"
     "/list — список с текущими ценами\n"
     "/alert N — алерт, если цена уйдёт более чем на N% за день (0.1–50)\n"
     "/quiet N — мин. пауза между повторными алертами, мин\n"
@@ -695,6 +697,64 @@ async def cb_cscalp(c: CallbackQuery, csq: cscalp.CScalpQueue, sess) -> None:
         asyncio.create_task(_cscalp_confirm(c.bot, c.message.chat.id, sess, csq, t, cid))
 
 
+# --------------------------------------------------------------- скринер
+
+_scr_msg: dict[int, int] = {}   # chat_id -> message_id открытого скринера (одно на чат)
+
+
+async def show_screener(bot: Bot, chat_id: int, scr: scrmod.Screener, win: str,
+                        current: Optional[Message] = None) -> None:
+    """Одно сообщение скринера на чат: переключение окна редактирует его на месте
+    (как график); новая команда удаляет старое сообщение и присылает свежее."""
+    if win not in scrmod.WINDOWS:
+        win = scrmod.DEFAULT_WINDOW
+    text = scrmod.format_screener(scr, win, esc)
+    kb = screener_kb(win)
+    if current is not None:
+        try:
+            await current.edit_text(text, reply_markup=kb)
+            return
+        except TelegramBadRequest as e:
+            if "not modified" in str(e):
+                return
+            log.warning("screener edit: %s", e)
+    old = _scr_msg.pop(chat_id, None)
+    if old:
+        try:
+            await bot.delete_message(chat_id, old)
+        except Exception:
+            pass
+    m = await bot.send_message(chat_id, text, reply_markup=kb)
+    _scr_msg[chat_id] = m.message_id
+
+
+@router.message(Command("screener"))
+async def cmd_screener(m: Message, scr: scrmod.Screener) -> None:
+    args = (m.text or "").split()[1:]
+    win = args[0].lower() if args else scrmod.DEFAULT_WINDOW
+    if win not in scrmod.WINDOWS:
+        await m.answer("Использование: /screener [15m|30m|1h|4h|1d]"); return
+    await show_screener(m.bot, m.chat.id, scr, win)
+
+
+@router.callback_query(F.data == "scr:close")
+async def cb_scr_close(c: CallbackQuery) -> None:
+    await c.answer()
+    _scr_msg.pop(c.message.chat.id, None)
+    try:
+        await c.message.delete()
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("scr:"))
+async def cb_scr(c: CallbackQuery, scr: scrmod.Screener) -> None:
+    parts = c.data.split(":")
+    win = parts[1]
+    await c.answer("Обновляю…" if len(parts) > 2 else None)
+    await show_screener(c.bot, c.message.chat.id, scr, win, current=c.message)
+
+
 # --------------------------------------------------------------- очистка
 
 @router.message(Command("clear"))
@@ -1020,6 +1080,7 @@ async def on_added(ev) -> None:
 
 BOT_COMMANDS = [
     ("list", "Мои бумаги и цены"),
+    ("screener", "Скринер: что двигается — /screener 15m"),
     ("setup", "Сетап: за/против входа — /setup SBER"),
     ("clusters", "Кластеры объёма — /clusters SBER 1h"),
     ("chart", "Свечной график — /chart SBER 5m"),
@@ -1060,8 +1121,8 @@ def main_kb(watchlist: list[str]) -> ReplyKeyboardMarkup:
              KeyboardButton(text="🧮 Кластеры")],
             [KeyboardButton(text="📈 График"), KeyboardButton(text="📚 Стакан"),
              KeyboardButton(text="🧾 Лента")],
-            [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="📰 Новости"),
-             KeyboardButton(text="⚙️ Настройки")]]
+            [KeyboardButton(text="🔎 Скринер"), KeyboardButton(text="📊 Статистика"),
+             KeyboardButton(text="📰 Новости"), KeyboardButton(text="⚙️ Настройки")]]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True,
                                input_field_placeholder="Тикер или команда…")
 
@@ -1071,6 +1132,7 @@ MENU_MAP = {
     "📋 Список": "list", "🎯 Сетап": "setup", "🧮 Кластеры": "clusters",
     "📈 График": "chart", "📚 Стакан": "book", "🧾 Лента": "tape",
     "📊 Статистика": "stats", "📰 Новости": "news", "⚙️ Настройки": "settings",
+    "🔎 Скринер": "screener",
 }
 NEEDS_TICKER = {"setup", "clusters", "chart", "book", "tape"}
 
@@ -1205,15 +1267,19 @@ def main() -> None:
         health_task = asyncio.create_task(health_check(bot))
         await setup_menu(bot)
         clean_task = asyncio.create_task(cleaner.run_daily(bot, sent, store, moex.now_msk))
+        scr = scrmod.Screener(tk, os.path.dirname(DATA_FILE) or ".")
+        scr_task = asyncio.create_task(scr.run(session)) if tinkoff.enabled() else None
         csq = cscalp.CScalpQueue()
         runner = await csq.start() if (cscalp.enabled() and cscalp.HTTP_MODE) else None
         try:
             await dp.start_polling(bot, store=store, sess=session, tk=tk,
                                    journal=journal, newsmon=newsmon, cstore=cstore, flow=flow,
-                                   csq=csq, sent=sent)
+                                   csq=csq, sent=sent, scr=scr)
         finally:
             cstore.save(force=True)
             clean_task.cancel()
+            if scr_task:
+                scr_task.cancel()
             sent.save()
             if runner is not None:
                 await runner.cleanup()

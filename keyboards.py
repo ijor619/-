@@ -188,3 +188,15 @@ def news_kb(tickers: list[str]) -> InlineKeyboardMarkup | None:
         ])
         rows.append(_links_row(t))
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+def screener_kb(win: str) -> InlineKeyboardMarkup:
+    """Под скринером: окна как у графика (одно сообщение, редактируется на месте)."""
+    from screener import WINDOW_ORDER, WINDOW_SHORT
+    row = [InlineKeyboardButton(text=("● " if w == win else "") + WINDOW_SHORT[w],
+                                callback_data=f"scr:{w}") for w in WINDOW_ORDER]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        row,
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"scr:{win}:r"),
+         InlineKeyboardButton(text="✖️ Закрыть", callback_data="scr:close")],
+    ])
