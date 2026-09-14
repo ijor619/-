@@ -704,27 +704,58 @@ _scr_msg: dict[int, int] = {}   # chat_id -> message_id открытого ск�
 
 async def show_screener(bot: Bot, chat_id: int, scr: scrmod.Screener, win: str,
                         current: Optional[Message] = None) -> None:
-    """Одно сообщение скринера на чат: переключение окна редактирует его на месте
-    (как график); новая команда удаляет старое сообщение и присылает свежее."""
+    """Одно сообщение скринера на чат: картинка-таблица; переключение окна
+    редактирует его на месте (как график); новая команда удаляет старое."""
     if win not in scrmod.WINDOWS:
         win = scrmod.DEFAULT_WINDOW
-    text = scrmod.format_screener(scr, win, esc)
     kb = screener_kb(win)
-    if current is not None:
+    ups, downs, n = scr.rows(win)
+    if not scr.secs or n == 0:
+        # данных нет — короткий текст вместо пустой картинки
+        text = scrmod.format_screener(scr, win, esc)
+        if current is not None and not current.photo:
+            try:
+                await current.edit_text(text, reply_markup=kb); return
+            except TelegramBadRequest:
+                pass
+        old = _scr_msg.pop(chat_id, None)
+        if old:
+            try:
+                await bot.delete_message(chat_id, old)
+            except Exception:
+                pass
+        m = await bot.send_message(chat_id, text, reply_markup=kb)
+        _scr_msg[chat_id] = m.message_id
+        return
+    try:
+        png = await asyncio.to_thread(scrmod.render_png, scr, win)
+    except Exception as e:
+        log.exception("screener render")
+        await bot.send_message(chat_id, scrmod.format_screener(scr, win, esc) +
+                               f"\n<i>(картинка недоступна: {esc(e)})</i>", reply_markup=kb)
+        return
+    file = BufferedInputFile(png, f"screener_{win}.png")
+    caption = f"🔎 Скринер MOEX — {scrmod.WINDOW_TITLES[win]}"
+    if current is not None and current.photo:
         try:
-            await current.edit_text(text, reply_markup=kb)
+            await current.edit_media(InputMediaPhoto(media=file, caption=caption), reply_markup=kb)
             return
         except TelegramBadRequest as e:
             if "not modified" in str(e):
                 return
-            log.warning("screener edit: %s", e)
+            log.warning("screener edit_media: %s", e)
     old = _scr_msg.pop(chat_id, None)
     if old:
         try:
             await bot.delete_message(chat_id, old)
         except Exception:
             pass
-    m = await bot.send_message(chat_id, text, reply_markup=kb)
+    if current is not None and not current.photo:
+        try:
+            await current.delete()
+        except Exception:
+            pass
+    m = await bot.send_photo(chat_id, file, caption=caption, reply_markup=kb)
     _scr_msg[chat_id] = m.message_id
 
 

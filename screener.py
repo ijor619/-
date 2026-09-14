@@ -331,3 +331,82 @@ def format_screener(scr: Screener, win: str, esc) -> str:
         body += "\n<i>Сейчас не торговое время — цены на момент закрытия.</i>"
     foot = f"\n<i>{esc(scr.status_text())}; в расчёте {n} бумаг</i>"
     return head + "\n" + body + foot
+
+
+# ---------------------------------------------------------------- картинка
+
+def render_png(scr: "Screener", win: str) -> bytes:
+    """Таблица в тёмной теме (стиль брокерского приложения): два блока —
+    Рост и Падение. Колонки: Инструмент | Цена | Объём, день | Изм."""
+    import io
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import FancyBboxPatch
+
+    BG, PANEL, ROW_ALT = "#0f1621", "#161f2c", "#1a2432"
+    TXT, MUTED, HEAD = "#e6edf3", "#8b98a9", "#c9d3df"
+    UP, DOWN, LINE = "#22c55e", "#ef4444", "#243040"
+
+    ups, downs, n = scr.rows(win)
+    title = WINDOW_TITLES.get(win, win)
+    blocks = [("Рост", ups, UP), ("Падение", downs, DOWN)]
+
+    row_h = 0.42
+    n_rows = sum(max(len(r), 1) for _, r, _ in blocks)
+    height = 1.05 + n_rows * row_h + len(blocks) * 1.1 + 0.6
+    fig = plt.figure(figsize=(6.4, height), dpi=180, facecolor=BG)
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.set_xlim(0, 6.4); ax.set_ylim(0, height); ax.axis("off")
+
+    # колонки (x-координаты)
+    x_tick, x_price, x_vol, x_chg = 0.35, 3.05, 4.55, 6.15
+    y = height - 0.45
+    ax.text(0.3, y, f"Скринер MOEX · изменение за {title}", color=TXT, fontsize=12.5,
+            fontweight="bold", va="center")
+    upd = scr.updated.strftime("%H:%M") if scr.updated else "—"
+    ax.text(6.1, y, f"{upd} МСК", color=MUTED, fontsize=8.5, va="center", ha="right")
+    y -= 0.6
+
+    def header(y: float) -> None:
+        ax.text(x_tick, y, "Инструмент", color=MUTED, fontsize=8.5, va="center")
+        ax.text(x_price, y, "Цена", color=MUTED, fontsize=8.5, va="center", ha="right")
+        ax.text(x_vol, y, "Объём, день", color=MUTED, fontsize=8.5, va="center", ha="right")
+        ax.text(x_chg, y, f"Изм. {WINDOW_SHORT[win]}", color=MUTED, fontsize=8.5, va="center", ha="right")
+        ax.plot([0.25, 6.15], [y - 0.2, y - 0.2], color=LINE, lw=0.8)
+
+    for name, rows, col in blocks:
+        # заголовок блока — «чип»
+        ax.add_patch(FancyBboxPatch((0.25, y - 0.17), 1.25, 0.34, boxstyle="round,pad=0.02,rounding_size=0.08",
+                                    fc=PANEL, ec=col, lw=1.0))
+        ax.text(0.875, y, name, color=col, fontsize=9.5, fontweight="bold", ha="center", va="center")
+        y -= 0.42
+        header(y)
+        y -= 0.38
+        if not rows:
+            ax.text(x_tick, y, "нет", color=MUTED, fontsize=9, va="center")
+            y -= row_h
+        for i, r in enumerate(rows):
+            if i % 2 == 0:
+                ax.add_patch(FancyBboxPatch((0.25, y - row_h / 2 + 0.02), 5.9, row_h - 0.04,
+                                            boxstyle="round,pad=0,rounding_size=0.05", fc=ROW_ALT, ec="none"))
+            # «иконка» — кружок с первой буквой
+            ax.add_patch(plt.Circle((x_tick + 0.12, y), 0.13, fc=col, ec="none", alpha=0.85))
+            ax.text(x_tick + 0.12, y, r.ticker[0], color=BG, fontsize=7.5, fontweight="bold", ha="center", va="center")
+            ax.text(x_tick + 0.36, y + 0.08, r.ticker, color=TXT, fontsize=9.5, fontweight="bold", va="center")
+            ax.text(x_tick + 0.36, y - 0.11, r.name[:22], color=MUTED, fontsize=6.5, va="center")
+            ax.text(x_price, y, _fmt_price(r.price, r.decimals) + " ₽", color=TXT, fontsize=9, va="center", ha="right")
+            ax.text(x_vol, y, _fmt_turn(r.turnover) + " ₽", color=HEAD, fontsize=8.5, va="center", ha="right")
+            ax.text(x_chg, y, f"{r.pct:+.2f}%", color=col, fontsize=9.5, fontweight="bold", va="center", ha="right")
+            y -= row_h
+        y -= 0.3
+
+    foot = f"{len(scr.secs)} бумаг, оборот ≥ {MIN_TURNOVER / 1e6:.0f} млн ₽ · T-Invest realtime"
+    if not trading_time():
+        foot += " · не торговое время"
+    ax.text(0.3, 0.22, foot, color=MUTED, fontsize=7, va="center")
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", facecolor=BG)
+    plt.close(fig)
+    return buf.getvalue()
