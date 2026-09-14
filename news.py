@@ -267,6 +267,69 @@ _STOP = {"россии", "россия", "банка", "банк", "заявил
          "того", "этом", "также", "году", "года", "компания", "компании"}
 
 
+def _norm_link(link: str) -> str:
+    """Ссылка без utm/query/фрагмента — чтобы перепубликация с другими метками
+    не считалась новой новостью."""
+    link = (link or "").strip()
+    if not link:
+        return ""
+    link = re.sub(r"[?#].*$", "", link)
+    link = re.sub(r"^https?://(www\.)?", "", link, flags=re.I)
+    return link.rstrip("/").lower()
+
+
+def _stem(w: str) -> str:
+    """Очень грубая основа слова: первые 5 символов (сохранил/сохранена → «сохра»)."""
+    return w[:5] if len(w) > 5 else w
+
+
+def _title_fp(title: str) -> str:
+    """Отпечаток заголовка: только значимые слова, отсортированы — переставленные
+    слова/кавычки/двоеточия агентств дают тот же отпечаток."""
+    words = sorted({_stem(w) for w in re.findall(r"[а-яёa-z0-9]{3,}", title.lower()) if w not in _STOP})
+    return hashlib.md5(" ".join(words).encode()).hexdigest()[:16]
+
+
+# ------------------------------------------------------------ спорт
+# 1) категория RSS / путь ссылки — надёжнее всего
+SPORT_URL = re.compile(r"(^|[./])sport(rbc)?\.|/sport/|/sports?/|/football|/hockey|/match", re.I)
+SPORT_CATEGORY = re.compile(r"спорт|sport|футбол|хоккей|кхл|рпл|олимп", re.I)
+# 2) спортивная лексика в тексте
+SPORT_RX = re.compile(
+    r"\b(матч\w*|гол\w{0,3}|забил\w*|хокке\w*|футбол\w*|кхл|рпл|нхл|фнл|плей-офф|овертайм\w*|буллит\w*|"
+    r"шайб\w*|вратар\w*|нападающ\w*|полузащитник\w*|защитник\w*|голкипер\w*|тренер\w*|"
+    r"сборн\w* (россии|мира)|чемпионат\w*|лиг[аеиу] чемпионов|евролиг\w*|кубк?\w* (гагарина|россии|мира|стэнли)|"
+    r"тур[ае]? (рпл|чемпионата|первенства)|дерби|разгромил\w*|обыграл\w*|уступил\w* (со счетом|со счётом)|"
+    r"со сч[её]том \d+[:-]\d+|\d+[:-]\d+ в (матче|игре)|сухой матч|хет-трик|дубл[ья] в (матче|игре)|"
+    r"легионер\w*|трансфер\w* (игрок|футболист|хоккеист)|футболист\w*|хоккеист\w*|баскетбол\w*|волейбол\w*|"
+    r"биатлон\w*|фигурист\w*|теннис\w*|бокс[её]р\w*|ufc|формул[аы]-1|гран-при|"
+    r"болельщик\w*|стадион\w*|арен[аеы] (в|на|им)|фан-сектор|судейств\w*|арбитр\w*)\b", re.I)
+# 3) клуб с «корпоративным» именем: ХК «Северсталь», ФК «Акрон», «Металлург»…
+SPORT_CLUB = re.compile(r"\b(хк|фк|бк|вк|пфк|мфк)\b\s*[«\"']?|(хоккейн|футбольн|баскетбольн|волейбольн)\w* клуб", re.I)
+# сильные корпоративные события — даже при спортивной лексике не режем
+CORP_STRONG = re.compile(r"дивиденд|отч[её]тност|выручк|чист\w* (прибыл|убыт)|ebitda|байбэк|buyback|обратн\w* выкуп|"
+                         r"размещени|ipo|spo|облигаци|купон|санкци|арест|обыск|суд |иск |штраф|"
+                         r"сделк\w* по (покупке|продаже)|поглощени|слияни|доля в|акци[ий] (компании|банка)|"
+                         r"котировк|торги|биржев|листинг|делистинг|ставк\w* (цб|банка россии)|ключев\w* ставк", re.I)
+
+
+def sport_reason(item: "NewsItem") -> str:
+    """Почему новость спортивная ('' — не спортивная)."""
+    if SPORT_URL.search(item.link or ""):
+        return "url"
+    if item.category and SPORT_CATEGORY.search(item.category):
+        return "category"
+    text = f"{item.title} {item.summary}"
+    if CORP_STRONG.search(text):
+        return ""
+    hits = SPORT_RX.findall(text)
+    if len(hits) >= 2 or (hits and SPORT_CLUB.search(text)):
+        return "lexicon"
+    if SPORT_CLUB.search(item.title):
+        return "club"
+    return ""
+
+
 @dataclass
 class NewsItem:
     uid: str
@@ -279,6 +342,8 @@ class NewsItem:
     tickers: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
     priority: int = 0
+    category: str = ""
+    sport: bool = False
 
 
 # --------------------------------------------------------------- парсинг
@@ -307,9 +372,12 @@ def _parse_rss(source_id: str, source: str, xml: str) -> list[NewsItem]:
         except Exception:
             dt = datetime.now(timezone.utc)
         desc = _norm(it.findtext("description") or "")[:400]
-        uid = hashlib.md5((link or title).encode()).hexdigest()[:16]
-        out.append(NewsItem(uid, source_id, source, title, link,
-                            dt.astimezone(timezone.utc), desc))
+        cats = " ".join(_norm(c.text or "") for c in it.findall("category"))
+        uid = hashlib.md5((_norm_link(link) or title).encode()).hexdigest()[:16]
+        item = NewsItem(uid, source_id, source, title, link,
+                        dt.astimezone(timezone.utc), desc)
+        item.category = cats
+        out.append(item)
     return out
 
 
@@ -362,6 +430,10 @@ def classify(item: NewsItem, watch: dict[str, list[str]]) -> None:
     if "MOEX" in tickers and len(tickers) > 1 and re.search(r"на мосбирж|на московской бирж", text):
         tickers.remove("MOEX")
     item.tickers = tickers
+    # спортивный контекст: тикеры-«клубы» (Северсталь, Акрон, Металлург…) снимаем
+    if tickers and sport_reason(item):
+        item.sport = True
+        item.tickers = tickers = []
     tags, prio = [], 0
     if tickers:
         prio = 1
@@ -393,6 +465,8 @@ def is_relevant(item: NewsItem, mode: str) -> bool:
     + рыночные триггеры; 'market' — мои бумаги + рыночные; 'all' — всё."""
     if mode == "all":
         return True
+    if item.sport:
+        return False
     if item.tickers:
         return item.priority >= 1   # 0 = PR-шум по тикеру, отфильтрован в classify
     if mode == "watch":
@@ -428,6 +502,7 @@ class NewsMonitor:
         self.bot, self.store, self.mode = bot, store, mode
         self.seen_path = seen_path
         self.seen: dict[str, float] = {}
+        self._stories: list[dict] = []
         self._load()
         self._first = True
         self.channel = NEWS_CHANNEL
@@ -437,7 +512,12 @@ class NewsMonitor:
     def _load(self) -> None:
         try:
             with open(self.seen_path, encoding="utf-8") as f:
-                self.seen = json.load(f)
+                data = json.load(f)
+            if isinstance(data, dict) and "seen" in data:
+                self.seen = data["seen"]
+                self._stories = data.get("stories", [])
+            else:
+                self.seen = data
         except (FileNotFoundError, json.JSONDecodeError):
             self.seen = {}
 
@@ -448,7 +528,7 @@ class NewsMonitor:
         if d:
             os.makedirs(d, exist_ok=True)
         with open(self.seen_path, "w", encoding="utf-8") as f:
-            json.dump(self.seen, f)
+            json.dump({"seen": self.seen, "stories": getattr(self, "_stories", [])[-500:]}, f)
 
     def watch_dict(self) -> dict[str, list[str]]:
         tickers = {t for _, p in self.store.all() for t in p.watchlist}
@@ -461,20 +541,43 @@ class NewsMonitor:
         return {t: COMPANY_ALIASES.get(t, []) for t in tickers}
 
     def _is_dup_story(self, it: "NewsItem") -> bool:
-        """Тот же сюжет от другого агентства в течение 30 мин: те же тикеры/теги
-        и ≥60% общих значимых слов заголовка — не постим повторно."""
-        words = {w for w in re.findall(r"[а-яёa-z0-9]{4,}", it.title.lower())
-                 if w not in _STOP}
-        if not words:
-            return False
+        """Дубли:
+        1) тот же отпечаток заголовка (значимые слова) за 24 ч — любой источник;
+        2) тот же сюжет за 3 ч: пересекаются тикеры (или оба без тикеров и
+           пересекаются теги) и ≥55 % общих значимых слов заголовка.
+        Список сюжетов сохраняется на диск — рестарт бота дубли не открывает."""
+        words = {_stem(w) for w in re.findall(r"[а-яёa-z0-9]{4,}", it.title.lower()) if w not in _STOP}
         now = time.time()
-        self._stories = [(ts, k, ws) for ts, k, ws in getattr(self, "_stories", [])
-                         if now - ts < 1800]
-        key = (tuple(it.tickers), tuple(t for t in it.tags if t not in ("ЦБ",)))
-        for ts, k, ws in self._stories:
-            if k == key and len(words & ws) / max(1, min(len(words), len(ws))) >= 0.6:
+        fp = _title_fp(it.title)
+        self._stories = [st for st in self._stories if now - st["ts"] < 24 * 3600]
+        for st in self._stories:
+            if st["fp"] == fp:
                 return True
-        self._stories.append((now, key, words))
+        # события-«одиночки»: решение по ключевой ставке публикуем один раз за 3 ч,
+        # как бы агентства его ни переформулировали
+        if "ЦБ ставка" in it.tags and not it.tickers and \
+                re.search(r"(сохран|повы[сш]|сниз|остав|подн|опуст)\w*.{0,40}\d{1,2}([.,]\d+)?\s?%", it.title.lower()):
+            for st in self._stories:
+                if now - st["ts"] < 3 * 3600 and st.get("rate"):
+                    return True
+            self._stories.append({"ts": now, "fp": fp, "t": [], "g": list(it.tags),
+                                  "w": sorted(words)[:40], "rate": True})
+            return False
+        if words:
+            tick, tags = set(it.tickers), set(it.tags)
+            for st in self._stories:
+                if now - st["ts"] > 3 * 3600:
+                    continue
+                st_t, st_g = set(st["t"]), set(st["g"])
+                same_topic = (tick & st_t) or (not tick and not st_t and (tags & st_g))
+                if not same_topic:
+                    continue
+                ws = set(st["w"])
+                if len(words) >= 3 and len(ws) >= 3 and \
+                        len(words & ws) / max(1, min(len(words), len(ws))) >= 0.55:
+                    return True
+        self._stories.append({"ts": now, "fp": fp, "t": list(it.tickers), "g": list(it.tags),
+                              "w": sorted(words)[:40]})
         return False
 
     async def fetch_source(self, sess: aiohttp.ClientSession,
