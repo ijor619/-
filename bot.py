@@ -949,6 +949,13 @@ async def cmd_stats(m: Message, journal: Journal) -> None:
     await m.answer(journal.stats(m.from_user.id, days, ticker))
 
 
+@router.message(Command("mutes"))
+async def cmd_mutes(m: Message, journal: Journal, store: Store) -> None:
+    """Какие пары «бумага × тип сигнала» сейчас отключены авто-фильтром."""
+    prof = store.get(m.from_user.id)
+    await m.answer(journal.mutes_text(prof.watchlist))
+
+
 @router.callback_query(F.data.startswith("book:"))
 async def cb_book(c: CallbackQuery, sess: aiohttp.ClientSession, tk: tinkoff.TinkoffClient) -> None:
     parts = c.data.split(":")
@@ -1120,6 +1127,7 @@ BOT_COMMANDS = [
     ("watch", "Добавить бумаги — /watch SBER GAZP"),
     ("unwatch", "Убрать бумагу"),
     ("stats", "Точность сигналов — /stats 7"),
+    ("mutes", "Авто-фильтр: какие сигналы отключены"),
     ("news", "Новости: статус и последние"),
     ("flow", "Сигналы роботов вкл/выкл — /flow on|off"),
     ("alert", "Порог алерта, % — /alert 3"),
@@ -1212,7 +1220,7 @@ async def _dispatch(m: Message, **kw) -> None:
     """Вызвать обработчик команды напрямую (кнопка меню / выбор тикера)."""
     handlers = {
         "list": cmd_list, "setup": cmd_setup, "clusters": cmd_clusters, "chart": cmd_chart,
-        "book": cmd_book, "tape": cmd_tape, "stats": cmd_stats, "news": cmd_news,
+        "book": cmd_book, "tape": cmd_tape, "stats": cmd_stats, "mutes": cmd_mutes, "news": cmd_news,
         "settings": cmd_settings,
     }
     cmd = m.text.split()[0].lstrip("/")

@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import logging
 import time
 from datetime import datetime, timedelta
@@ -23,7 +24,7 @@ from aiogram.exceptions import TelegramBadRequest
 import moex
 import setup as stp
 import tape
-from journal import CHECKPOINTS, Entry, Journal
+from journal import CHECKPOINTS, Entry, Journal, HIT_PCT
 from keyboards import flow_kb
 from formatting import fmt_pct
 from moex import now_msk
@@ -51,6 +52,18 @@ def _direction(sig: tape.Signal) -> int:
     if sig.kind == "spoof":
         return -1 if "на покупку" in t else 1  # ложный бид -> реальный интерес продать
     return 0
+
+
+def _hm(s: str, default: int) -> int:
+    try:
+        h, m = (s.split(":") + ["0"])[:2]
+        return int(h) * 60 + int(m)
+    except Exception:
+        return default
+
+
+SIGNAL_FROM_MIN = _hm(os.getenv("SIGNAL_FROM", "07:00"), 7 * 60)
+SIGNAL_TO_MIN = _hm(os.getenv("SIGNAL_TO", "19:00"), 19 * 60)
 
 
 class DayStats:
@@ -218,12 +231,15 @@ class FlowMonitor:
 
     @staticmethod
     def _main_session() -> bool:
-        """Торговое время MOEX: утренняя 06:50 + основная + вечерняя до 23:50 МСК.
+        """Окно сигналов 07:00–19:00 МСК (см. SIGNAL_FROM/SIGNAL_TO).
+        По статистике недели вечерняя сессия давала 20% сигналов с 10% попадания —
+        для сигналов закрыта; лента для кластеров копится всё равно (см. tick)."""
+        n = now_msk()
+        m = n.hour * 60 + n.minute
+        return SIGNAL_FROM_MIN <= m <= SIGNAL_TO_MIN
 
-        Детекторы работают всю сессию; утренняя тоньше, но адаптивные
-        пороги (Baseline) сами подстраиваются под её активность.
-        Выходные — только если торги идут (MOEX иногда торгует в выходные).
-        """
+    @staticmethod
+    def _trading_time() -> bool:
         n = now_msk()
         m = n.hour * 60 + n.minute
         return 6 * 60 + 50 <= m <= 23 * 60 + 50
@@ -246,11 +262,16 @@ class FlowMonitor:
 
         now = time.time()
         hour = now_msk().hour
+        if not self._main_session():
+            return   # вне окна сигналов: лента уже накоплена для кластеров, уведомлений нет
         for uid, prof in users:
             if prof.is_quiet(hour):
                 continue
             for t in prof.watchlist:
                 for sig in signals.get(t, []):
+                    # авто-фильтр по статистике: слабые пары «бумага × тип» не шлём
+                    if self.journal.is_muted(t, sig.kind):
+                        continue
                     k = (uid, f"{t}:{sig.key}")
                     kk = (uid, f"{t}:{sig.kind}")
                     if now - self._sent.get(k, 0) < SIGNAL_COOLDOWN_SEC:
@@ -397,8 +418,8 @@ class FlowMonitor:
                     v = first.results[str(cp)]
                     mark = ""
                     if first.direction:
-                        mark = " ✅" if v * first.direction >= 0.2 else (
-                            " ❌" if v * first.direction <= -0.2 else " ➖")
+                        mark = " ✅" if v * first.direction >= HIT_PCT else (
+                            " ❌" if v * first.direction <= -HIT_PCT else " ➖")
                     parts.append(f"{cp}м: {v:+.2f}%{mark}".replace(".", ","))
             new_text = first.text + "\n\n⏱ После сигнала → " + " · ".join(parts)
             try:

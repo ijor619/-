@@ -25,6 +25,15 @@ KIND_NAME = {
 }
 # ожидаемое направление сигнала: +1 — рост, -1 — падение, 0 — неизвестно
 CHECKPOINTS = (5, 15)  # минуты
+# «попадание»: ход в сторону сигнала через 15 мин не меньше HIT_PCT.
+# 0.2% для ликвидных бумаг — это обычный шум, поэтому 0.4%.
+HIT_PCT = 0.4
+# авто-отключение пары «бумага × тип»: n ≥ MUTE_MIN_N за MUTE_DAYS дней и попадание < MUTE_HIT
+MUTE_MIN_N = 30
+MUTE_DAYS = 7
+MUTE_HIT = 25.0
+# типы без направления — оценить нельзя, поэтому не показываем
+UNDIRECTED = {"volume", "level", "burst"}
 
 
 @dataclass
@@ -100,20 +109,59 @@ class Journal:
             avg = sum(r15) / len(r15) if r15 else None
             # «попадание» — движение ≥0,2% в сторону сигнала (если направление есть)
             hits = [e for e in grp if "15" in e.results and e.direction
-                    and e.results["15"] * e.direction >= 0.2]
+                    and e.results["15"] * e.direction >= HIT_PCT]
             directed = [e for e in grp if "15" in e.results and e.direction]
             hit_s = f"{len(hits) / len(directed) * 100:.0f}%" if directed else "—"
             avg_s = f"{avg:+.2f}%" if avg is not None else "—"
-            lines.append(f"{t:<6} {KIND_EMOJI.get(k, '')}{KIND_NAME.get(k, k):<11} "
+            mark = "🔇" if self.is_muted(t, k) else " "
+            lines.append(f"{mark}{t:<6} {KIND_EMOJI.get(k, '')}{KIND_NAME.get(k, k):<11} "
                          f"{len(grp):>3} {avg_s:>8} {hit_s:>6}")
         lines.append("</pre>")
         lines.append("<i>15м ср. — среднее изменение цены через 15 мин после сигнала; "
-                     "попад. — доля случаев, когда цена пошла в сторону сигнала на ≥0,2%.</i>")
+                     f"попад. — доля случаев, когда цена пошла в сторону сигнала на ≥{HIT_PCT:.1f}%. "
+                     "🔇 — пара отключена автоматически (n≥30, попадание <25%).</i>")
         ctx = self._ctx_stats(es)
         if ctx:
             lines.append("")
             lines.append(ctx)
         return "\n".join(lines)
+
+    # ------------------------------------------------- качество и авто-мьют
+    def quality(self, ticker: str, kind: str, days: int = MUTE_DAYS) -> tuple[int, Optional[float]]:
+        """(n оценённых направленных сигналов, попадание %) по всем пользователям."""
+        cutoff = time.time() - days * 86400
+        es = [e for e in self.entries if e.ticker == ticker and e.kind == kind
+              and e.ts >= cutoff and e.direction and "15" in e.results]
+        if not es:
+            return 0, None
+        hits = sum(1 for e in es if e.results["15"] * e.direction >= HIT_PCT)
+        return len(es), hits / len(es) * 100
+
+    def is_muted(self, ticker: str, kind: str) -> bool:
+        """Пара отключена: тип без направления, либо статистика плохая."""
+        if kind in UNDIRECTED:
+            return True
+        n, hit = self.quality(ticker, kind)
+        return n >= MUTE_MIN_N and hit is not None and hit < MUTE_HIT
+
+    def mutes_text(self, tickers: list[str]) -> str:
+        rows = []
+        for t in tickers:
+            for k in KIND_NAME:
+                if k in UNDIRECTED:
+                    continue
+                n, hit = self.quality(t, k)
+                if n == 0:
+                    continue
+                st = "🔇" if self.is_muted(t, k) else "✅"
+                rows.append(f"{st} {t:<6} {KIND_EMOJI.get(k, '')}{KIND_NAME[k]:<12} n={n:<4} {hit:>3.0f}%")
+        if not rows:
+            return "Пока нет оценённых сигналов."
+        return ("<b>Авто-фильтр сигналов</b> (7 дн., порог хода "
+                f"{HIT_PCT:.1f}%)\n<pre>" + "\n".join(rows) + "</pre>\n"
+                "<i>🔇 — отключено (n≥30, попадание <25%). Пары с малой выборкой продолжают "
+                f"приходить, пока не наберут {MUTE_MIN_N} сигналов. Объём/уровень/всплеск "
+                "выключены целиком — направления нет, оценить нельзя.</i>")
 
     def _ctx_stats(self, es: list[Entry]) -> str:
         """В каких условиях сигналы работают: по VWAP, времени дня, дельте, силе к рынку."""
@@ -132,7 +180,7 @@ class Journal:
             for lab, grp in by.items():
                 if len(grp) < 4:
                     continue
-                hits = sum(1 for e in grp if e.results["15"] * e.direction >= 0.2)
+                hits = sum(1 for e in grp if e.results["15"] * e.direction >= HIT_PCT)
                 avg = sum(e.results["15"] * e.direction for e in grp) / len(grp)
                 rows.append((lab, len(grp), hits / len(grp) * 100, avg))
             return sorted(rows, key=lambda r: -r[2])
