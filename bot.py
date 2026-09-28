@@ -946,7 +946,32 @@ async def cmd_stats(m: Message, journal: Journal) -> None:
             days = max(1, min(int(a), 14))
         elif TICKER_RE.match(a.upper()):
             ticker = a.upper()
-    await m.answer(journal.stats(m.from_user.id, days, ticker))
+    try:
+        text = journal.stats(m.from_user.id, days, ticker)
+    except Exception as e:
+        log.exception("stats")
+        await m.answer(f"⚠️ Не удалось собрать статистику: <code>{esc(e)}</code>"); return
+    for chunk in _split_html(text):
+        await m.answer(chunk)
+
+
+def _split_html(text: str, limit: int = 3900) -> list[str]:
+    """Разбить длинный ответ по строкам, не ломая блоки <pre>."""
+    if len(text) <= limit:
+        return [text]
+    out, cur, in_pre = [], "", False
+    for line in text.split("\n"):
+        if len(cur) + len(line) + 1 + (6 if in_pre else 0) > limit:
+            out.append(cur + ("</pre>" if in_pre else ""))
+            cur = ("<pre>" if in_pre else "")
+        cur += ("\n" if cur and not cur.endswith("<pre>") else "") + line
+        if "<pre>" in line:
+            in_pre = True
+        if "</pre>" in line:
+            in_pre = False
+    if cur:
+        out.append(cur)
+    return out
 
 
 @router.message(Command("mutes"))
