@@ -33,6 +33,18 @@ class SecurityTests(unittest.TestCase):
 
 
 class StatisticsTests(unittest.TestCase):
+    def test_telegram_html_escapes_less_than_sign(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = Journal(os.path.join(tmp, "signals.json"))
+            journal.entries.append(Entry(
+                ts=time.time(), uid=1, chat_id=1, msg_id=1,
+                ticker="SBER", kind="wall", price=100,
+                direction=1, results={"15": 0.5}, done=True,
+            ))
+            text = journal.stats(1)
+            self.assertNotIn("попадание <25%", text)
+            self.assertIn("попадание &lt;25%", text)
+
     def test_quality_deduplicates_deliveries(self):
         with tempfile.TemporaryDirectory() as tmp:
             journal = Journal(os.path.join(tmp, "signals.json"))
