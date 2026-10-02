@@ -1243,6 +1243,7 @@ def main_kb(watchlist: list[str]) -> ReplyKeyboardMarkup:
             [KeyboardButton(text="🔎 Скринер"), KeyboardButton(text="📊 Статистика"),
              KeyboardButton(text="📰 Новости"), KeyboardButton(text="⚙️ Настройки")]]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True,
+                               one_time_keyboard=True, is_persistent=False,
                                input_field_placeholder="Тикер или команда…")
 
 

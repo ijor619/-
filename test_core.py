@@ -85,6 +85,7 @@ class KeyboardTests(unittest.TestCase):
         for keyboard in keyboards:
             callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
             self.assertIn("panel:close", callbacks)
+            self.assertEqual(keyboard.inline_keyboard[0][0].callback_data, "panel:close")
 
 
 if __name__ == "__main__":
