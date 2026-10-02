@@ -9,13 +9,14 @@
   3) вводит тикер в появившийся поиск и жмёт Enter.
 
 Установка (один раз, в PowerShell):
-    pip install requests pywinauto pyautogui pyperclip
+    pip install -r requirements-bridge.txt
     python cscalp_bridge.py --calibrate      # навести мышь на заголовок стакана, Enter
     python cscalp_bridge.py                  # рабочий режим
 
 Настройки — в файле cscalp_bridge.ini рядом со скриптом (создаётся при первом
-запуске). Достаточно вписать key — тот же, что в переменной CSCALP_KEY у бота:
-команды идут через релей ntfy.sh, публичный адрес у бота не нужен.
+запуске). Достаточно вписать key — тот же, что в переменной CSCALP_KEY у бота.
+Команды имеют HMAC-подпись, короткий срок жизни и защиту от повторного выполнения.
+Они идут через relay; для рабочего торгового места предпочтителен свой ntfy.
 (Если у бота есть публичный URL и CSCALP_HTTP=1 — впишите url, режим http.)
 
 Автозапуск: положить ярлык на `pythonw.exe cscalp_bridge.py` в
@@ -24,11 +25,14 @@ shell:startup. Лог — cscalp_bridge.log рядом со скриптом.
 from __future__ import annotations
 
 import configparser
+import hashlib
+import hmac
 import json
 import logging
 import os
 import sys
 import time
+import re
 
 import requests
 
@@ -39,11 +43,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
                     handlers=[logging.FileHandler(LOG, encoding="utf-8"),
                               logging.StreamHandler(sys.stdout)])
 log = logging.getLogger("bridge")
-VERSION = "2026-09-12g"
+VERSION = "2026-10-02-secure"
+TICKER_RE = re.compile(r"^[A-Z][A-Z0-9]{0,9}$")
+MAX_COMMAND_AGE_SEC = 30
 
 DEFAULT_INI = """[bot]
 ; ключ — тот же, что CSCALP_KEY у бота (единственное обязательное поле)
 key = CHANGE_ME
+; необязательный неприватный id топика; пусто = SHA-256 от key
+topic =
 ; relay — через ntfy (по умолчанию, url не нужен); http — бот слушает сам
 mode = relay
 relay = https://ntfy.sh
@@ -120,6 +128,42 @@ def load_cfg() -> configparser.ConfigParser:
 def save_cfg(cfg: configparser.ConfigParser) -> None:
     with open(INI, "w", encoding="utf-8") as f:
         cfg.write(f)
+
+
+def _topic(cfg: configparser.ConfigParser) -> str:
+    key = cfg.get("bot", "key")
+    suffix = cfg.get("bot", "topic", fallback="").strip() or hashlib.sha256(key.encode()).hexdigest()[:32]
+    return "cscalp-" + suffix
+
+
+def _signed(key: str, data: dict) -> dict:
+    body = json.dumps(data, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return {**data, "sig": hmac.new(key.encode(), body.encode(), hashlib.sha256).hexdigest()}
+
+
+def _verify(key: str, data: dict) -> bool:
+    if not isinstance(data, dict) or not isinstance(data.get("sig"), str):
+        return False
+    unsigned = {k: v for k, v in data.items() if k != "sig"}
+    return hmac.compare_digest(data["sig"], _signed(key, unsigned)["sig"])
+
+
+def _valid_command(key: str, cmd: dict, used_nonces: dict[str, float]) -> bool:
+    ticker = str(cmd.get("ticker", "")).upper()
+    try:
+        age = time.time() - float(cmd.get("ts", 0))
+    except (TypeError, ValueError):
+        return False
+    nonce = str(cmd.get("nonce", ""))
+    now = time.time()
+    for old, ts in list(used_nonces.items()):
+        if now - ts > MAX_COMMAND_AGE_SEC * 2:
+            used_nonces.pop(old, None)
+    if (not TICKER_RE.fullmatch(ticker) or not nonce or nonce in used_nonces
+            or not -5 <= age <= MAX_COMMAND_AGE_SEC or not _verify(key, cmd)):
+        return False
+    used_nonces[nonce] = now
+    return True
 
 
 # ------------------------------------------------------------- CScalp UI
@@ -272,6 +316,8 @@ def dblclick_result_row(cfg: configparser.ConfigParser, ticker: str) -> bool:
 
 
 def switch_instrument(cfg: configparser.ConfigParser, ticker: str, state: dict) -> str:
+    if not TICKER_RE.fullmatch(ticker):
+        return "отклонено: некорректный тикер"
     import pyautogui
     import pyperclip
     pyautogui.FAILSAFE = False
@@ -571,8 +617,9 @@ def relay_loop(cfg: configparser.ConfigParser) -> None:
     if key == "CHANGE_ME":
         log.error("впишите key в %s", INI)
         return
-    topic = "cscalp-" + key
+    topic = _topic(cfg)
     state: dict = {}
+    used_nonces: dict[str, float] = {}
     sess = requests.Session()
     log.info("мостик %s запущен (relay %s)", VERSION, relay)
     since = "5s"
@@ -599,14 +646,17 @@ def relay_loop(cfg: configparser.ConfigParser) -> None:
                 except Exception:
                     continue
                 t = str(cmd.get("ticker", "")).upper()
-                if not t or time.time() - float(cmd.get("ts", 0)) > 60:
+                if not _valid_command(key, cmd, used_nonces):
+                    log.warning("отклонена неподписанная/просроченная команда")
                     continue
                 t0 = time.time()
                 res = switch_instrument(cfg, t, state)
                 log.info("→ %s: %s (%.2f с)", t, res, time.time() - t0)
                 try:
-                    sess.post(f"{relay}/{topic}-ack", data=json.dumps(
-                        {"id": cmd.get("id"), "ticker": t, "result": res}), timeout=10)
+                    ack = _signed(key, {"id": cmd.get("id"), "ticker": t,
+                                        "result": res, "ts": time.time(),
+                                        "nonce": os.urandom(16).hex()})
+                    sess.post(f"{relay}/{topic}-ack", data=json.dumps(ack), timeout=10)
                 except Exception:
                     pass
         except requests.exceptions.ReadTimeout:
@@ -624,23 +674,28 @@ def poll_loop(cfg: configparser.ConfigParser) -> None:
         log.error("заполните url и key в %s", INI)
         return
     state: dict = {}
+    used_nonces: dict[str, float] = {}
     sess = requests.Session()
     log.info("мостик запущен → %s", url)
     backoff = poll
     while True:
         try:
-            r = sess.get(f"{url}/cscalp/next", params={"key": key}, timeout=10)
+            headers = {"Authorization": f"Bearer {key}"}
+            r = sess.get(f"{url}/cscalp/next", headers=headers, timeout=10)
             if r.status_code == 200:
                 data = r.json()
                 backoff = poll
                 for cmd in data.get("commands", []):
                     t = str(cmd.get("ticker", "")).upper()
-                    if t:
+                    if _valid_command(key, cmd, used_nonces):
                         res = switch_instrument(cfg, t, state)
                         log.info("→ %s: %s", t, res)
                         try:
-                            sess.post(f"{url}/cscalp/ack", params={"key": key},
-                                      json={"id": cmd.get("id"), "ticker": t, "result": res}, timeout=10)
+                            ack = _signed(key, {"id": cmd.get("id"), "ticker": t,
+                                                "result": res, "ts": time.time(),
+                                                "nonce": os.urandom(16).hex()})
+                            sess.post(f"{url}/cscalp/ack", headers=headers,
+                                      json=ack, timeout=10)
                         except Exception:
                             pass
             elif r.status_code == 403:

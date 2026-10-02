@@ -20,6 +20,8 @@ _load_dotenv()
 
 # --- Telegram ---
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
+OWNER_ID: int = int(os.getenv("OWNER_ID", "0") or 0)
+MAX_WATCHLIST: int = max(1, int(os.getenv("MAX_WATCHLIST", "50")))
 
 # --- MOEX ISS API (бесплатный, без ключа) ---
 MOEX_BASE: str = "https://iss.moex.com/iss"

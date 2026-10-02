@@ -48,6 +48,8 @@ class Monitor:
     async def tick(self, session: aiohttp.ClientSession) -> None:
         users = self.store.all()
         tickers = sorted({t for _, p in users for t in p.watchlist})
+        active = set(tickers)
+        self._sec_cache = {t: value for t, value in self._sec_cache.items() if t in active}
         if not tickers:
             self._first_tick = False
             return

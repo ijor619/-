@@ -38,6 +38,7 @@ MIN_TURNOVER = float(os.getenv("SCREENER_MIN_TURNOVER", "50000000"))  # ₽/де
 HISTORY_H = 5.0                     # глубина истории цен в памяти, часов
 UNIVERSE_TTL = 3600                 # обновление вселенной, сек
 TOP_N = 10
+PRICE_FRESHNESS_SEC = 10 * 60
 
 WINDOWS: dict[str, int] = {"15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440}
 WINDOW_TITLES = {"15m": "15 мин", "30m": "30 мин", "1h": "1 час", "4h": "4 часа", "1d": "1 день"}
@@ -86,7 +87,7 @@ class Sec:
         return best
 
     def change(self, win: str) -> Optional[float]:
-        if not self.last:
+        if not self.last or time.time() - self.last_ts > PRICE_FRESHNESS_SEC:
             return None
         if win == "1d":
             if self.prev_close <= 0:
@@ -130,8 +131,10 @@ class Screener:
     def _save_turnover(self) -> None:
         try:
             os.makedirs(os.path.dirname(self._turn_file) or ".", exist_ok=True)
-            with open(self._turn_file, "w", encoding="utf-8") as f:
+            tmp = self._turn_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self._full_turnover, f)
+            os.replace(tmp, self._turn_file)
         except Exception as e:
             log.debug("screener: save turnover: %s", e)
 
@@ -234,7 +237,7 @@ class Screener:
         secs = list(self.secs.values())
         if not secs:
             return
-        now = time.time()
+        newest: Optional[datetime] = None
         for i in range(0, len(secs), 100):
             chunk = secs[i:i + 100]
             d = await self.tk._call("MarketDataService/GetLastPrices",
@@ -247,9 +250,21 @@ class Screener:
                 price = q2f(p["price"])
                 if price <= 0:
                     continue
-                s.last, s.last_ts = price, now
-                s.hist.append((now, price))
-        self.updated = now_msk()
+                try:
+                    source_dt = datetime.fromisoformat(str(p["time"]).replace("Z", "+00:00"))
+                    source_ts = source_dt.timestamp()
+                except (KeyError, TypeError, ValueError):
+                    continue
+                # GetLastPrices возвращает последнюю известную цену и в выходной.
+                # Не превращаем её в свежую точку с локальным временем опроса.
+                if time.time() - source_ts > PRICE_FRESHNESS_SEC or source_ts <= s.last_ts:
+                    continue
+                s.last, s.last_ts = price, source_ts
+                s.hist.append((source_ts, price))
+                local_dt = source_dt.astimezone(_MSK)
+                newest = local_dt if newest is None or local_dt > newest else newest
+        if newest is not None:
+            self.updated = newest
 
     # ------------------------------------------------------------ цикл
     async def run(self, session: aiohttp.ClientSession) -> None:
@@ -258,8 +273,9 @@ class Screener:
             try:
                 if time.time() - self._universe_ts > UNIVERSE_TTL:
                     await self.refresh_universe(session)
-                if trading_time():
-                    await self.poll_prices()
+                # Freshness проверяется по timestamp самого источника, поэтому
+                # праздники и выходные не создают фиктивную историю.
+                await self.poll_prices()
                 self.error = ""
             except asyncio.CancelledError:
                 raise
