@@ -6,6 +6,7 @@ import unittest
 
 import cscalp
 from journal import Entry, Journal
+from keyboards import book_kb, cluster_kb, setup_kb, tape_kb
 from screener import Sec
 from store import Store
 
@@ -63,6 +64,15 @@ class PersistenceTests(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as fh:
                 json.dump([], fh)
             self.assertEqual(list(Store(path).all()), [])
+
+
+class KeyboardTests(unittest.TestCase):
+    def test_analytical_panels_have_close_button(self):
+        keyboards = [setup_kb("SBER"), book_kb("SBER"),
+                     cluster_kb("SBER", "1h"), tape_kb("SBER")]
+        for keyboard in keyboards:
+            callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
+            self.assertIn("panel:close", callbacks)
 
 
 if __name__ == "__main__":

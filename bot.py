@@ -1077,6 +1077,17 @@ async def cb_flow_off(c: CallbackQuery, store: Store) -> None:
 
 # ------------------------------------------------------------- callbacks
 
+@router.callback_query(F.data == "panel:close")
+async def cb_panel_close(c: CallbackQuery) -> None:
+    """Закрыть открытый сетап, стакан, ленту или кластеры."""
+    await c.answer()
+    if c.message is None:
+        return
+    try:
+        await c.message.delete()
+    except Exception:
+        log.debug("не удалось закрыть аналитическую панель", exc_info=True)
+
 @router.callback_query(F.data == "chart:close")
 async def cb_chart_close(c: CallbackQuery) -> None:
     await c.answer()
