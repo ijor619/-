@@ -48,6 +48,8 @@ from store import Store
 
 log = logging.getLogger(__name__)
 
+BUILD_VERSION = "2026.10.02-v3"
+
 router = Router(name="stockbot")
 _background_tasks: set[asyncio.Task] = set()
 
@@ -264,9 +266,15 @@ async def cmd_start(m: Message, store: Store) -> None:
         "Добавь тикеры: /watch SBER GAZP\n"
         "Или просто напиши тикер обычным сообщением.\n\n"
         "Вся информация — /help. Кнопки внизу — частые действия, "
-        "полный список команд — в кнопке «Меню» слева от поля ввода.",
+        "полный список команд — в кнопке «Меню» слева от поля ввода.\n\n"
+        f"Сборка: <code>{BUILD_VERSION}</code>",
         reply_markup=main_kb(store.get(m.from_user.id).watchlist),
     )
+
+
+@router.message(Command("version"))
+async def cmd_version(m: Message) -> None:
+    await m.answer(f"Сборка: <code>{BUILD_VERSION}</code>")
 
 
 @router.message(Command("help"))
@@ -1197,6 +1205,7 @@ async def on_added(ev) -> None:
 # -------------------------------------------------------------------- меню
 
 BOT_COMMANDS = [
+    ("version", "Проверить версию сборки"),
     ("list", "Мои бумаги и цены"),
     ("screener", "Скринер: что двигается — /screener 15m"),
     ("setup", "Сетап: за/против входа — /setup SBER"),
@@ -1355,6 +1364,7 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
+    log.info("stockbot build %s starting", BUILD_VERSION)
     if not BOT_TOKEN:
         sys.exit(
             "BOT_TOKEN не задан. Получи токен у @BotFather и передай так:\n"
