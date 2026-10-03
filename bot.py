@@ -12,12 +12,11 @@ import logging
 import os
 from datetime import datetime, timedelta
 import re
-import secrets
 import sys
 
 import aiohttp
 from aiohttp import ClientTimeout
-from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -40,54 +39,16 @@ from journal import Journal
 from news import NewsMonitor, NEWS_CHANNEL
 from keyboards import book_kb, chart_kb, cluster_kb, report_kb, setup_kb, tape_kb, screener_kb
 from config import (BOT_TOKEN, CHECK_INTERVAL_SEC, DATA_FILE,
-                    DEFAULT_REPORT_MIN, DEFAULT_THRESHOLD_PCT, MAX_WATCHLIST,
-                    OWNER_ID)
+                    DEFAULT_REPORT_MIN, DEFAULT_THRESHOLD_PCT)
 from formatting import cur_symbol, esc, fmt_pct, fmt_price
 from monitor import Monitor
 from store import Store
 
 log = logging.getLogger(__name__)
 
-BUILD_VERSION = "2026.10.03-v4"
-
 router = Router(name="stockbot")
-_background_tasks: set[asyncio.Task] = set()
 
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9]{0,9}$")
-
-
-def _spawn(coro) -> None:
-    task = asyncio.create_task(coro)
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
-
-
-def _failure(label: str, exc: Exception) -> str:
-    incident = secrets.token_hex(3)
-    log.exception("%s; incident=%s", label, incident)
-    return f"⚠️ Операция не выполнена. Код ошибки: <code>{incident}</code>"
-
-
-class OwnerOnlyMiddleware(BaseMiddleware):
-    """Личный бот: сообщения и callback принимает только от OWNER_ID."""
-
-    async def __call__(self, handler, event, data):
-        user = getattr(event, "from_user", None)
-        if user is not None and user.id != OWNER_ID:
-            log.warning("отклонено обращение постороннего user_id=%s", user.id)
-            try:
-                if isinstance(event, CallbackQuery):
-                    await event.answer("Это личный бот", show_alert=True)
-                elif isinstance(event, Message):
-                    await event.answer("Это личный бот.")
-            except Exception:
-                pass
-            return None
-        return await handler(event, data)
-
-
-router.message.outer_middleware(OwnerOnlyMiddleware())
-router.callback_query.outer_middleware(OwnerOnlyMiddleware())
 
 HELP = (
     "📈 Я слежу за акциями Мосбиржи и присылаю изменения цен.\n\n"
@@ -154,9 +115,6 @@ async def _watch(m: Message, store: Store, sess: aiohttp.ClientSession,
             lines.append(f"❌ <b>{esc(t)}</b> — не найден на Мосбирже")
             continue
         if t not in prof.watchlist:
-            if len(prof.watchlist) >= MAX_WATCHLIST:
-                lines.append(f"⚠️ Лимит списка — {MAX_WATCHLIST} бумаг")
-                break
             prof.watchlist.append(t)
         lines.append(f"✅ <b>{t}</b> — {esc(info.name)}")
     store.save()
@@ -197,7 +155,7 @@ async def _list(m, store: Store, sess: aiohttp.ClientSession, tk=None) -> str:
 _chart_msg: dict[int, int] = {}
 
 
-async def show_chart(bot: Bot, chat_id: int, user_id: int, sess: aiohttp.ClientSession,
+async def show_chart(bot: Bot, chat_id: int, sess: aiohttp.ClientSession,
                      store: Store, t: str, period: str,
                      current: Message | None = None, tk=None,
                      reply_to: int | None = None, flow: "FlowMonitor | None" = None) -> str | None:
@@ -225,7 +183,7 @@ async def show_chart(bot: Bot, chat_id: int, user_id: int, sess: aiohttp.ClientS
     if png is None:
         return f"Нет данных для графика {esc(t)}."
     file = BufferedInputFile(png, f"{t}_{period}.png")
-    kb = chart_kb(t, period, store.get(user_id).watchlist)
+    kb = chart_kb(t, period, store.get(chat_id).watchlist)
 
     if current is not None and current.photo:
         try:
@@ -266,15 +224,9 @@ async def cmd_start(m: Message, store: Store) -> None:
         "Добавь тикеры: /watch SBER GAZP\n"
         "Или просто напиши тикер обычным сообщением.\n\n"
         "Вся информация — /help. Кнопки внизу — частые действия, "
-        "полный список команд — в кнопке «Меню» слева от поля ввода.\n\n"
-        f"Сборка: <code>{BUILD_VERSION}</code>",
+        "полный список команд — в кнопке «Меню» слева от поля ввода.",
         reply_markup=main_kb(store.get(m.from_user.id).watchlist),
     )
-
-
-@router.message(Command("version"))
-async def cmd_version(m: Message) -> None:
-    await m.answer(f"Сборка: <code>{BUILD_VERSION}</code>")
 
 
 @router.message(Command("help"))
@@ -333,10 +285,10 @@ async def cmd_chart(m: Message, store: Store, sess: aiohttp.ClientSession,
         await m.answer("Не похоже на тикер.")
         return
     try:
-        err = await show_chart(m.bot, m.chat.id, m.from_user.id, sess, store, t, period,
-                               tk=tk, flow=flow)
+        err = await show_chart(m.bot, m.chat.id, sess, store, t, period, tk=tk, flow=flow)
     except Exception as e:
-        err = _failure(f"chart {t}", e)
+        log.exception("chart %s", t)
+        err = f"⚠️ Не удалось построить график {esc(t)}:\n<code>{esc(e)}</code>"
     if err:
         await m.answer(err)
 
@@ -421,7 +373,7 @@ async def _book_text(sess, tk: tinkoff.TinkoffClient, t: str) -> str:
     try:
         inst = await tk.instrument(t)
     except Exception as e:
-        return _failure(f"T-Invest book {t}", e)
+        return f"⚠️ T-Invest API недоступен: {esc(e)}"
     if inst is None:
         return f"❌ <b>{esc(t)}</b> — нет такого тикера на TQBR (Т-Банк)"
     info = await moex.get_security_info(sess, t)
@@ -436,7 +388,7 @@ async def _tape_text(sess, tk: tinkoff.TinkoffClient, t: str) -> str:
     try:
         inst = await tk.instrument(t)
     except Exception as e:
-        return _failure(f"T-Invest tape {t}", e)
+        return f"⚠️ T-Invest API недоступен: {esc(e)}"
     if inst is None:
         return f"❌ <b>{esc(t)}</b> — нет такого тикера на TQBR (Т-Банк)"
     info = await moex.get_security_info(sess, t)
@@ -464,7 +416,7 @@ async def cmd_book(m: Message, sess: aiohttp.ClientSession, tk: tinkoff.TinkoffC
     try:
         text = await _book_text(sess, tk, t)
     except Exception as e:
-        text = _failure(f"book {t}", e)
+        log.exception("book %s", t); text = f"⚠️ Не удалось получить стакан {t}: {esc(e)}"
     await m.answer(text, reply_markup=book_kb(t))
 
 
@@ -479,7 +431,7 @@ async def cmd_tape(m: Message, sess: aiohttp.ClientSession, tk: tinkoff.TinkoffC
     try:
         text = await _tape_text(sess, tk, t)
     except Exception as e:
-        text = _failure(f"tape {t}", e)
+        log.exception("tape %s", t); text = f"⚠️ Не удалось получить ленту {t}: {esc(e)}"
     await m.answer(text, reply_markup=tape_kb(t))
 
 
@@ -493,7 +445,7 @@ async def _cluster_view(sess, tk: tinkoff.TinkoffClient, cstore: clu.ClusterStor
     try:
         inst = await tk.instrument(t)
     except Exception as e:
-        return _failure(f"clusters {t}", e), None
+        return f"⚠️ T-Invest API недоступен: {esc(e)}", None
     if inst is None:
         return f"❌ <b>{esc(t)}</b> — нет такого тикера на TQBR (Т-Банк)", None
     info = await moex.get_security_info(sess, t)
@@ -585,7 +537,7 @@ async def cb_clusters(c: CallbackQuery, sess: aiohttp.ClientSession,
     except Exception as e:
         log.exception("clusters %s", t)
         try:
-            await c.bot.send_message(chat_id, _failure(f"clusters callback {t}", e),
+            await c.bot.send_message(chat_id, f"⚠️ Не удалось посчитать кластеры {esc(t)}:\n<code>{esc(e)}</code>",
                                      reply_to_message_id=reply_to)
         except Exception:
             pass
@@ -598,7 +550,7 @@ async def _setup_text(sess, tk: tinkoff.TinkoffClient, cstore: clu.ClusterStore,
     try:
         inst = await tk.instrument(t)
     except Exception as e:
-        return _failure(f"setup data {t}", e)
+        return f"⚠️ T-Invest API недоступен: {esc(e)}"
     if inst is None:
         return f"❌ <b>{esc(t)}</b> — нет такого тикера на TQBR (Т-Банк)"
     info = await moex.get_security_info(sess, t)
@@ -653,7 +605,7 @@ async def cmd_setup(m: Message, store: Store, sess: aiohttp.ClientSession,
     try:
         text = await _setup_text(sess, tk, cstore, flow, t)
     except Exception as e:
-        text = _failure(f"setup {t}", e)
+        log.exception("setup %s", t); text = f"⚠️ Не удалось собрать сетап {esc(t)}: <code>{esc(e)}</code>"
     try:
         await wait.edit_text(text, reply_markup=setup_kb(t))
     except TelegramBadRequest:
@@ -671,7 +623,7 @@ async def cb_setup(c: CallbackQuery, sess: aiohttp.ClientSession, tk: tinkoff.Ti
     try:
         text = await _setup_text(sess, tk, cstore, flow, t)
     except Exception as e:
-        text = _failure(f"setup callback {t}", e)
+        log.exception("setup %s", t); text = f"⚠️ Не удалось собрать сетап {esc(t)}: <code>{esc(e)}</code>"
     if len(parts) > 2 and parts[2] == "r" and c.message and not c.message.photo:
         try:
             await c.message.edit_text(text, reply_markup=setup_kb(t)); return
@@ -684,7 +636,7 @@ async def cb_setup(c: CallbackQuery, sess: aiohttp.ClientSession, tk: tinkoff.Ti
 # ---------------------------------------------------------------- CScalp
 
 def _cscalp_allowed(uid: int) -> bool:
-    return cscalp.enabled() and uid == cscalp.OWNER_ID
+    return cscalp.enabled() and (not cscalp.OWNER_ID or uid == cscalp.OWNER_ID)
 
 
 async def _cscalp_send(sess, csq: cscalp.CScalpQueue, t: str) -> tuple[str, Optional[str]]:
@@ -728,25 +680,21 @@ async def cmd_cscalp(m: Message, csq: cscalp.CScalpQueue, sess) -> None:
     if not args:
         await m.answer(f"Использование: /cscalp SBER\nСтатус: {esc(csq.status_text())}"); return
     t = args[0].upper()
-    if not TICKER_RE.fullmatch(t):
-        await m.answer("Некорректный тикер."); return
     txt, cid = await _cscalp_send(sess, csq, t)
     await m.answer(esc(txt))
     if cid:
-        _spawn(_cscalp_confirm(m.bot, m.chat.id, sess, csq, t, cid))
+        asyncio.create_task(_cscalp_confirm(m.bot, m.chat.id, sess, csq, t, cid))
 
 
 @router.callback_query(F.data.startswith("cscalp:"))
 async def cb_cscalp(c: CallbackQuery, csq: cscalp.CScalpQueue, sess) -> None:
     t = c.data.split(":")[1]
-    if not TICKER_RE.fullmatch(t):
-        await c.answer("Некорректный тикер", show_alert=True); return
     if not _cscalp_allowed(c.from_user.id):
         await c.answer("Только для владельца бота", show_alert=True); return
     txt, cid = await _cscalp_send(sess, csq, t)
     await c.answer(txt, show_alert=not txt.startswith("⚡"))
     if cid and c.message:
-        _spawn(_cscalp_confirm(c.bot, c.message.chat.id, sess, csq, t, cid))
+        asyncio.create_task(_cscalp_confirm(c.bot, c.message.chat.id, sess, csq, t, cid))
 
 
 # --------------------------------------------------------------- скринер
@@ -784,7 +732,7 @@ async def show_screener(bot: Bot, chat_id: int, scr: scrmod.Screener, win: str,
     except Exception as e:
         log.exception("screener render")
         await bot.send_message(chat_id, scrmod.format_screener(scr, win, esc) +
-                               "\n<i>(изображение временно недоступно)</i>", reply_markup=kb)
+                               f"\n<i>(картинка недоступна: {esc(e)})</i>", reply_markup=kb)
         return
     file = BufferedInputFile(png, f"screener_{win}.png")
     caption = f"🔎 Скринер MOEX — {scrmod.WINDOW_TITLES[win]}"
@@ -852,7 +800,7 @@ async def cmd_clear(m: Message, sent: cleaner.SentLog) -> None:
     await asyncio.sleep(5)
     try:
         await note.delete()
-        sent.forget(m.chat.id, {note.message_id})
+        sent.take(m.chat.id, keep=None)  # note уже учтён и удалён
     except Exception:
         pass
 
@@ -933,7 +881,7 @@ async def cmd_backtest(m: Message, sess: aiohttp.ClientSession,
         dec = info.decimals if info else 2
         trades = await tk.last_trades(inst, minutes=60)
     except Exception as e:
-        await m.answer(_failure(f"backtest {t}", e)); return
+        await m.answer(f"⚠️ {esc(e)}"); return
     if len(trades) < 20:
         await m.answer(f"🧪 {t}: за последний час всего {len(trades)} сделок — торгов нет."); return
     # скользящее окно 10 мин с шагом 1 мин, как это делает монитор
@@ -1001,7 +949,8 @@ async def cmd_stats(m: Message, journal: Journal) -> None:
     try:
         text = journal.stats(m.from_user.id, days, ticker)
     except Exception as e:
-        await m.answer(_failure("stats", e)); return
+        log.exception("stats")
+        await m.answer(f"⚠️ Не удалось собрать статистику: <code>{esc(e)}</code>"); return
     for chunk in _split_html(text):
         await m.answer(chunk)
 
@@ -1042,7 +991,7 @@ async def cb_book(c: CallbackQuery, sess: aiohttp.ClientSession, tk: tinkoff.Tin
     try:
         text = await _book_text(sess, tk, t)
     except Exception as e:
-        text = _failure(f"book callback {t}", e)
+        log.exception("book %s", t); text = f"Не удалось получить стакан {t}: {esc(e)}"
     chat_id, reply_to = _reply_ctx(c)
     if len(parts) > 2 and parts[2] == "r":
         try:
@@ -1063,7 +1012,7 @@ async def cb_tape(c: CallbackQuery, sess: aiohttp.ClientSession, tk: tinkoff.Tin
     try:
         text = await _tape_text(sess, tk, t)
     except Exception as e:
-        text = _failure(f"tape callback {t}", e)
+        log.exception("tape %s", t); text = f"Не удалось получить ленту {t}: {esc(e)}"
     chat_id, reply_to = _reply_ctx(c)
     if len(parts) > 2 and parts[2] == "r":
         try:
@@ -1085,17 +1034,6 @@ async def cb_flow_off(c: CallbackQuery, store: Store) -> None:
 
 # ------------------------------------------------------------- callbacks
 
-@router.callback_query(F.data == "panel:close")
-async def cb_panel_close(c: CallbackQuery) -> None:
-    """Закрыть открытый сетап, стакан, ленту или кластеры."""
-    await c.answer()
-    if c.message is None:
-        return
-    try:
-        await c.message.delete()
-    except Exception:
-        log.debug("не удалось закрыть аналитическую панель", exc_info=True)
-
 @router.callback_query(F.data == "chart:close")
 async def cb_chart_close(c: CallbackQuery) -> None:
     await c.answer()
@@ -1116,8 +1054,6 @@ def _reply_ctx(c: CallbackQuery) -> tuple[int, int | None]:
     m = c.message
     if m is None:
         return c.from_user.id, None
-    if m.chat.type == "channel":
-        return c.from_user.id, None
     is_news = bool(m.text and "#" in m.text and "Источник" in m.text)
     if m.chat.type != "private" or is_news:
         return m.chat.id, m.message_id
@@ -1137,10 +1073,11 @@ async def cb_chart(c: CallbackQuery, store: Store, sess: aiohttp.ClientSession,
         current = None
     await c.answer("Строю график…")
     try:
-        err = await show_chart(c.bot, chat_id, c.from_user.id, sess, store, t, period,
+        err = await show_chart(c.bot, chat_id, sess, store, t, period,
                                current=current, tk=tk, reply_to=reply_to, flow=flow)
     except Exception as e:
-        err = _failure(f"chart callback {t}", e)
+        log.exception("график %s", t)
+        err = f"⚠️ Не удалось построить график {esc(t)}:\n<code>{esc(e)}</code>"
     if err:
         try:
             await c.bot.send_message(chat_id, err, reply_to_message_id=reply_to)
@@ -1205,7 +1142,6 @@ async def on_added(ev) -> None:
 # -------------------------------------------------------------------- меню
 
 BOT_COMMANDS = [
-    ("version", "Проверить версию сборки"),
     ("list", "Мои бумаги и цены"),
     ("screener", "Скринер: что двигается — /screener 15m"),
     ("setup", "Сетап: за/против входа — /setup SBER"),
@@ -1252,7 +1188,6 @@ def main_kb(watchlist: list[str]) -> ReplyKeyboardMarkup:
             [KeyboardButton(text="🔎 Скринер"), KeyboardButton(text="📊 Статистика"),
              KeyboardButton(text="📰 Новости"), KeyboardButton(text="⚙️ Настройки")]]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True,
-                               one_time_keyboard=True, is_persistent=False,
                                input_field_placeholder="Тикер или команда…")
 
 
@@ -1334,14 +1269,13 @@ async def fallback(m: Message, store: Store, sess: aiohttp.ClientSession) -> Non
 
 # -------------------------------------------------------------------- main
 
-async def health_check(bot: Bot, dp: Dispatcher) -> None:
+async def health_check(bot: Bot) -> None:
     """Контроль связи с Telegram API.
 
     В нестабильных сетях (песочницы, VPN) long polling может «зависнуть»:
     соединение молча умирает, и бот перестаёт отвечать на несколько минут.
     Раз в 45 c проверяем API; два последовательных сбоя — роняем процесс,
-    несколько последовательных сбоев останавливают polling штатно; внешний
-    supervisor может затем перезапустить процесс.
+    watchdog (run.sh) поднимет его заново за пару секунд.
     """
     await asyncio.sleep(30)
     fails = 0
@@ -1351,12 +1285,11 @@ async def health_check(bot: Bot, dp: Dispatcher) -> None:
             fails = 0
         except Exception:
             fails += 1
-            log.warning("health check: Telegram API недоступен (сбой %s/4)", fails)
-            if fails >= 4:
-                log.error("health check: связь с Telegram потеряна — штатная остановка")
-                await dp.stop_polling()
-                return
-        await asyncio.sleep(min(180, 30 * (2 ** min(fails, 3))) if fails else 45)
+            log.warning("health check: Telegram API недоступен (сбой %s/2)", fails)
+            if fails >= 2:
+                log.error("health check: связь с Telegram потеряна — рестарт процесса")
+                os._exit(3)
+        await asyncio.sleep(45)
 
 
 def main() -> None:
@@ -1364,17 +1297,12 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
-    log.info("stockbot build %s starting", BUILD_VERSION)
     if not BOT_TOKEN:
         sys.exit(
             "BOT_TOKEN не задан. Получи токен у @BotFather и передай так:\n"
             "  export BOT_TOKEN='123456:ABC...'\n"
             "или положи в файл .env:  BOT_TOKEN=123456:ABC..."
         )
-    if OWNER_ID <= 0:
-        sys.exit("OWNER_ID обязателен: это личный бот, укажи свой Telegram user id в .env")
-    if cscalp.enabled() and (len(cscalp.CSCALP_KEY) < 32 or cscalp.CSCALP_KEY == "CHANGE_ME"):
-        sys.exit("CSCALP_KEY должен быть случайным секретом длиной не меньше 32 символов")
 
     bot = Bot(token=BOT_TOKEN,
               default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -1400,7 +1328,7 @@ def main() -> None:
         monitor_task = asyncio.create_task(monitor.run(session))
         flow_task = asyncio.create_task(flow.run(session))
         news_task = asyncio.create_task(newsmon.run(session))
-        health_task = asyncio.create_task(health_check(bot, dp))
+        health_task = asyncio.create_task(health_check(bot))
         await setup_menu(bot)
         clean_task = asyncio.create_task(cleaner.run_daily(bot, sent, store, moex.now_msk))
         scr = scrmod.Screener(tk, os.path.dirname(DATA_FILE) or ".")
@@ -1413,20 +1341,16 @@ def main() -> None:
                                    csq=csq, sent=sent, scr=scr)
         finally:
             cstore.save(force=True)
-            journal.save()
-            tasks = [clean_task, monitor_task, flow_task, news_task, health_task]
+            clean_task.cancel()
             if scr_task:
-                tasks.append(scr_task)
-            for task in tasks:
-                task.cancel()
-            for task in list(_background_tasks):
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            if _background_tasks:
-                await asyncio.gather(*list(_background_tasks), return_exceptions=True)
+                scr_task.cancel()
             sent.save()
             if runner is not None:
                 await runner.cleanup()
+            monitor_task.cancel()
+            flow_task.cancel()
+            news_task.cancel()
+            health_task.cancel()
             await tk.close()
             await session.close()
             await bot.session.close()

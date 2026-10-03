@@ -45,7 +45,6 @@ class Entry:
     ticker: str
     kind: str
     price: float
-    event_id: str = ""
     direction: int = 0                          # +1 / -1 / 0
     text: str = ""                              # исходный текст (HTML)
     results: dict = field(default_factory=dict)  # "5": +0.42, "15": -0.1
@@ -57,8 +56,6 @@ class Journal:
     def __init__(self, path: str) -> None:
         self.path = path
         self.entries: list[Entry] = []
-        self._dirty = False
-        self._saved_at = 0.0
         self._load()
 
     # ----------------------------------------------------------- хранение
@@ -81,18 +78,11 @@ class Journal:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump([asdict(e) for e in self.entries], f, ensure_ascii=False)
         os.replace(tmp, self.path)
-        self._dirty = False
-        self._saved_at = time.time()
-
-    def maybe_save(self, every_sec: float = 10.0) -> None:
-        if self._dirty and time.time() - self._saved_at >= every_sec:
-            self.save()
 
     # ----------------------------------------------------------- операции
     def add(self, e: Entry) -> None:
         self.entries.append(e)
-        self._dirty = True
-        self.maybe_save()
+        self.save()
 
     def pending(self) -> list[Entry]:
         return [e for e in self.entries if not e.done]
@@ -117,7 +107,7 @@ class Journal:
         for (t, k), grp in sorted(by.items(), key=lambda kv: -len(kv[1])):
             r15 = [e.results.get("15") for e in grp if "15" in e.results]
             avg = sum(r15) / len(r15) if r15 else None
-            # «попадание» — движение ≥HIT_PCT в сторону сигнала
+            # «попадание» — движение ≥0,2% в сторону сигнала (если направление есть)
             hits = [e for e in grp if "15" in e.results and e.direction
                     and e.results["15"] * e.direction >= HIT_PCT]
             directed = [e for e in grp if "15" in e.results and e.direction]
@@ -129,7 +119,7 @@ class Journal:
         lines.append("</pre>")
         lines.append("<i>15м ср. — среднее изменение цены через 15 мин после сигнала; "
                      f"попад. — доля случаев, когда цена пошла в сторону сигнала на ≥{HIT_PCT:.1f}%. "
-                     "🔇 — пара отключена автоматически (n≥30, попадание &lt;25%).</i>")
+                     "🔇 — пара отключена автоматически (n≥30, попадание <25%).</i>")
         ctx = self._ctx_stats(es)
         if ctx:
             lines.append("")
@@ -140,13 +130,8 @@ class Journal:
     def quality(self, ticker: str, kind: str, days: int = MUTE_DAYS) -> tuple[int, Optional[float]]:
         """(n оценённых направленных сигналов, попадание %) по всем пользователям."""
         cutoff = time.time() - days * 86400
-        candidates = [e for e in self.entries if e.ticker == ticker and e.kind == kind
-                      and e.ts >= cutoff and e.direction and "15" in e.results]
-        unique: dict[str, Entry] = {}
-        for e in candidates:
-            key = e.event_id or f"legacy:{e.ticker}:{e.kind}:{round(e.ts / 30)}"
-            unique.setdefault(key, e)
-        es = list(unique.values())
+        es = [e for e in self.entries if e.ticker == ticker and e.kind == kind
+              and e.ts >= cutoff and e.direction and "15" in e.results]
         if not es:
             return 0, None
         hits = sum(1 for e in es if e.results["15"] * e.direction >= HIT_PCT)
@@ -174,7 +159,7 @@ class Journal:
             return "Пока нет оценённых сигналов."
         return ("<b>Авто-фильтр сигналов</b> (7 дн., порог хода "
                 f"{HIT_PCT:.1f}%)\n<pre>" + "\n".join(rows) + "</pre>\n"
-                "<i>🔇 — отключено (n≥30, попадание &lt;25%). Пары с малой выборкой продолжают "
+                "<i>🔇 — отключено (n≥30, попадание <25%). Пары с малой выборкой продолжают "
                 f"приходить, пока не наберут {MUTE_MIN_N} сигналов. Объём/уровень/всплеск "
                 "выключены целиком — направления нет, оценить нельзя.</i>")
 

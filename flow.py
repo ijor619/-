@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import os
 import logging
 import time
@@ -252,12 +251,6 @@ class FlowMonitor:
         tickers = sorted({t for _, p in self.store.all() for t in p.watchlist})
         if not tickers:
             return
-        active = set(tickers)
-        for cache in (self._books, self._base, self._day, self._dec, self._infos,
-                      self._last_price, self._last_book, self._levels,
-                      self._levels_ts, self._recent):
-            for stale in set(cache) - active:
-                cache.pop(stale, None)
         results = await asyncio.gather(*(self._analyze(sess, t) for t in tickers),
                                        return_exceptions=True)
         signals: Dict[str, list[tape.Signal]] = {}
@@ -268,11 +261,6 @@ class FlowMonitor:
                 signals[t] = r
 
         now = time.time()
-        for ticker, detected in signals.items():
-            for sig in detected:
-                if not sig.event_id:
-                    raw = f"{ticker}|{sig.kind}|{sig.key}|{int(now // FLOW_INTERVAL_SEC)}"
-                    sig.event_id = hashlib.sha256(raw.encode()).hexdigest()[:24]
         hour = now_msk().hour
         if not self._main_session():
             return   # вне окна сигналов: лента уже накоплена для кластеров, уведомлений нет
@@ -301,7 +289,7 @@ class FlowMonitor:
             # первый сигнал уходит сразу; следующие копятся DIGEST_SEC
             if now - last < DIGEST_SEC and len(sigs) < MAX_SIGNALS_PER_MSG:
                 continue
-            self._digest[(uid, t)] = sigs[MAX_SIGNALS_PER_MSG:]
+            self._digest[(uid, t)] = []
             self._digest_ts[(uid, t)] = now
             await self._send_signals(sess, uid, t, sigs[:MAX_SIGNALS_PER_MSG])
 
@@ -350,7 +338,7 @@ class FlowMonitor:
                 self.journal.add(Entry(ts=time.time(), uid=uid, chat_id=msg.chat.id,
                                        msg_id=msg.message_id, ticker=t, kind=s.kind,
                                        price=price, direction=_direction(s), text=text,
-                                       ctx=ctx_d, event_id=s.event_id))
+                                       ctx=ctx_d))
                 self._recent.setdefault(t, []).append((s.kind, _direction(s), time.time()))
 
     async def _analyze(self, sess, t: str) -> list[tape.Signal]:

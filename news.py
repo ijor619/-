@@ -551,10 +551,8 @@ class NewsMonitor:
         d = os.path.dirname(self.seen_path)
         if d:
             os.makedirs(d, exist_ok=True)
-        tmp = self.seen_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
+        with open(self.seen_path, "w", encoding="utf-8") as f:
             json.dump({"seen": self.seen, "stories": getattr(self, "_stories", [])[-500:]}, f)
-        os.replace(tmp, self.seen_path)
 
     def watch_dict(self) -> dict[str, list[str]]:
         tickers = {t for _, p in self.store.all() for t in p.watchlist}

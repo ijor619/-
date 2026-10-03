@@ -82,25 +82,6 @@ class SentLog:
         self._dirty = True
         return out
 
-    def candidates(self, chat_id: int, older_than_sec: float = 0.0,
-                   keep: Optional[set] = None) -> list[int]:
-        """Выбрать кандидатов, не забывая их до подтверждения Telegram."""
-        now = time.time()
-        fresh = [[mid, ts] for mid, ts in self.data.get(str(chat_id), [])
-                 if now - ts <= MAX_AGE_H * 3600]
-        if len(fresh) != len(self.data.get(str(chat_id), [])):
-            self.data[str(chat_id)] = fresh
-            self._dirty = True
-        return [mid for mid, ts in fresh
-                if now - ts >= older_than_sec and not (keep and mid in keep)]
-
-    def forget(self, chat_id: int, message_ids: set[int]) -> None:
-        if not message_ids:
-            return
-        key = str(chat_id)
-        self.data[key] = [row for row in self.data.get(key, []) if row[0] not in message_ids]
-        self._dirty = True
-
 
 class TrackOutgoing(BaseRequestMiddleware):
     """Записывает id всех сообщений, отправленных ботом в личные чаты."""
@@ -124,27 +105,23 @@ class TrackOutgoing(BaseRequestMiddleware):
 
 async def clear_chat(bot: Bot, sent: SentLog, chat_id: int,
                      older_than_sec: float = 0.0, keep: Optional[set] = None) -> int:
-    ids = sent.candidates(chat_id, older_than_sec, keep)
+    ids = sent.take(chat_id, older_than_sec, keep)
     deleted = 0
-    succeeded: set[int] = set()
     # delete_messages принимает до 100 id за раз
     for i in range(0, len(ids), 100):
         chunk = ids[i:i + 100]
         try:
             await bot.delete_messages(chat_id, chunk)
             deleted += len(chunk)
-            succeeded.update(chunk)
         except Exception:
             # часть могла быть удалена вручную — добиваем по одному
             for mid in chunk:
                 try:
                     await bot.delete_message(chat_id, mid)
                     deleted += 1
-                    succeeded.add(mid)
                 except Exception:
                     pass
         await asyncio.sleep(0.2)
-    sent.forget(chat_id, succeeded)
     sent.save()
     return deleted
 

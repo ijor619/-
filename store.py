@@ -43,9 +43,7 @@ class UserProfile:
         p.cooldown_min = float(d.get("cooldown_min", p.cooldown_min))
         p.report_min = float(d.get("report_min", p.report_min))
         p.last_report_ts = float(d.get("last_report_ts", 0.0))
-        raw_flow = d.get("flow_alerts", True)
-        p.flow_alerts = (raw_flow.lower() in ("1", "true", "yes", "on")
-                         if isinstance(raw_flow, str) else bool(raw_flow))
+        p.flow_alerts = bool(d.get("flow_alerts", True))
         p.quiet_from = int(d.get("quiet_from", -1))
         p.quiet_to = int(d.get("quiet_to", -1))
         p.clear_hour = int(d.get("clear_hour", 3))
@@ -71,8 +69,6 @@ class Store:
                 raw = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             return
-        if not isinstance(raw, dict):
-            return
         for uid, d in raw.items():
             try:
                 self._users[int(uid)] = UserProfile.from_dict(d)
@@ -88,10 +84,6 @@ class Store:
             json.dump({str(k): v.to_dict() for k, v in self._users.items()},
                       f, ensure_ascii=False, indent=2)
         os.replace(tmp, self.path)
-        try:
-            os.chmod(self.path, 0o600)
-        except OSError:
-            pass
 
     def get(self, user_id: int) -> UserProfile:
         if user_id not in self._users:

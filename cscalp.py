@@ -1,15 +1,14 @@
 """Очередь команд для CScalp-мостика (cscalp_bridge.py на ПК пользователя).
 
 Бот не может достучаться до ПК за NAT, поэтому мостик сам опрашивает бота:
-  GET  /cscalp/next   → {"commands": [{"id", "ticker", "ts", "nonce", "sig"}]}
-  POST /cscalp/ack    ← подписанный результат
-  GET  /cscalp/status → когда мостик последний раз выходил на связь
-  Авторизация HTTP: заголовок Authorization: Bearer <CSCALP_KEY>.
+  GET  /cscalp/next?key=…   → {"commands": [{"id", "ticker", "ts"}]}
+  POST /cscalp/ack?key=…    ← {"id", "result"}
+  GET  /cscalp/status?key=… → когда мостик последний раз выходил на связь
 
 Два транспорта:
   * relay (по умолчанию) — публичный URL у бота не нужен: команды идут через
-    pub/sub-релей ntfy (CSCALP_RELAY, по умолчанию https://ntfy.sh),
-    неприватное имя топика выводится из ключа, payload подписан HMAC;
+    бесплатный pub/sub-релей ntfy (CSCALP_RELAY, по умолчанию https://ntfy.sh),
+    имя топика = CSCALP_KEY (длинная случайная строка = секрет);
   * http — бот сам слушает PORT (только если у приложения есть публичный URL).
 Мостик выбирает то же самое в cscalp_bridge.ini.
 Кнопка «⚡ CScalp» показывается только владельцу (OWNER_ID), команды
@@ -18,9 +17,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections import deque
-import hashlib
-import hmac
 import json
 import logging
 import os
@@ -38,55 +34,33 @@ OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
 PORT = int(os.getenv("PORT", "8080"))
 RELAY = os.getenv("CSCALP_RELAY", "https://ntfy.sh").rstrip("/")
 HTTP_MODE = os.getenv("CSCALP_HTTP", "").lower() in ("1", "true", "yes")
-TOPIC = os.getenv("CSCALP_TOPIC", "").strip()
-MAX_QUEUE = 10
-MAX_COMMAND_AGE_SEC = 30
 
 
 def enabled() -> bool:
     return bool(CSCALP_KEY)
 
 
-def topic_name() -> str:
-    """Не помещаем сам секрет в URL relay."""
-    suffix = TOPIC or hashlib.sha256(CSCALP_KEY.encode()).hexdigest()[:32]
-    return "cscalp-" + suffix
-
-
-def _signed(data: dict) -> dict:
-    body = json.dumps(data, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
-    return {**data, "sig": hmac.new(CSCALP_KEY.encode(), body.encode(), hashlib.sha256).hexdigest()}
-
-
-def _verify(data: dict) -> bool:
-    if not isinstance(data, dict) or not isinstance(data.get("sig"), str):
-        return False
-    unsigned = {k: v for k, v in data.items() if k != "sig"}
-    expected = _signed(unsigned)["sig"]
-    return hmac.compare_digest(data["sig"], expected)
-
-
 class CScalpQueue:
     def __init__(self) -> None:
-        self.pending: deque[dict] = deque(maxlen=MAX_QUEUE)
+        self.pending: list[dict] = []
         self.last_seen = 0.0          # когда мостик последний раз опрашивал
         self.last_result: Optional[tuple[str, str, float]] = None  # (ticker, result, ts)
 
     def push(self, ticker: str) -> str:
-        cid = secrets.token_hex(16)
-        self.pending.append(_signed({"id": cid, "ticker": ticker.upper(),
-                                     "ts": time.time(), "nonce": secrets.token_hex(16)}))
+        cid = secrets.token_hex(4)
+        # одна свежая команда важнее очереди старых
+        self.pending = [{"id": cid, "ticker": ticker.upper(), "ts": time.time()}]
         return cid
 
     # ---------------------------------------------------------- relay (ntfy)
     @property
     def topic(self) -> str:
-        return topic_name()
+        return "cscalp-" + CSCALP_KEY
 
     async def relay_push(self, session, ticker: str) -> tuple[str, str]:
         """Отправить команду через релей. Возвращает (id, текст ошибки или '')."""
         cid = self.push(ticker)
-        body = json.dumps(self.pending[-1], separators=(",", ":"))
+        body = json.dumps({"id": cid, "ticker": ticker.upper(), "ts": time.time()})
         try:
             async with session.post(f"{RELAY}/{self.topic}", data=body,
                                     headers={"Title": "cscalp", "Cache": "no"},
@@ -112,7 +86,7 @@ class CScalpQueue:
                         d = json.loads(msg.get("message", "{}"))
                     except Exception:
                         continue
-                    if d.get("id") == cid and _verify(d):
+                    if d.get("id") == cid:
                         self.last_seen = time.time()
                         self.last_result = (str(d.get("ticker", "")), str(d.get("result", "")), time.time())
                         return str(d.get("result", ""))
@@ -137,17 +111,15 @@ class CScalpQueue:
 
     # ----------------------------------------------------------- http
     def _auth(self, req: web.Request) -> bool:
-        auth = req.headers.get("Authorization", "")
-        supplied = auth.removeprefix("Bearer ") if auth.startswith("Bearer ") else ""
-        return bool(CSCALP_KEY) and secrets.compare_digest(supplied, CSCALP_KEY)
+        return bool(CSCALP_KEY) and secrets.compare_digest(req.query.get("key", ""), CSCALP_KEY)
 
     async def h_next(self, req: web.Request) -> web.Response:
         if not self._auth(req):
             return web.json_response({"error": "forbidden"}, status=403)
         self.last_seen = time.time()
         # команды старше 60 с не выполняем — пользователь уже не ждёт
-        cmds = [c for c in self.pending if -5 <= time.time() - c["ts"] < MAX_COMMAND_AGE_SEC]
-        self.pending.clear()
+        cmds = [c for c in self.pending if time.time() - c["ts"] < 60]
+        self.pending = []
         return web.json_response({"commands": cmds})
 
     async def h_ack(self, req: web.Request) -> web.Response:
@@ -157,8 +129,6 @@ class CScalpQueue:
             d = await req.json()
         except Exception:
             d = {}
-        if not _verify(d):
-            return web.json_response({"error": "bad signature"}, status=403)
         self.last_result = (str(d.get("ticker", "")), str(d.get("result", "")), time.time())
         log.info("cscalp: ack %s", d)
         return web.json_response({"ok": True})
