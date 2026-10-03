@@ -1044,6 +1044,15 @@ async def cb_chart_close(c: CallbackQuery) -> None:
         pass
 
 
+@router.callback_query(F.data == "msg:close")
+async def cb_msg_close(c: CallbackQuery) -> None:
+    await c.answer()
+    try:
+        await c.message.delete()
+    except Exception:
+        pass
+
+
 def _reply_ctx(c: CallbackQuery) -> tuple[int, int | None]:
     """Куда отвечать на нажатие: (chat_id, reply_to_message_id).
 
