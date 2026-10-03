@@ -95,6 +95,10 @@ def setup_btn(ticker: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text="🎯 Сетап", callback_data=f"setup:{ticker}")
 
 
+def close_btn() -> InlineKeyboardButton:
+    return InlineKeyboardButton(text="✖️ Закрыть", callback_data="msg:close")
+
+
 def setup_kb(ticker: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"setup:{ticker}:r"),
@@ -103,6 +107,7 @@ def setup_kb(ticker: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📚 Стакан", callback_data=f"book:{ticker}"),
          InlineKeyboardButton(text="🧾 Лента", callback_data=f"tape:{ticker}")],
         _links_row(ticker),
+        [close_btn()],
     ])
 
 
@@ -113,6 +118,7 @@ def book_kb(ticker: str) -> InlineKeyboardMarkup:
          InlineKeyboardButton(text="📈 График", callback_data=f"chart:{ticker}:1m")],
         [setup_btn(ticker), cluster_btn(ticker)],
         _links_row(ticker),
+        [close_btn()],
     ])
 
 
@@ -128,7 +134,8 @@ def cluster_kb(ticker: str, window: str) -> InlineKeyboardMarkup:
          InlineKeyboardButton(text="🧾 Лента", callback_data=f"tape:{ticker}"),
          InlineKeyboardButton(text="📈 График", callback_data=f"chart:{ticker}:5m")],
         _links_row(ticker),
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"clu:{ticker}:{window}:r")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"clu:{ticker}:{window}:r"),
+         close_btn()],
     ])
 
 
@@ -139,6 +146,7 @@ def tape_kb(ticker: str) -> InlineKeyboardMarkup:
          InlineKeyboardButton(text="📈 График", callback_data=f"chart:{ticker}:1m")],
         [setup_btn(ticker), cluster_btn(ticker)],
         _links_row(ticker),
+        [close_btn()],
     ])
 
 
