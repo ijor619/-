@@ -48,6 +48,35 @@ log = logging.getLogger(__name__)
 
 router = Router(name="stockbot")
 
+# ------------------------------------------------------------ приватность
+# Бот личный: отвечает только Telegram-ID из OWNER_ID (через запятую можно
+# несколько). Если переменная не задана — бот открыт для всех (как раньше).
+_ALLOWED = {int(x) for x in os.getenv("OWNER_ID", "").replace(";", ",").split(",")
+            if x.strip().lstrip("-").isdigit()}
+_denied_logged: set[int] = set()
+
+
+@router.message.outer_middleware()
+@router.callback_query.outer_middleware()
+async def _private_guard(handler, event, data):
+    if not _ALLOWED:
+        return await handler(event, data)
+    user = getattr(event, "from_user", None)
+    if user and user.id in _ALLOWED:
+        return await handler(event, data)
+    uid = user.id if user else 0
+    if uid not in _denied_logged:
+        _denied_logged.add(uid)
+        log.warning("доступ запрещён: id=%s @%s", uid, getattr(user, "username", None))
+    try:
+        if isinstance(event, CallbackQuery):
+            await event.answer("Бот приватный.", show_alert=True)
+        else:
+            await event.answer("🔒 Это личный бот, доступ закрыт.")
+    except Exception:
+        pass
+    return None
+
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9]{0,9}$")
 
 HELP = (
