@@ -1284,11 +1284,13 @@ async def _dispatch(m: Message, **kw) -> None:
     handlers = {
         "list": cmd_list, "setup": cmd_setup, "clusters": cmd_clusters, "chart": cmd_chart,
         "book": cmd_book, "tape": cmd_tape, "stats": cmd_stats, "mutes": cmd_mutes, "news": cmd_news,
-        "settings": cmd_settings,
+        "settings": cmd_settings, "screener": cmd_screener,
     }
     cmd = m.text.split()[0].lstrip("/")
     fn = handlers.get(cmd)
     if fn is None:
+        log.error("_dispatch: нет обработчика для %r", cmd)
+        await m.answer(f"⚠️ Кнопка «{esc(cmd)}» пока не подключена.")
         return
     import inspect
     params = inspect.signature(fn).parameters
