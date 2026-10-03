@@ -48,7 +48,7 @@ from store import Store
 
 log = logging.getLogger(__name__)
 
-BUILD_VERSION = "2026.10.02-v3"
+BUILD_VERSION = "2026.10.03-v4"
 
 router = Router(name="stockbot")
 _background_tasks: set[asyncio.Task] = set()

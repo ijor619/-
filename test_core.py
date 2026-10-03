@@ -81,7 +81,7 @@ class PersistenceTests(unittest.TestCase):
 
 class KeyboardTests(unittest.TestCase):
     def test_build_version_is_visible_and_specific(self):
-        self.assertEqual(BUILD_VERSION, "2026.10.02-v3")
+        self.assertEqual(BUILD_VERSION, "2026.10.03-v4")
 
     def test_analytical_panels_have_close_button(self):
         keyboards = [setup_kb("SBER"), book_kb("SBER"),
