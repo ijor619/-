@@ -198,13 +198,33 @@ def news_kb(tickers: list[str]) -> InlineKeyboardMarkup | None:
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
-def screener_kb(win: str) -> InlineKeyboardMarkup:
-    """Под скринером: окна как у графика (одно сообщение, редактируется на месте)."""
-    from screener import WINDOW_ORDER, WINDOW_SHORT
+def screener_kb(win: str, mine: bool = False, tickers: list[str] | None = None) -> InlineKeyboardMarkup:
+    """Под скринером: окна как у графика (одно сообщение, редактируется на месте),
+    режим «мои/рынок», кнопки лидеров (открыть карточку бумаги)."""
+    from screener import WINDOW_ORDER, WINDOW_SHORT, VOL_WIN
+    sfx = ":my" if mine else ""
     row = [InlineKeyboardButton(text=("● " if w == win else "") + WINDOW_SHORT[w],
-                                callback_data=f"scr:{w}") for w in WINDOW_ORDER]
+                                callback_data=f"scr:{w}{sfx}") for w in WINDOW_ORDER]
+    rows = [row,
+            [InlineKeyboardButton(text=("● " if win == VOL_WIN else "") + WINDOW_SHORT[VOL_WIN],
+                                  callback_data=f"scr:{VOL_WIN}{sfx}"),
+             InlineKeyboardButton(text="👤 Мои" if not mine else "● 👤 Мои", callback_data=f"scr:{win}:my"),
+             InlineKeyboardButton(text="🌍 Рынок" if mine else "● 🌍 Рынок", callback_data=f"scr:{win}")]]
+    if tickers:
+        rows.append([InlineKeyboardButton(text=t, callback_data=f"scr:pick:{t}") for t in tickers[:6]])
+    rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"scr:{win}{sfx}:r"),
+                 InlineKeyboardButton(text="✖️ Закрыть", callback_data="scr:close")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def scr_pick_kb(ticker: str, in_watchlist: bool) -> InlineKeyboardMarkup:
+    """Карточка бумаги из скринера."""
+    add = (InlineKeyboardButton(text="✅ Уже в списке", callback_data="noop") if in_watchlist
+           else InlineKeyboardButton(text="➕ В список", callback_data=f"watch:{ticker}"))
     return InlineKeyboardMarkup(inline_keyboard=[
-        row,
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"scr:{win}:r"),
-         InlineKeyboardButton(text="✖️ Закрыть", callback_data="scr:close")],
+        [InlineKeyboardButton(text="📈 График", callback_data=f"chart:{ticker}:5m"),
+         setup_btn(ticker),
+         InlineKeyboardButton(text="📚 Стакан", callback_data=f"book:{ticker}")],
+        [add, close_btn()],
+        _links_row(ticker),
     ])

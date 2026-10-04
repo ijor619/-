@@ -260,3 +260,18 @@ async def index_changes(session: aiohttp.ClientSession) -> dict[str, Optional[fl
     except Exception as e:
         log.debug("IMOEX: %s", e)
     return out
+
+
+async def prev_day_hl(session: aiohttp.ClientSession, ticker: str,
+                      board: str = "TQBR") -> tuple[float, float]:
+    """Максимум и минимум последнего завершённого торгового дня (ISS history)."""
+    frm = (now_msk() - timedelta(days=10)).strftime("%Y-%m-%d")
+    today = now_msk().strftime("%Y-%m-%d")
+    data = await _get(session,
+                      f"/history/engines/stock/markets/shares/boards/{board}/securities/{ticker}.json",
+                      {"from": frm, "iss.meta": "off", "history.columns": "TRADEDATE,HIGH,LOW"})
+    rows = (data.get("history") or {}).get("data") or []
+    rows = [r for r in rows if r[0] < today and r[1] and r[2]]
+    if not rows:
+        return 0.0, 0.0
+    return float(rows[-1][1]), float(rows[-1][2])

@@ -44,6 +44,17 @@ WINDOW_TITLES = {"15m": "15 мин", "30m": "30 мин", "1h": "1 час", "4h":
 WINDOW_SHORT = {"15m": "15м", "30m": "30м", "1h": "1ч", "4h": "4ч", "1d": "1д"}
 WINDOW_ORDER = ["15m", "30m", "1h", "4h", "1d"]
 DEFAULT_WINDOW = "15m"
+# «окно» аномального объёма: оборот за последние 15 мин к обычному обороту этого
+# часа (средний дневной оборот × доля часа в типичном дне MOEX)
+VOL_WIN = "vol"
+WINDOW_TITLES[VOL_WIN] = "аномальный объём 15 мин"
+WINDOW_SHORT[VOL_WIN] = "📊 объём"
+VOL_POLL_SEC = 300
+VOL_MIN_RATIO = 1.5
+VOL_TOP_N = 15
+HOUR_SHARE = {7: 0.03, 8: 0.03, 9: 0.03, 10: 0.14, 11: 0.10, 12: 0.08, 13: 0.07, 14: 0.07,
+              15: 0.08, 16: 0.09, 17: 0.10, 18: 0.10, 19: 0.03, 20: 0.02, 21: 0.015,
+              22: 0.015, 23: 0.01}
 
 _MSK = timezone(timedelta(hours=3))
 
@@ -70,6 +81,15 @@ class Sec:
     hist: deque = field(default_factory=lambda: deque(maxlen=int(HISTORY_H * 3600 / POLL_SEC) + 400))
     last: float = 0.0
     last_ts: float = 0.0
+    lot: int = 1
+    turn15: float = 0.0        # оборот за последние 15 мин, ₽
+    turn15_ts: float = 0.0
+    ratio: float = 0.0         # turn15 / обычный оборот этого часа
+
+    def vol_ratio(self) -> Optional[float]:
+        if not self.turn15_ts or time.time() - self.turn15_ts > 3 * VOL_POLL_SEC:
+            return None
+        return self.ratio
 
     def price_at(self, ago_sec: float) -> Optional[float]:
         """Цена «ago_sec назад»: последний сэмпл не позже целевого момента.
@@ -106,6 +126,7 @@ class Row:
     price: float
     decimals: int
     turnover: float
+    ratio: float = 0.0
 
 
 class Screener:
@@ -118,6 +139,7 @@ class Screener:
         self.updated: Optional[datetime] = None
         self.error: str = ""
         self._warm = False
+        self._vol_ts = 0.0
 
     # ------------------------------------------------------------ persist
     def _load_turnover(self) -> dict[str, float]:
@@ -189,7 +211,8 @@ class Screener:
                 old.name, old.prev_close, old.turnover, old.decimals = b["name"], b["prev"], turnover, b["dec"]
                 new[tick] = old
             else:
-                new[tick] = Sec(tick, b["name"], inst.uid, b["prev"], turnover, b["dec"])
+                new[tick] = Sec(tick, b["name"], inst.uid, b["prev"], turnover, b["dec"], lot=inst.lot)
+            new[tick].lot = inst.lot
         if len(new) < 20:
             log.warning("screener: вселенная подозрительно мала (%d) — оставляю прежнюю", len(new))
             if self.secs:
@@ -251,6 +274,32 @@ class Screener:
                 s.hist.append((now, price))
         self.updated = now_msk()
 
+    # ------------------------------------------------------------ объём
+    async def poll_volumes(self) -> None:
+        """Раз в VOL_POLL_SEC: оборот за последние 15 мин по 5-мин свечам T-Invest."""
+        secs = list(self.secs.values())
+        if not secs:
+            return
+        sem = asyncio.Semaphore(6)
+        h = now_msk().hour
+        share = HOUR_SHARE.get(h, 0.02) / 4          # доля 15-минутки в дневном обороте
+        cut = datetime.now(_MSK).replace(tzinfo=None) - timedelta(minutes=15)
+
+        async def one(s: Sec) -> None:
+            async with sem:
+                try:
+                    inst = Instrument(s.ticker, s.uid, "", s.lot, s.name)
+                    cs = await self.tk.candles(inst, 5, timedelta(minutes=25))
+                except Exception as e:
+                    log.debug("screener: объём %s: %s", s.ticker, e)
+                    return
+            turn = sum(c.volume * s.lot * c.close for c in cs if c.begin + timedelta(minutes=5) > cut)
+            s.turn15, s.turn15_ts = turn, time.time()
+            expected = s.turnover * share
+            s.ratio = turn / expected if expected > 0 else 0.0
+        await asyncio.gather(*(one(s) for s in secs))
+        self._vol_ts = time.time()
+
     # ------------------------------------------------------------ цикл
     async def run(self, session: aiohttp.ClientSession) -> None:
         await asyncio.sleep(3)
@@ -260,6 +309,8 @@ class Screener:
                     await self.refresh_universe(session)
                 if trading_time():
                     await self.poll_prices()
+                    if time.time() - self._vol_ts > VOL_POLL_SEC:
+                        await self.poll_volumes()
                 self.error = ""
             except asyncio.CancelledError:
                 raise
@@ -269,14 +320,28 @@ class Screener:
             await asyncio.sleep(POLL_SEC)
 
     # ------------------------------------------------------------ выдача
-    def rows(self, win: str) -> tuple[list[Row], list[Row], int]:
-        """(рост топ-N, падение топ-N, сколько бумаг имело данные по окну)."""
+    def rows(self, win: str, only: Optional[set] = None) -> tuple[list[Row], list[Row], int]:
+        """(рост топ-N, падение топ-N, сколько бумаг имело данные по окну).
+        only — ограничить бумагами из набора (режим «мои»).
+        Для окна VOL_WIN: (всплески объёма по убыванию, [], n)."""
         rows: list[Row] = []
         for s in self.secs.values():
+            if only is not None and s.ticker not in only:
+                continue
+            if win == VOL_WIN:
+                ratio = s.vol_ratio()
+                if ratio is None:
+                    continue
+                rows.append(Row(s.ticker, s.name, s.change("15m") or 0.0, s.last, s.decimals,
+                                s.turnover, ratio))
+                continue
             pct = s.change(win)
             if pct is None:
                 continue
             rows.append(Row(s.ticker, s.name, pct, s.last, s.decimals, s.turnover))
+        if win == VOL_WIN:
+            top = sorted((r for r in rows if r.ratio >= VOL_MIN_RATIO), key=lambda r: -r.ratio)[:VOL_TOP_N]
+            return top, [], len(rows)
         ups = sorted((r for r in rows if r.pct > 0), key=lambda r: -r.pct)[:TOP_N]
         downs = sorted((r for r in rows if r.pct < 0), key=lambda r: r.pct)[:TOP_N]
         return ups, downs, len(rows)
@@ -305,10 +370,13 @@ def _fmt_turn(v: float) -> str:
     return f"{v / 1e6:.0f} млн"
 
 
-def format_screener(scr: Screener, win: str, esc) -> str:
-    ups, downs, n = scr.rows(win)
+def format_screener(scr: Screener, win: str, esc, only: Optional[set] = None) -> str:
+    ups, downs, n = scr.rows(win, only)
     title = WINDOW_TITLES.get(win, win)
-    head = f"🔎 <b>Скринер MOEX — изменение за {esc(title)}</b>\n"
+    head = (f"🔎 <b>Скринер MOEX — {esc(title)}</b>\n" if win == VOL_WIN
+            else f"🔎 <b>Скринер MOEX — изменение за {esc(title)}</b>\n")
+    if only is not None:
+        head += "<i>только мои бумаги</i>\n"
     if not scr.secs:
         return head + "\n⏳ Загружаю список бумаг… попробуй через минуту."
     if n == 0:
@@ -321,12 +389,16 @@ def format_screener(scr: Screener, win: str, esc) -> str:
             return f"{icon} <b>{name}</b>: нет\n"
         lines = [f"{icon} <b>{name}</b>"]
         for i, r in enumerate(rows, 1):
-            lines.append(f"{i:>2}. <code>{esc(r.ticker):<6}</code> "
+            rt = f"×{r.ratio:.1f}  " if win == VOL_WIN else ""
+            lines.append(f"{i:>2}. <code>{esc(r.ticker):<6}</code> {rt}"
                          f"<b>{r.pct:+.2f}%</b>  {esc(_fmt_price(r.price, r.decimals))} ₽"
                          f"  <i>{esc(_fmt_turn(r.turnover))}</i>")
         return "\n".join(lines) + "\n"
 
-    body = block("🚀", "Рост", ups) + "\n" + block("🔻", "Падение", downs)
+    if win == VOL_WIN:
+        body = block("📊", "Всплеск объёма (к обычному для этого часа)", ups)
+    else:
+        body = block("🚀", "Рост", ups) + "\n" + block("🔻", "Падение", downs)
     if not trading_time():
         body += "\n<i>Сейчас не торговое время — цены на момент закрытия.</i>"
     foot = f"\n<i>{esc(scr.status_text())}; в расчёте {n} бумаг</i>"
@@ -335,7 +407,7 @@ def format_screener(scr: Screener, win: str, esc) -> str:
 
 # ---------------------------------------------------------------- картинка
 
-def render_png(scr: "Screener", win: str) -> bytes:
+def render_png(scr: "Screener", win: str, only: Optional[set] = None) -> bytes:
     """Таблица в тёмной теме (стиль брокерского приложения): два блока —
     Рост и Падение. Колонки: Инструмент | Цена | Объём, день | Изм."""
     import io
@@ -348,9 +420,11 @@ def render_png(scr: "Screener", win: str) -> bytes:
     TXT, MUTED, HEAD = "#e6edf3", "#8b98a9", "#c9d3df"
     UP, DOWN, LINE = "#22c55e", "#ef4444", "#243040"
 
-    ups, downs, n = scr.rows(win)
+    ups, downs, n = scr.rows(win, only)
     title = WINDOW_TITLES.get(win, win)
-    blocks = [("Рост", ups, UP), ("Падение", downs, DOWN)]
+    vol = win == VOL_WIN
+    ACC = "#f59e0b"
+    blocks = [("Всплеск объёма", ups, ACC)] if vol else [("Рост", ups, UP), ("Падение", downs, DOWN)]
 
     row_h = 0.42
     n_rows = sum(max(len(r), 1) for _, r, _ in blocks)
@@ -361,8 +435,13 @@ def render_png(scr: "Screener", win: str) -> bytes:
 
     # колонки (x-координаты)
     x_tick, x_price, x_vol, x_chg = 0.35, 3.05, 4.55, 6.15
+    if vol:
+        x_price, x_vol, x_chg = 2.75, 4.35, 6.15
     y = height - 0.45
-    ax.text(0.3, y, f"Скринер MOEX · изменение за {title}", color=TXT, fontsize=12.5,
+    ttl = f"Скринер MOEX · {title}" if vol else f"Скринер MOEX · изменение за {title}"
+    if only is not None:
+        ttl += " · мои"
+    ax.text(0.3, y, ttl, color=TXT, fontsize=12.5 if len(ttl) < 40 else 10.5,
             fontweight="bold", va="center")
     upd = scr.updated.strftime("%H:%M") if scr.updated else "—"
     ax.text(6.1, y, f"{upd} МСК", color=MUTED, fontsize=8.5, va="center", ha="right")
@@ -371,8 +450,8 @@ def render_png(scr: "Screener", win: str) -> bytes:
     def header(y: float) -> None:
         ax.text(x_tick, y, "Инструмент", color=MUTED, fontsize=8.5, va="center")
         ax.text(x_price, y, "Цена", color=MUTED, fontsize=8.5, va="center", ha="right")
-        ax.text(x_vol, y, "Объём, день", color=MUTED, fontsize=8.5, va="center", ha="right")
-        ax.text(x_chg, y, f"Изм. {WINDOW_SHORT[win]}", color=MUTED, fontsize=8.5, va="center", ha="right")
+        ax.text(x_vol, y, "×объём 15м" if vol else "Объём, день", color=MUTED, fontsize=8.5, va="center", ha="right")
+        ax.text(x_chg, y, "Изм. 15м" if vol else f"Изм. {WINDOW_SHORT[win]}", color=MUTED, fontsize=8.5, va="center", ha="right")
         ax.plot([0.25, 6.15], [y - 0.2, y - 0.2], color=LINE, lw=0.8)
 
     for name, rows, col in blocks:
@@ -396,15 +475,22 @@ def render_png(scr: "Screener", win: str) -> bytes:
             ax.text(x_tick + 0.36, y + 0.08, r.ticker, color=TXT, fontsize=9.5, fontweight="bold", va="center")
             ax.text(x_tick + 0.36, y - 0.11, r.name[:22], color=MUTED, fontsize=6.5, va="center")
             ax.text(x_price, y, _fmt_price(r.price, r.decimals) + " ₽", color=TXT, fontsize=9, va="center", ha="right")
-            ax.text(x_vol, y, _fmt_turn(r.turnover) + " ₽", color=HEAD, fontsize=8.5, va="center", ha="right")
-            ax.text(x_chg, y, f"{r.pct:+.2f}%", color=col, fontsize=9.5, fontweight="bold", va="center", ha="right")
+            if vol:
+                ax.text(x_vol, y, f"×{r.ratio:.1f}", color=col, fontsize=9.5, fontweight="bold", va="center", ha="right")
+                ax.text(x_chg, y, f"{r.pct:+.2f}%", color=UP if r.pct >= 0 else DOWN, fontsize=9.5,
+                        fontweight="bold", va="center", ha="right")
+            else:
+                ax.text(x_vol, y, _fmt_turn(r.turnover) + " ₽", color=HEAD, fontsize=8.5, va="center", ha="right")
+                ax.text(x_chg, y, f"{r.pct:+.2f}%", color=col, fontsize=9.5, fontweight="bold", va="center", ha="right")
             y -= row_h
         y -= 0.3
 
     foot = f"{len(scr.secs)} бумаг, оборот ≥ {MIN_TURNOVER / 1e6:.0f} млн ₽ · T-Invest realtime"
+    if vol:
+        foot = f"оборот за 15 мин к обычному для этого часа (порог ×{VOL_MIN_RATIO:g}) · " + foot
     if not trading_time():
         foot += " · не торговое время"
-    ax.text(0.3, 0.22, foot, color=MUTED, fontsize=7, va="center")
+    ax.text(0.3, 0.22, foot, color=MUTED, fontsize=6.5 if vol else 7, va="center")
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", facecolor=BG)

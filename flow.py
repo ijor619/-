@@ -21,6 +21,7 @@ from typing import Dict, Optional
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
 
+import market
 import moex
 import setup as stp
 import tape
@@ -51,6 +52,8 @@ def _direction(sig: tape.Signal) -> int:
         return 1 if "бид" in t else -1      # поддержка -> ждём отскок вверх
     if sig.kind == "spoof":
         return -1 if "на покупку" in t else 1  # ложный бид -> реальный интерес продать
+    if sig.kind == "breakout":
+        return 1 if "вверх" in t else -1
     return 0
 
 
@@ -67,11 +70,35 @@ SIGNAL_TO_MIN = _hm(os.getenv("SIGNAL_TO", "19:00"), 19 * 60)
 
 
 class DayStats:
-    __slots__ = ("high", "low", "vwap", "ts")
+    __slots__ = ("high", "low", "vwap", "ts", "prev_high", "prev_low", "prev_date",
+                 "hl_hist")
 
     def __init__(self) -> None:
         self.high = self.low = self.vwap = 0.0
         self.ts = 0.0
+        self.prev_high = self.prev_low = 0.0     # вчерашние экстремумы
+        self.prev_date = ""                      # на какой день загружены
+        self.hl_hist: list[tuple[float, float, float]] = []   # (ts, high, low) по опросам
+
+    def high_asof(self, age_sec: float) -> tuple[float, float]:
+        """Максимум/минимум дня, какими они были не позже age_sec назад
+        (уровень, который «постоял»)."""
+        cut = time.time() - age_sec
+        best = (0.0, 0.0)
+        for ts, h, l in self.hl_hist:
+            if ts <= cut:
+                best = (h, l)
+            else:
+                break
+        return best
+
+
+# «второй факт»: сигнал считается подтверждённым, если согласны >= CONFIRM_MIN
+# из фактов: дельта 15 мин, сторона VWAP, сила к рынку, близость к ключевому уровню
+CONFIRM_MIN = 2
+LEVEL_NEAR_PCT = 0.3            # «у уровня» для подтверждения
+BREAKOUT_COOLDOWN_SEC = 2 * 3600
+BREAKOUT_HOLD_SEC = 60 * 60     # максимум/минимум дня должен простоять ≥ 1 ч
 
 
 class FlowMonitor:
@@ -96,6 +123,10 @@ class FlowMonitor:
         self._level_side: Dict[str, bool] = {}      # ticker -> цена была выше ближайшего уровня
         self._level_sent: Dict[tuple[str, float], float] = {}
         self._recent: Dict[str, list[tuple[str, int, float]]] = {}  # ticker -> [(kind, dir, ts)]
+        self._prev_price: Dict[str, float] = {}
+        self._breakout_sent: Dict[tuple[str, float], float] = {}
+        self._digest_first: Dict[tuple[int, str], float] = {}   # когда в пачке появился первый сигнал
+        self._confirmed: Dict[int, dict] = {}                  # id(sig) -> {"facts": [...], "ctx": {...}}
 
     # ------------------------------------------------------------------ run
     async def run(self, sess) -> None:
@@ -142,15 +173,118 @@ class FlowMonitor:
                 val = sum(float(r[4] or 0) for r in rows)
                 vol = sum(float(r[5] or 0) for r in rows)
                 ds.vwap = val / vol if vol else 0.0
+                ds.hl_hist.append((time.time(), ds.high, ds.low))
+                if len(ds.hl_hist) > 1500:
+                    ds.hl_hist = ds.hl_hist[-1000:]
+            today = day0.strftime("%Y-%m-%d")
+            if ds.prev_date != today:
+                ph, pl = await moex.prev_day_hl(sess, t, info.board)
+                if ph:
+                    ds.prev_high, ds.prev_low, ds.prev_date = ph, pl, today
         except Exception as e:
             log.debug("flow: daystats %s: %s", t, e)
         return ds
 
+    # ------------------------------------------------------- подтверждение
+    def key_levels(self, t: str, ds: DayStats) -> list[tuple[str, float]]:
+        """Ключевые уровни: вчерашние high/low и постоявшие ≥1 ч max/min дня."""
+        out = []
+        if ds.prev_high:
+            out.append(("вчерашний максимум", ds.prev_high))
+        if ds.prev_low:
+            out.append(("вчерашний минимум", ds.prev_low))
+        h, l = ds.high_asof(BREAKOUT_HOLD_SEC)
+        if h and abs(h - ds.prev_high) / h > 0.001:
+            out.append(("максимум дня", h))
+        if l and abs(l - ds.prev_low) / l > 0.001:
+            out.append(("минимум дня", l))
+        return out
+
+    def _delta15(self, t: str) -> int:
+        if self.clusters is None:
+            return 0
+        c15 = self.clusters.window(t, 15)
+        b = sum(c.buy for c in c15); s_ = sum(c.sell for c in c15)
+        if not b + s_:
+            return 0
+        bp = b / (b + s_)
+        return 1 if bp >= 0.58 else -1 if bp <= 0.42 else 0
+
+    def _rel_strength(self, t: str, im: dict) -> int:
+        ch15 = self.price_change(t, 15)
+        if ch15 is None or im.get("15m") is None:
+            return 0
+        d = ch15 - im["15m"]
+        return 1 if d >= 0.3 else -1 if d <= -0.3 else 0
+
+    def facts(self, t: str, direction: int, price: float, ds: DayStats, im: dict,
+              dec: int) -> tuple[list[str], dict]:
+        """Какие независимые факты согласны с направлением сигнала.
+        Возвращает (список подписей, ctx для журнала)."""
+        d15 = self._delta15(t)
+        rs = self._rel_strength(t, im)
+        vw = (1 if price >= ds.vwap else -1) if ds.vwap and price else 0
+        near = None
+        for name, lv in self.key_levels(t, ds):
+            if lv and abs(price - lv) / lv * 100 <= LEVEL_NEAR_PCT:
+                near = (name, lv); break
+        ok = []
+        if direction and d15 == direction:
+            ok.append("дельта 15м " + ("за покупки" if direction > 0 else "за продажи"))
+        if direction and vw == direction:
+            ok.append(("выше" if direction > 0 else "ниже") + " VWAP")
+        if direction and rs == direction:
+            ok.append("сильнее рынка" if direction > 0 else "слабее рынка")
+        if near:
+            ok.append(f"у уровня {near[0]} {near[1]:.{dec}f}".replace(".", ","))
+        ctx = {"vwap": vw or None, "hour": now_msk().hour, "delta15": d15, "rs": rs,
+               "near": 1 if near else 0, "conf": len(ok)}
+        return ok, ctx
+
+    def _breakout_signals(self, t: str, price: float, prev_price: float, ds: DayStats,
+                          dec: int) -> list[tape.Signal]:
+        """Пробой ключевого уровня: цена пересекла его между двумя опросами."""
+        out = []
+        if not price or not prev_price or price == prev_price:
+            return out
+        now = time.time()
+        for name, lv in self.key_levels(t, ds):
+            if not lv:
+                continue
+            up = prev_price < lv <= price
+            down = prev_price > lv >= price
+            if not (up or down):
+                continue
+            k = (t, round(lv, 6))
+            if now - self._breakout_sent.get(k, 0) < BREAKOUT_COOLDOWN_SEC:
+                continue
+            self._breakout_sent[k] = now
+            arrow = "🚀 пробой вверх" if up else "🔻 пробой вниз"
+            d15 = self._delta15(t)
+            dtxt = {1: "дельта 15м за покупки", -1: "дельта 15м за продажи", 0: "дельта 15м нейтральна"}[d15]
+            lvl = f"{lv:.{dec}f}".replace(".", ",")
+            ptxt = f"{price:.{dec}f}".replace(".", ",")
+            out.append(tape.Signal(
+                kind="breakout", ticker=t,
+                text=f"{arrow}: <b>{t}</b> прошла {name} <b>{lvl}</b> — цена {ptxt} ₽, {dtxt}",
+                key=f"breakout:{name}:{'up' if up else 'down'}"))
+        return out
+
     async def imoex(self, sess) -> dict:
+        """{'15m': %, 'day': %}: день и 15 мин — из T-Invest в реальном времени
+        (market.snapshot + собственная история); пока истории < 15 мин — 15m от MOEX."""
         if time.time() - self._imoex_ts > 60:
             self._imoex_ts = time.time()
             try:
-                self._imoex = await moex.index_changes(sess)
+                snap = await market.snapshot(sess)
+                rt15 = market.imoex_change(15)
+                if snap.ok() and rt15 is not None:
+                    self._imoex = {"15m": rt15, "day": snap.imoex_pct}
+                else:
+                    mx = await moex.index_changes(sess)
+                    if snap.ok():
+                        mx["day"] = snap.imoex_pct
+                    self._imoex = mx
             except Exception as e:
                 log.debug("flow: imoex: %s", e)
         return self._imoex
@@ -264,6 +398,27 @@ class FlowMonitor:
         hour = now_msk().hour
         if not self._main_session():
             return   # вне окна сигналов: лента уже накоплена для кластеров, уведомлений нет
+        # «второй факт»: считаем подтверждение один раз на бумагу и направление
+        im = await self.imoex(sess)
+        for t, sigs in signals.items():
+            if not sigs:
+                continue
+            price = self._last_price.get(t, 0.0)
+            ds = await self._daystats(sess, t)
+            info = self._infos.get(t)
+            dec = info.decimals if info else 2
+            cache: Dict[int, tuple[list[str], dict]] = {}
+            for sig in sigs:
+                d = _direction(sig)
+                if d not in cache:
+                    cache[d] = self.facts(t, d, price, ds, im, dec)
+                ok, ctx = cache[d]
+                if sig.kind == "breakout":           # пробой — сам по себе факт у уровня
+                    ok = [x for x in ok if not x.startswith("у уровня")]
+                    ctx = dict(ctx, conf=len(ok) + 1)
+                self._confirmed[id(sig)] = {"facts": ok, "ctx": ctx,
+                                            "ok": sig.kind == "breakout" or (d != 0 and len(ok) >= CONFIRM_MIN)}
+
         for uid, prof in users:
             if prof.is_quiet(hour):
                 continue
@@ -279,19 +434,23 @@ class FlowMonitor:
                     if now - self._sent.get(kk, 0) < KIND_COOLDOWN_SEC:
                         continue
                     self._sent[k] = self._sent[kk] = now
+                    if not self._digest.get((uid, t)):
+                        self._digest_first[(uid, t)] = now
                     self._digest.setdefault((uid, t), []).append(sig)
 
-        # отправка дайджестов
+        # отправка: подтверждённые — сразу; одиночные копятся DIGEST_SEC и уходят сводкой
         for (uid, t), sigs in list(self._digest.items()):
             if not sigs:
                 continue
-            last = self._digest_ts.get((uid, t), 0)
-            # первый сигнал уходит сразу; следующие копятся DIGEST_SEC
-            if now - last < DIGEST_SEC and len(sigs) < MAX_SIGNALS_PER_MSG:
+            first = self._digest_first.get((uid, t), now)
+            has_conf = any(self._confirmed.get(id(s), {}).get("ok") for s in sigs)
+            if not has_conf and now - first < DIGEST_SEC and len(sigs) < MAX_SIGNALS_PER_MSG:
                 continue
             self._digest[(uid, t)] = []
             self._digest_ts[(uid, t)] = now
             await self._send_signals(sess, uid, t, sigs[:MAX_SIGNALS_PER_MSG])
+        if len(self._confirmed) > 2000:
+            self._confirmed = {}
 
         if len(self._sent) > 5000:
             self._sent = {k: v for k, v in self._sent.items() if now - v < 3600}
@@ -307,22 +466,20 @@ class FlowMonitor:
                                 self._last_book.get(t))
         im = await self.imoex(sess)
         ch15 = self.price_change(t, 15)
-        rs = 0
-        if ch15 is not None and im.get("15m") is not None:
-            rs = 1 if ch15 - im["15m"] >= 0.3 else -1 if ch15 - im["15m"] <= -0.3 else 0
-        d15 = 0
-        if self.clusters is not None:
-            c15 = self.clusters.window(t, 15)
-            b = sum(c.buy for c in c15); s_ = sum(c.sell for c in c15)
-            if b + s_:
-                bp = b / (b + s_)
-                d15 = 1 if bp >= 0.58 else -1 if bp <= 0.42 else 0
-        ctx_d = {"vwap": (1 if price >= ds.vwap else -1) if ds.vwap and price else None,
-                 "hour": now_msk().hour, "delta15": d15, "rs": rs}
+        rs = self._rel_strength(t, im)
         if im.get("15m") is not None and ch15 is not None:
             ctx += (f"\n📊 15 мин: бумага {fmt_pct(ch15)}, IMOEX {fmt_pct(im['15m'])} — "
                     + ("сильнее рынка" if rs > 0 else "слабее рынка" if rs < 0 else "с рынком"))
-        body = "\n\n".join(s.text for s in sigs)
+        confs = [self._confirmed.get(id(s)) or {"facts": [], "ctx": {}, "ok": False} for s in sigs]
+        parts = []
+        for s, c in zip(sigs, confs):
+            if c["ok"] and c["facts"]:
+                parts.append(s.text + "\n⭐ подтверждено: " + ", ".join(c["facts"]))
+            else:
+                parts.append(s.text)
+        body = "\n\n".join(parts)
+        if not any(c["ok"] for c in confs):
+            body = "🗂 <i>Сводка за 5 мин (без подтверждения)</i>\n\n" + body
         # под китами контекст не показываем — перегружает (по просьбе пользователя)
         if all(s.kind in ("whale", "whale_series") for s in sigs):
             ctx = ""
@@ -334,7 +491,8 @@ class FlowMonitor:
             return
         if price:
             # журналируем каждый сигнал; результат дописываем к одному сообщению
-            for s in sigs:
+            for s, c in zip(sigs, confs):
+                ctx_d = c["ctx"] or {"hour": now_msk().hour}
                 self.journal.add(Entry(ts=time.time(), uid=uid, chat_id=msg.chat.id,
                                        msg_id=msg.message_id, ticker=t, kind=s.kind,
                                        price=price, direction=_direction(s), text=text,
@@ -357,6 +515,7 @@ class FlowMonitor:
             return_exceptions=True)
         out: list[tape.Signal] = []
         if isinstance(trades, list) and trades:
+            self._prev_price[t] = self._last_price.get(t, 0.0)
             self._last_price[t] = trades[-1].price
             if self.clusters is not None:
                 try:
@@ -370,6 +529,8 @@ class FlowMonitor:
                 try:
                     out += self._level_signals(t, trades[-1].price, dec)
                     out += self._volume_signal(t, dec)
+                    ds = await self._daystats(sess, t)
+                    out += self._breakout_signals(t, trades[-1].price, self._prev_price.get(t, 0.0), ds, dec)
                 except Exception:
                     log.exception("flow: уровни/объём %s", t)
         elif isinstance(trades, BaseException):

@@ -30,6 +30,8 @@ import cleaner
 import screener as scrmod
 import clusters as clu
 import cscalp
+import events as evmod
+import market
 import moex
 import setup as stp
 import tape
@@ -37,7 +39,8 @@ import tinkoff
 from flow import FlowMonitor
 from journal import Journal
 from news import NewsMonitor, NEWS_CHANNEL
-from keyboards import book_kb, chart_kb, cluster_kb, report_kb, setup_kb, tape_kb, screener_kb
+from keyboards import (book_kb, chart_kb, cluster_kb, report_kb, setup_kb, tape_kb, screener_kb,
+                       scr_pick_kb)
 from config import (BOT_TOKEN, CHECK_INTERVAL_SEC, DATA_FILE,
                     DEFAULT_REPORT_MIN, DEFAULT_THRESHOLD_PCT)
 from formatting import cur_symbol, esc, fmt_pct, fmt_price
@@ -84,7 +87,9 @@ HELP = (
     "<b>Команды</b>\n"
     "/watch TICKER [TICKER …] — добавить акции, напр. /watch SBER GAZP\n"
     "/unwatch TICKER — убрать из списка\n"
-    "/screener [15m|30m|1h|4h|1d] — скринер: топ-10 роста и падения по ликвидным акциям\n"
+    "/screener [15m|30m|1h|4h|1d|vol] — скринер: топ-10 роста/падения; vol — всплески объёма\n"
+    "/market — рынок сейчас: IMOEX, RTS, юань, доллар, Brent\n"
+    "/calendar [дней] — дивиденды, заседания ЦБ, отчётности по списку; /event add|del — свои события\n"
     "/list — список с текущими ценами\n"
     "/alert N — алерт, если цена уйдёт более чем на N% за день (0.1–50)\n"
     "/quiet N — мин. пауза между повторными алертами, мин\n"
@@ -611,6 +616,12 @@ async def _setup_text(sess, tk: tinkoff.TinkoffClient, cstore: clu.ClusterStore,
         cells, dec, inst.lot, flow.recent_signals(t), rs15, rsd)
     cov = cstore.coverage(t)
     text = stp.setup_text(s, name, dec)
+    try:
+        ml = market.line(await market.snapshot(sess))
+        if ml:
+            text += "\n\n" + ml
+    except Exception as e:
+        log.debug("market line: %s", e)
     if cov and (datetime.now() - cov) < timedelta(hours=6):
         text += f"\n<i>История ленты копится с {cov:%d.%m %H:%M} МСК — уровни и тесты пока неполные.</i>"
     return text
@@ -732,16 +743,26 @@ _scr_msg: dict[int, int] = {}   # chat_id -> message_id открытого ск�
 
 
 async def show_screener(bot: Bot, chat_id: int, scr: scrmod.Screener, win: str,
-                        current: Optional[Message] = None) -> None:
+                        current: Optional[Message] = None, mine: bool = False,
+                        watchlist: Optional[list[str]] = None) -> None:
     """Одно сообщение скринера на чат: картинка-таблица; переключение окна
-    редактирует его на месте (как график); новая команда удаляет старое."""
-    if win not in scrmod.WINDOWS:
+    редактирует его на месте (как график); новая команда удаляет старое.
+    mine — только бумаги из списка пользователя."""
+    if win not in scrmod.WINDOWS and win != scrmod.VOL_WIN:
         win = scrmod.DEFAULT_WINDOW
-    kb = screener_kb(win)
-    ups, downs, n = scr.rows(win)
-    if not scr.secs or n == 0:
+    only = set(watchlist or []) if mine else None
+    ups, downs, n = scr.rows(win, only)
+    # кнопки лидеров: топ-3 роста + топ-3 падения (или топ-6 по объёму)
+    leaders = [r.ticker for r in ups[:3]] + [r.ticker for r in downs[:3]] if win != scrmod.VOL_WIN \
+        else [r.ticker for r in ups[:6]]
+    kb = screener_kb(win, mine, leaders)
+    if not scr.secs or n == 0 or (win == scrmod.VOL_WIN and not ups):
         # данных нет — короткий текст вместо пустой картинки
-        text = scrmod.format_screener(scr, win, esc)
+        text = scrmod.format_screener(scr, win, esc, only)
+        if win == scrmod.VOL_WIN and not ups and n:
+            text = (f"🔎 <b>Скринер MOEX — {esc(scrmod.WINDOW_TITLES[win])}</b>\n\n"
+                    f"Сейчас нет бумаг с оборотом за 15 мин выше ×{scrmod.VOL_MIN_RATIO:g} от обычного "
+                    f"для этого часа (в расчёте {n}).")
         if current is not None and not current.photo:
             try:
                 await current.edit_text(text, reply_markup=kb); return
@@ -757,14 +778,14 @@ async def show_screener(bot: Bot, chat_id: int, scr: scrmod.Screener, win: str,
         _scr_msg[chat_id] = m.message_id
         return
     try:
-        png = await asyncio.to_thread(scrmod.render_png, scr, win)
+        png = await asyncio.to_thread(scrmod.render_png, scr, win, only)
     except Exception as e:
         log.exception("screener render")
-        await bot.send_message(chat_id, scrmod.format_screener(scr, win, esc) +
+        await bot.send_message(chat_id, scrmod.format_screener(scr, win, esc, only) +
                                f"\n<i>(картинка недоступна: {esc(e)})</i>", reply_markup=kb)
         return
     file = BufferedInputFile(png, f"screener_{win}.png")
-    caption = f"🔎 Скринер MOEX — {scrmod.WINDOW_TITLES[win]}"
+    caption = f"🔎 Скринер MOEX — {scrmod.WINDOW_TITLES[win]}" + (" · мои бумаги" if mine else "")
     if current is not None and current.photo:
         try:
             await current.edit_media(InputMediaPhoto(media=file, caption=caption), reply_markup=kb)
@@ -789,12 +810,12 @@ async def show_screener(bot: Bot, chat_id: int, scr: scrmod.Screener, win: str,
 
 
 @router.message(Command("screener"))
-async def cmd_screener(m: Message, scr: scrmod.Screener) -> None:
+async def cmd_screener(m: Message, scr: scrmod.Screener, store: Store) -> None:
     args = (m.text or "").split()[1:]
     win = args[0].lower() if args else scrmod.DEFAULT_WINDOW
-    if win not in scrmod.WINDOWS:
-        await m.answer("Использование: /screener [15m|30m|1h|4h|1d]"); return
-    await show_screener(m.bot, m.chat.id, scr, win)
+    if win not in scrmod.WINDOWS and win != scrmod.VOL_WIN:
+        await m.answer("Использование: /screener [15m|30m|1h|4h|1d|vol]"); return
+    await show_screener(m.bot, m.chat.id, scr, win, watchlist=store.get(m.from_user.id).watchlist)
 
 
 @router.callback_query(F.data == "scr:close")
@@ -807,12 +828,109 @@ async def cb_scr_close(c: CallbackQuery) -> None:
         pass
 
 
+@router.callback_query(F.data.startswith("scr:pick:"))
+async def cb_scr_pick(c: CallbackQuery, store: Store, scr: scrmod.Screener) -> None:
+    t = c.data.split(":")[2]
+    await c.answer()
+    prof = store.get(c.from_user.id)
+    s = scr.secs.get(t)
+    head = f"<b>{esc(t)}</b>" + (f" — {esc(s.name)}" if s else "")
+    if s and s.last:
+        ch = s.change("1d")
+        head += f"\n{esc(scrmod._fmt_price(s.last, s.decimals))} ₽"
+        if ch is not None:
+            head += f"  ({ch:+.2f}% за день)".replace(".", ",")
+        chs = []
+        for w in ("15m", "1h"):
+            v = s.change(w)
+            if v is not None:
+                chs.append(f"{scrmod.WINDOW_SHORT[w]} {v:+.2f}%".replace(".", ","))
+        r = s.vol_ratio()
+        if r:
+            chs.append(f"объём ×{r:.1f}")
+        if chs:
+            head += "\n" + " · ".join(chs)
+    await c.message.answer(head, reply_markup=scr_pick_kb(t, t in prof.watchlist))
+
+
+@router.callback_query(F.data.startswith("watch:"))
+async def cb_watch(c: CallbackQuery, store: Store, sess: aiohttp.ClientSession) -> None:
+    t = c.data.split(":")[1]
+    await c.answer()
+    m = c.message.model_copy(update={"from_user": c.from_user})
+    await c.message.answer(await _watch(m, store, sess, [t]))
+
+
+@router.callback_query(F.data == "noop")
+async def cb_noop(c: CallbackQuery) -> None:
+    await c.answer()
+
+
 @router.callback_query(F.data.startswith("scr:"))
-async def cb_scr(c: CallbackQuery, scr: scrmod.Screener) -> None:
+async def cb_scr(c: CallbackQuery, scr: scrmod.Screener, store: Store) -> None:
     parts = c.data.split(":")
     win = parts[1]
-    await c.answer("Обновляю…" if len(parts) > 2 else None)
-    await show_screener(c.bot, c.message.chat.id, scr, win, current=c.message)
+    flags = set(parts[2:])
+    await c.answer("Обновляю…" if "r" in flags else None)
+    await show_screener(c.bot, c.message.chat.id, scr, win, current=c.message,
+                        mine="my" in flags, watchlist=store.get(c.from_user.id).watchlist)
+
+
+# ------------------------------------------------------------ рынок/календарь
+
+@router.message(Command("market"))
+async def cmd_market(m: Message, sess: aiohttp.ClientSession, store: Store,
+                     scr: scrmod.Screener) -> None:
+    snap = await market.snapshot(sess, force=True)
+    rows = []
+    for t in store.get(m.from_user.id).watchlist:
+        s = scr.secs.get(t)
+        if s is None or not s.last:
+            rows.append((t, None, None))
+        else:
+            rows.append((t, s.change("15m"), s.change("1d")))
+    await m.answer(market.text(snap) + market.rs_text(snap, rows))
+
+
+@router.message(Command("calendar"))
+async def cmd_calendar(m: Message, store: Store, cal: evmod.Calendar) -> None:
+    args = (m.text or "").split()[1:]
+    days = int(args[0]) if args and args[0].isdigit() else evmod.HORIZON_DAYS
+    days = max(1, min(days, 90))
+    wl = store.get(m.from_user.id).watchlist
+    evs = await cal.upcoming(wl, days=days)
+    await m.answer(cal.text(evs, wl, esc, days=days))
+
+
+@router.message(Command("event"))
+async def cmd_event(m: Message, store: Store, cal: evmod.Calendar) -> None:
+    usage = ("Использование:\n"
+             "/event add SBER 2026-11-05 МСФО 3 кв.\n"
+             "/event add - 2026-10-23 Заседание ЦБ   (— без бумаги)\n"
+             "/event del 3   (номер из /calendar)\n"
+             "/event list")
+    args = (m.text or "").split(maxsplit=4)[1:]
+    if not args:
+        await m.answer(usage); return
+    op = args[0].lower()
+    if op == "add" and len(args) >= 4:
+        t = "" if args[1] in ("-", "—") else args[1].upper()
+        dt = args[2]
+        try:
+            datetime.strptime(dt, "%Y-%m-%d")
+        except ValueError:
+            await m.answer("Дата в формате ГГГГ-ММ-ДД, например 2026-11-05"); return
+        e = cal.add(dt, t, args[3])
+        await m.answer(f"📌 Добавлено #{e.id}: {esc(dt)} {esc(t)} {esc(e.text)}"); return
+    if op == "del" and len(args) >= 2 and args[1].isdigit():
+        ok = cal.remove(int(args[1]))
+        await m.answer("🗑 Удалено" if ok else "Нет события с таким номером"); return
+    if op == "list":
+        if not cal.manual:
+            await m.answer("Ручных событий нет."); return
+        lines = [f"#{e.id} {e.date} {e.ticker or '—'} {esc(e.text)}" for e in sorted(cal.manual, key=lambda e: e.date)]
+        await m.answer("📌 <b>Ручные события</b>\n" + "\n".join(lines)); return
+    await m.answer(usage)
 
 
 # --------------------------------------------------------------- очистка
@@ -1181,7 +1299,10 @@ async def on_added(ev) -> None:
 
 BOT_COMMANDS = [
     ("list", "Мои бумаги и цены"),
-    ("screener", "Скринер: что двигается — /screener 15m"),
+    ("screener", "Скринер: что двигается — /screener 15m|vol"),
+    ("market", "Рынок сейчас: IMOEX, RTS, валюта, Brent"),
+    ("calendar", "Календарь: дивиденды, ЦБ, отчётности — /calendar 14"),
+    ("event", "Добавить/удалить событие — /event add SBER 2026-11-05 МСФО"),
     ("setup", "Сетап: за/против входа — /setup SBER"),
     ("clusters", "Кластеры объёма — /clusters SBER 1h"),
     ("chart", "Свечной график — /chart SBER 5m"),
@@ -1373,13 +1494,18 @@ def main() -> None:
         clean_task = asyncio.create_task(cleaner.run_daily(bot, sent, store, moex.now_msk))
         scr = scrmod.Screener(tk, os.path.dirname(DATA_FILE) or ".")
         scr_task = asyncio.create_task(scr.run(session)) if tinkoff.enabled() else None
+        market.set_client(tk if tinkoff.enabled() else None)
+        cal = evmod.Calendar(os.path.join(os.path.dirname(DATA_FILE) or ".", "events.json"),
+                             tk if tinkoff.enabled() else None)
+        cal_task = asyncio.create_task(cal.run_reminders(bot, store, esc))
         csq = cscalp.CScalpQueue()
         runner = await csq.start() if (cscalp.enabled() and cscalp.HTTP_MODE) else None
         try:
             await dp.start_polling(bot, store=store, sess=session, tk=tk,
                                    journal=journal, newsmon=newsmon, cstore=cstore, flow=flow,
-                                   csq=csq, sent=sent, scr=scr)
+                                   csq=csq, sent=sent, scr=scr, cal=cal)
         finally:
+            cal_task.cancel()
             cstore.save(force=True)
             clean_task.cancel()
             if scr_task:

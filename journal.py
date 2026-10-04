@@ -16,12 +16,12 @@ from typing import Optional
 KIND_EMOJI = {
     "iceberg": "🧊", "rhythm": "🤖", "imbalance": "⚖️", "burst": "🔥",
     "wall": "🧱", "spoof": "👻", "whale": "🐋", "eaten": "🍽",
-    "level": "📏", "volume": "📊", "whale_series": "🐋🐋",
+    "level": "📏", "volume": "📊", "whale_series": "🐋🐋", "breakout": "🚀",
 }
 KIND_NAME = {
     "iceberg": "айсберг", "rhythm": "ритм", "imbalance": "перекос",
     "burst": "всплеск", "wall": "плотность", "spoof": "спуфинг",
-    "whale": "кит", "eaten": "стену съели", "level": "уровень", "volume": "объём", "whale_series": "серия китов",
+    "whale": "кит", "eaten": "стену съели", "level": "уровень", "volume": "объём", "whale_series": "серия китов", "breakout": "пробой",
 }
 # ожидаемое направление сигнала: +1 — рост, -1 — падение, 0 — неизвестно
 CHECKPOINTS = (5, 15)  # минуты
@@ -193,6 +193,8 @@ class Journal:
             ("По дельте 15м", _grp("delta15", lambda e, v: ("дельта согласна" if v * e.direction > 0 else "дельта против" if v * e.direction < 0 else "дельта нейтральна"))),
             ("По силе к рынку", _grp("rs", lambda e, v: ("сильнее рынка" if v > 0 else "слабее рынка" if v < 0 else "с рынком"))),
             ("По времени дня", _grp("hour", _hour)),
+            ("По подтверждению", _grp("conf", lambda e, v: ("⭐ подтверждённые (2+ факта)" if v >= 2 else "одиночные"))),
+            ("По уровню", _grp("near", lambda e, v: ("у ключевого уровня" if v else "вдали от уровней"))),
         ]
         out = ["<b>В каких условиях сигналы работали</b>", "<pre>"]
         any_rows = False
