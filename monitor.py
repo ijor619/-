@@ -30,6 +30,10 @@ class Monitor:
         self._hints: Dict[str, datetime] = {}                    # тикер -> конец последней свечи
         self._sec_cache: Dict[str, tuple[float, Optional[SecurityInfo]]] = {}
         self._last_alert: Dict[tuple[int, str], float] = {}      # (user, тикер) -> unix-время
+        # ступень, о которой уже сообщили: (user, тикер) -> (дата, int(change/threshold))
+        # алерт уходит при переходе на новую ступень (±0.5%, ±1%, ±1.5% …), а не пока
+        # бумага «висит» выше порога
+        self._step: Dict[tuple[int, str], tuple[str, int]] = {}
         self._first_tick = True
 
     # ------------------------------------------------------------------ run
@@ -65,13 +69,25 @@ class Monitor:
                 q = quotes.get(t)
                 # Алерты — только когда рынок торгует (данные свежие),
                 # чтобы не зациклиться на неизменной цене после закрытия.
-                if (q is not None and q.trading
-                        and abs(q.change_pct) >= prof.threshold_pct
-                        and not self._first_tick):
-                    last = self._last_alert.get((uid, t), 0.0)
-                    if now_ts - last >= prof.cooldown_min * 60:
-                        self._last_alert[(uid, t)] = now_ts
-                        await self._send(uid, self._alert_text(q, prof), alert_kb(t, flow_enabled()))
+                if q is None or not q.trading or prof.threshold_pct <= 0:
+                    continue
+                day = now_msk().strftime("%Y-%m-%d")
+                step = int(q.change_pct / prof.threshold_pct)   # 0 — внутри порога
+                key = (uid, t)
+                prev_day, prev_step = self._step.get(key, ("", 0))
+                if prev_day != day:
+                    prev_step = 0
+                if step == prev_step:
+                    continue
+                self._step[key] = (day, step)
+                if self._first_tick:
+                    continue    # после рестарта запоминаем текущую ступень молча
+                last = self._last_alert.get(key, 0.0)
+                if now_ts - last < prof.cooldown_min * 60:
+                    continue    # защита от дребезга на границе ступени
+                self._last_alert[key] = now_ts
+                await self._send(uid, self._alert_text(q, prof, step, prev_step),
+                                 alert_kb(t, flow_enabled()))
 
             if (prof.report_min > 0
                     and now_ts - prof.last_report_ts >= prof.report_min * 60):
@@ -111,16 +127,23 @@ class Monitor:
 
     # ------------------------------------------------------------- сообщения
     @staticmethod
-    def _alert_text(q: Quote, prof: UserProfile) -> str:
+    def _alert_text(q: Quote, prof: UserProfile, step: int = 0, prev_step: int = 0) -> str:
         emoji = "📈" if q.change_pct > 0 else "📉"
         cur = cur_symbol(q.info.currency)
         d = q.info.prev_date
         date_str = f"{d[8:10]}.{d[5:7]}" if len(d) == 10 else d
+        thr = prof.threshold_pct
+        if step == 0:
+            what = f"вернулась внутрь ±{thr:g}%"
+        elif abs(step) > abs(prev_step):
+            what = f"прошла {'+' if step > 0 else '-'}{abs(step) * thr:g}%"
+        else:
+            what = f"откатилась ниже {'+' if step > 0 else '-'}{(abs(step) + 1) * thr:g}%"
         return (
             f"{emoji} <b>{esc(q.info.ticker)}</b> — "
             f"<b>{fmt_price(q.price, q.info.decimals)} {cur}</b>\n"
-            f"{esc(q.info.name)}: <b>{fmt_pct(q.change_pct)}</b> за день "
-            f"(порог {prof.threshold_pct:g}%)\n"
+            f"{esc(q.info.name)}: <b>{fmt_pct(q.change_pct)}</b> за день — {what} "
+            f"(шаг {thr:g}%)\n"
             f"Пред. закрытие {date_str}: "
             f"{fmt_price(q.info.prev_close, q.info.decimals)} {cur}"
         )
