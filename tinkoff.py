@@ -143,6 +143,7 @@ class Instrument:
     figi: str
     lot: int
     name: str
+    sector: str = ""
 
 
 @dataclass
@@ -255,7 +256,7 @@ class TinkoffClient:
             i = d.get("instrument") or {}
             if i:
                 inst = Instrument(t, i["uid"], i.get("figi", ""),
-                                  int(i.get("lot") or 1), i.get("name", t))
+                                  int(i.get("lot") or 1), i.get("name", t), i.get("sector", ""))
         except Exception as e:
             log.warning("T-Invest: инструмент %s: %s", t, e)
             raise  # пусть пользователь увидит настоящую причину (401, сеть...)

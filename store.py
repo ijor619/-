@@ -9,7 +9,8 @@ from typing import Dict, Iterator
 class UserProfile:
     __slots__ = ("watchlist", "threshold_pct", "cooldown_min",
                  "report_min", "last_report_ts", "flow_alerts", "quiet_from", "quiet_to",
-                 "clear_hour")
+                 "clear_hour", "idea_alerts", "raw_flow_alerts", "risk_rub",
+                 "idea_min_conf")
 
     def __init__(self) -> None:
         self.watchlist: list[str] = []      # тикеры в верхнем регистре
@@ -18,6 +19,10 @@ class UserProfile:
         self.report_min: float = 60.0       # период сводки, мин (0 = выкл)
         self.last_report_ts: float = 0.0    # unix-время последней сводки
         self.flow_alerts: bool = True       # сигналы по ленте/стакану (роботы)
+        self.idea_alerts: bool = True       # торговые идеи со входом/стопом/целью
+        self.raw_flow_alerts: bool = False  # сырые киты/стены — по умолчанию только контекст
+        self.risk_rub: float = 0.0          # риск на идею, ₽; 0 = не считать размер
+        self.idea_min_conf: int = 65        # минимальная оценка идеи
         self.quiet_from: int = -1           # тихие часы, час МСК начала (-1 = выкл)
         self.quiet_to: int = -1             # час МСК окончания
         self.clear_hour: int = 3            # автоочистка чата, час МСК (-1 = выкл)
@@ -30,6 +35,10 @@ class UserProfile:
             "report_min": self.report_min,
             "last_report_ts": self.last_report_ts,
             "flow_alerts": self.flow_alerts,
+            "idea_alerts": self.idea_alerts,
+            "raw_flow_alerts": self.raw_flow_alerts,
+            "risk_rub": self.risk_rub,
+            "idea_min_conf": self.idea_min_conf,
             "quiet_from": self.quiet_from,
             "quiet_to": self.quiet_to,
             "clear_hour": self.clear_hour,
@@ -44,6 +53,10 @@ class UserProfile:
         p.report_min = float(d.get("report_min", p.report_min))
         p.last_report_ts = float(d.get("last_report_ts", 0.0))
         p.flow_alerts = bool(d.get("flow_alerts", True))
+        p.idea_alerts = bool(d.get("idea_alerts", True))
+        p.raw_flow_alerts = bool(d.get("raw_flow_alerts", False))
+        p.risk_rub = max(0.0, float(d.get("risk_rub", 0.0)))
+        p.idea_min_conf = max(40, min(90, int(d.get("idea_min_conf", 65))))
         p.quiet_from = int(d.get("quiet_from", -1))
         p.quiet_to = int(d.get("quiet_to", -1))
         p.clear_hour = int(d.get("clear_hour", 3))

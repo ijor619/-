@@ -195,14 +195,19 @@ def analyze_trades(ticker: str, trades: list[Trade], lot: int,
             share = max(vb, vs) / tot
             if share >= IMBALANCE_SHARE:
                 side = "покупки" if vb > vs else "продажи"
+                # Aggressive flow with no price response is absorption, not a
+                # directional continuation. Buyers absorbed by a passive
+                # seller are bearish context; sellers absorbed by a buyer are
+                # bullish context.
+                direction = -1 if vb > vs else 1
                 out.append(Signal(
                     "imbalance", ticker,
                     f"⚖️ <b>{ticker}</b> — перекос ленты: {share * 100:.0f}% объёма "
                     f"за 5 мин — {side}\n"
-                    f"Цена при этом {fmt_pct(move)} → кто-то "
-                    f"{'набирает' if vb > vs else 'раздаёт'} позицию, не двигая рынок\n"
+                    f"Цена при этом {fmt_pct(move)} → поток поглощается пассивной "
+                    f"{'продажей' if vb > vs else 'покупкой'}; это не подтверждение импульса\n"
                     f"Объём: {fmt_n(tot * lot)} шт. в {len(win)} сделках",
-                    f"imbalance:{side}", direction=1 if vb > vs else -1))
+                    f"imbalance:{side}", direction=direction))
 
     # --- всплеск -----------------------------------------------------
     per_min: dict[datetime, int] = defaultdict(int)

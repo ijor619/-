@@ -83,6 +83,23 @@ def flow_kb(ticker: str) -> InlineKeyboardMarkup:
     ])
 
 
+def idea_kb(idea_id: str, ticker: str, status: str) -> InlineKeyboardMarkup:
+    """Actions under an idea card; callback stays under Telegram's 64 bytes."""
+    rows: list[list[InlineKeyboardButton]] = []
+    if status in ("prepared", "active"):
+        rows.append([
+            InlineKeyboardButton(text="✅ Взял", callback_data=f"idea:take:{idea_id}"),
+            InlineKeyboardButton(text="⏭ Пропустил", callback_data=f"idea:skip:{idea_id}"),
+            InlineKeyboardButton(text="✖ Отменить", callback_data=f"idea:cancel:{idea_id}"),
+        ])
+    rows.append([
+        InlineKeyboardButton(text="📈 График", callback_data=f"chart:{ticker}:1m"),
+        setup_btn(ticker),
+    ])
+    rows.append(_links_row(ticker))
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def cluster_btn(ticker: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text="🧮 Кластеры", callback_data=f"clu:{ticker}:{DEFAULT_WINDOW}")
 

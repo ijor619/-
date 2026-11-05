@@ -532,6 +532,16 @@ class NewsMonitor:
         self.channel = NEWS_CHANNEL
         self._src_err_ts: dict[str, float] = {}
         self._src_ok: set = set()
+        self._recent_items: list[NewsItem] = []
+
+    def risk_for(self, ticker: str, minutes: int = 45) -> str:
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+        xs = [x for x in self._recent_items if x.published >= cutoff
+              and (ticker in x.tickers or x.priority >= 3)]
+        if not xs:
+            return ""
+        latest = max(xs, key=lambda x: x.published)
+        return f"свежая новость: {latest.title[:100]}"
 
     def _load(self) -> None:
         try:
@@ -682,6 +692,9 @@ class NewsMonitor:
             classify(it, watch)
             if not is_relevant(it, self.mode):
                 continue
+            self._recent_items.append(it)
+            cutoff = now - timedelta(hours=3)
+            self._recent_items = [x for x in self._recent_items if x.published >= cutoff][-300:]
             if self._is_dup_story(it):
                 continue
             try:

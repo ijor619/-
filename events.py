@@ -87,6 +87,26 @@ class Calendar:
         except Exception as e:
             log.warning("events: не сохранён: %s", e)
 
+    def risk_for(self, ticker: str, days: int = 1) -> str:
+        """Known scheduled event today/tomorrow, without a network request."""
+        today = datetime.now(MSK).date()
+        rows = []
+        for dt, text in CBR_MEETINGS.items():
+            try:
+                if 0 <= (date.fromisoformat(dt) - today).days <= days:
+                    rows.append(text)
+            except ValueError:
+                pass
+        for e in self.manual:
+            if e.ticker and e.ticker != ticker:
+                continue
+            try:
+                if 0 <= (date.fromisoformat(e.date) - today).days <= days:
+                    rows.append(e.text)
+            except ValueError:
+                pass
+        return ("событие сегодня/завтра: " + rows[0][:100]) if rows else ""
+
     # ------------------------------------------------------------ ручные
     def add(self, dt: str, ticker: str, text: str) -> Event:
         e = Event(dt, ticker.upper(), text.strip(), "manual", self._next_id)

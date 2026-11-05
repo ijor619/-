@@ -85,6 +85,7 @@ class Sec:
     turn15: float = 0.0        # оборот за последние 15 мин, ₽
     turn15_ts: float = 0.0
     ratio: float = 0.0         # turn15 / обычный оборот этого часа
+    sector: str = ""
 
     def vol_ratio(self) -> Optional[float]:
         if not self.turn15_ts or time.time() - self.turn15_ts > 3 * VOL_POLL_SEC:
@@ -147,6 +148,21 @@ class Screener:
         self._warm = False
         self._vol_ts = 0.0
 
+    def idea_context(self, ticker: str) -> dict:
+        """Breadth and sector-relative strength from one consistent snapshot."""
+        rows = [(s, s.change("15m")) for s in self.secs.values()]
+        rows = [(s, ch) for s, ch in rows if ch is not None and s.last_ts]
+        if not rows:
+            return {}
+        breadth = sum(ch > 0 for _, ch in rows) / len(rows) * 100
+        sec = self.secs.get(ticker)
+        sector_rows = [ch for s, ch in rows if sec and sec.sector and s.sector == sec.sector]
+        sector15 = sum(sector_rows) / len(sector_rows) if sector_rows else None
+        own = sec.change("15m") if sec else None
+        return {"breadth": breadth, "sector": sec.sector if sec else "",
+                "sector15": sector15,
+                "sector_edge": own - sector15 if own is not None and sector15 is not None else None}
+
     # ------------------------------------------------------------ persist
     def _load_turnover(self) -> dict[str, float]:
         try:
@@ -191,7 +207,8 @@ class Screener:
             if i.get("apiTradeAvailableFlag") is False:
                 continue
             t = i["ticker"]
-            out[t] = Instrument(t, i["uid"], i.get("figi", ""), int(i.get("lot") or 1), i.get("name", t))
+            out[t] = Instrument(t, i["uid"], i.get("figi", ""), int(i.get("lot") or 1),
+                                i.get("name", t), i.get("sector", ""))
         return out
 
     async def refresh_universe(self, session: aiohttp.ClientSession) -> None:
@@ -217,8 +234,10 @@ class Screener:
                 old.name, old.prev_close, old.turnover, old.decimals = b["name"], b["prev"], turnover, b["dec"]
                 new[tick] = old
             else:
-                new[tick] = Sec(tick, b["name"], inst.uid, b["prev"], turnover, b["dec"], lot=inst.lot)
+                new[tick] = Sec(tick, b["name"], inst.uid, b["prev"], turnover, b["dec"],
+                                lot=inst.lot, sector=inst.sector)
             new[tick].lot = inst.lot
+            new[tick].sector = inst.sector
         if len(new) < 20:
             log.warning("screener: вселенная подозрительно мала (%d) — оставляю прежнюю", len(new))
             if self.secs:

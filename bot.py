@@ -38,9 +38,10 @@ import tape
 import tinkoff
 from flow import FlowMonitor
 from journal import Journal
+from ideas import IdeaJournal, card
 from news import NewsMonitor, NEWS_CHANNEL
 from keyboards import (book_kb, chart_kb, cluster_kb, report_kb, setup_kb, tape_kb, screener_kb,
-                       scr_pick_kb)
+                       scr_pick_kb, idea_kb)
 from config import (BOT_TOKEN, CHECK_INTERVAL_SEC, DATA_FILE,
                     DEFAULT_REPORT_MIN, DEFAULT_THRESHOLD_PCT)
 from formatting import cur_symbol, esc, fmt_pct, fmt_price
@@ -96,7 +97,9 @@ HELP = (
     "/report N — сводка каждые N минут, 0 — выключить\n"
     "/chart TICKER [1m|5m|15m|30m|1h|4h|1d] — свечной график\n"
     "/book TICKER — стакан, /tape TICKER — лента сделок\n"
-    "/flow on|off — сигналы о роботах (айсберги, спуфинг, перекосы)\n"
+    "/ideas [30] [SBER] — активные идеи и статистика цель/стоп/отмена\n"
+    "/risk 1000 — риск на одну идею в рублях (для расчёта лотов)\n"
+    "/flow on|off — торговые идеи; /flow raw on — диагностические события ленты\n"
     "/stats [7] [TICKER] — точность сигналов за N дней\n"
     "/backtest TICKER — прогнать детекторы по ленте за час\n"
     "/news — статус парсера новостей и последние релевантные\n"
@@ -123,6 +126,9 @@ def _help_text(store: Store, user_id: int) -> str:
         + "\nСигналы ленты/стакана: "
         + ("нет T-Invest токена" if not tinkoff.enabled()
            else "включены" if p.flow_alerts else "выключены")
+        + f"\nТорговые идеи: {'включены' if p.idea_alerts else 'выключены'}"
+        + f" · мин. оценка {p.idea_min_conf}/100 · риск {p.risk_rub:g} ₽"
+        + f"\nСырые события ленты: {'включены' if p.raw_flow_alerts else 'выключены'}"
         + "\nТихие часы: "
         + (f"{p.quiet_from:02d}:00–{p.quiet_to:02d}:00 МСК" if p.quiet_from >= 0 else "нет")
         + "\nАвтоочистка чата: "
@@ -1021,13 +1027,62 @@ async def cmd_flow(m: Message, store: Store) -> None:
     p = store.get(m.from_user.id)
     if not tinkoff.enabled():
         await m.answer(NO_TK); return
-    if args and args[0].lower() in ("on", "off"):
-        p.flow_alerts = args[0].lower() == "on"
+    if len(args) >= 2 and args[0].lower() == "raw" and args[1].lower() in ("on", "off"):
+        p.raw_flow_alerts = args[1].lower() == "on"
+        store.save()
+    elif args and args[0].lower() in ("on", "off"):
+        enabled_ = args[0].lower() == "on"
+        p.flow_alerts = enabled_
+        p.idea_alerts = enabled_
         store.save()
     await m.answer(
-        f"🤖 Сигналы ленты/стакана: <b>{'включены' if p.flow_alerts else 'выключены'}</b>\n"
-        "Айсберги 🧊, ритмичные роботы 🤖, перекосы ⚖️, всплески 🔥, "
-        "плотности 🧱, спуфинг 👻.\nПереключить: /flow on | /flow off")
+        f"💡 Торговые идеи: <b>{'включены' if p.idea_alerts else 'выключены'}</b>\n"
+        f"🧪 Сырые события ленты: <b>{'включены' if p.raw_flow_alerts else 'выключены'}</b>\n\n"
+        "По умолчанию киты, ритм, стены и всплески не шлются отдельно: они лишь контекст идеи.\n"
+        "/flow on|off · /flow raw on|off")
+
+
+@router.message(Command("ideas"))
+async def cmd_ideas(m: Message, idea_journal: IdeaJournal, store: Store) -> None:
+    args = (m.text or "").split()[1:]
+    p = store.get(m.from_user.id)
+    if args and args[0].lower() in ("on", "off"):
+        p.idea_alerts = args[0].lower() == "on"
+        store.save()
+        await m.answer(f"💡 Идеи: {'включены' if p.idea_alerts else 'выключены'}.")
+        return
+    days, ticker = 30, ""
+    for a in args:
+        if a.isdigit():
+            days = max(1, min(int(a), 180))
+        elif TICKER_RE.match(a.upper()):
+            ticker = a.upper()
+    active = [x for x in idea_journal.active(ticker or None)
+              if x.delivery(m.from_user.id)]
+    if active:
+        await m.answer("💡 <b>Активные идеи</b>\n" + "\n".join(
+            f"• {x.ticker} {x.side} · {x.status} · триггер {x.trigger:g}" for x in active))
+    await m.answer(idea_journal.stats(m.from_user.id, days, ticker))
+
+
+@router.message(Command("risk"))
+async def cmd_risk(m: Message, store: Store) -> None:
+    args = (m.text or "").split()[1:]
+    p = store.get(m.from_user.id)
+    if not args:
+        await m.answer(f"Риск на идею: {p.risk_rub:g} ₽.\nЗадать: /risk 1000 · убрать расчёт: /risk 0")
+        return
+    try:
+        value = float(args[0].replace(",", "."))
+    except ValueError:
+        await m.answer("Нужна сумма в рублях, например /risk 1000")
+        return
+    if not 0 <= value <= 10_000_000:
+        await m.answer("Допустимо: 0–10 000 000 ₽.")
+        return
+    p.risk_rub = value
+    store.save()
+    await m.answer(f"💰 Риск на одну идею: <b>{value:g} ₽</b>. В карточке появится расчёт лотов.")
 
 
 @router.message(Command("quiethours"))
@@ -1222,6 +1277,35 @@ async def cb_flow_off(c: CallbackQuery, store: Store) -> None:
     await c.message.answer("🔕 Сигналы ленты/стакана выключены. Включить: /flow on")
 
 
+@router.callback_query(F.data.startswith("idea:"))
+async def cb_idea(c: CallbackQuery, idea_journal: IdeaJournal, store: Store) -> None:
+    _, action, idea_id = c.data.split(":", 2)
+    idea = idea_journal.find(idea_id)
+    delivery = idea.delivery(c.from_user.id) if idea else None
+    if idea is None or delivery is None:
+        await c.answer("Идея не найдена", show_alert=True)
+        return
+    if action in ("take", "skip"):
+        idea_journal.set_decision(idea_id, c.from_user.id,
+                                  "taken" if action == "take" else "skipped")
+        await c.answer("Отмечено: взял" if action == "take" else "Отмечено: пропустил")
+        return
+    if action == "cancel":
+        if idea.status not in ("prepared", "active"):
+            await c.answer("Идея уже закрыта", show_alert=True)
+            return
+        idea.status = "cancelled"
+        idea.closed_ts = datetime.now().timestamp()
+        idea.close_reason = "отменена вручную"
+        idea_journal.save()
+        await c.answer("Идея отменена")
+        try:
+            await c.message.edit_text(card(idea, store.get(c.from_user.id).risk_rub),
+                                      reply_markup=idea_kb(idea.id, idea.ticker, idea.status))
+        except TelegramBadRequest:
+            pass
+
+
 # ------------------------------------------------------------- callbacks
 
 @router.callback_query(F.data == "chart:close")
@@ -1347,6 +1431,8 @@ BOT_COMMANDS = [
     ("calendar", "Календарь: дивиденды, ЦБ, отчётности — /calendar 14"),
     ("event", "Добавить/удалить событие — /event add SBER 2026-11-05 МСФО"),
     ("setup", "Сетап: за/против входа — /setup SBER"),
+    ("ideas", "Торговые идеи и их статистика — /ideas 30"),
+    ("risk", "Риск на идею и расчёт лотов — /risk 1000"),
     ("clusters", "Кластеры объёма — /clusters SBER 1h"),
     ("chart", "Свечной график — /chart SBER 5m"),
     ("book", "Стакан — /book SBER"),
@@ -1387,7 +1473,8 @@ def main_kb(watchlist: list[str]) -> ReplyKeyboardMarkup:
              KeyboardButton(text="🧮 Кластеры")],
             [KeyboardButton(text="📈 График"), KeyboardButton(text="📚 Стакан"),
              KeyboardButton(text="🧾 Лента")],
-            [KeyboardButton(text="🔎 Скринер"), KeyboardButton(text="📊 Статистика"),
+            [KeyboardButton(text="🔎 Скринер"), KeyboardButton(text="💡 Идеи"),
+             KeyboardButton(text="📊 Статистика"),
              KeyboardButton(text="📰 Новости"), KeyboardButton(text="⚙️ Настройки")]]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True,
                                input_field_placeholder="Тикер или команда…")
@@ -1398,7 +1485,7 @@ MENU_MAP = {
     "📋 Список": "list", "🎯 Сетап": "setup", "🧮 Кластеры": "clusters",
     "📈 График": "chart", "📚 Стакан": "book", "🧾 Лента": "tape",
     "📊 Статистика": "stats", "📰 Новости": "news", "⚙️ Настройки": "settings",
-    "🔎 Скринер": "screener",
+    "🔎 Скринер": "screener", "💡 Идеи": "ideas",
 }
 NEEDS_TICKER = {"setup", "clusters", "chart", "book", "tape"}
 
@@ -1448,7 +1535,7 @@ async def _dispatch(m: Message, **kw) -> None:
     handlers = {
         "list": cmd_list, "setup": cmd_setup, "clusters": cmd_clusters, "chart": cmd_chart,
         "book": cmd_book, "tape": cmd_tape, "stats": cmd_stats, "mutes": cmd_mutes, "news": cmd_news,
-        "settings": cmd_settings, "screener": cmd_screener,
+        "settings": cmd_settings, "screener": cmd_screener, "ideas": cmd_ideas,
     }
     cmd = m.text.split()[0].lstrip("/")
     fn = handlers.get(cmd)
@@ -1518,11 +1605,16 @@ def main() -> None:
     tk = tinkoff.TinkoffClient()
     monitor = Monitor(bot, store, tk if tinkoff.enabled() else None)
     journal = Journal(os.path.join(os.path.dirname(DATA_FILE) or ".", "signals.json"))
+    idea_journal = IdeaJournal(os.path.join(os.path.dirname(DATA_FILE) or ".", "ideas.json"))
     cstore = clu.ClusterStore(os.path.join(os.path.dirname(DATA_FILE) or ".", "clusters.json"))
-    flow = FlowMonitor(bot, store, tk, journal, cstore)
+    flow = FlowMonitor(bot, store, tk, journal, cstore, idea_journal)
     newsmon = NewsMonitor(bot, store,
                           os.path.join(os.path.dirname(DATA_FILE) or ".", "news_seen.json"),
                           mode=os.getenv("NEWS_MODE", "stocks"))
+    scr = scrmod.Screener(tk, os.path.dirname(DATA_FILE) or ".")
+    cal = evmod.Calendar(os.path.join(os.path.dirname(DATA_FILE) or ".", "events.json"),
+                         tk if tinkoff.enabled() else None)
+    flow.screener, flow.newsmon, flow.calendar = scr, newsmon, cal
 
     async def amain() -> None:
         session = aiohttp.ClientSession(
@@ -1535,18 +1627,15 @@ def main() -> None:
         health_task = asyncio.create_task(health_check(bot))
         await setup_menu(bot)
         clean_task = asyncio.create_task(cleaner.run_daily(bot, sent, store, moex.now_msk))
-        scr = scrmod.Screener(tk, os.path.dirname(DATA_FILE) or ".")
         scr_task = asyncio.create_task(scr.run(session)) if tinkoff.enabled() else None
         market.set_client(tk if tinkoff.enabled() else None)
-        cal = evmod.Calendar(os.path.join(os.path.dirname(DATA_FILE) or ".", "events.json"),
-                             tk if tinkoff.enabled() else None)
         cal_task = asyncio.create_task(cal.run_reminders(bot, store, esc))
         csq = cscalp.CScalpQueue()
         runner = await csq.start() if (cscalp.enabled() and cscalp.HTTP_MODE) else None
         try:
             await dp.start_polling(bot, store=store, sess=session, tk=tk,
                                    journal=journal, newsmon=newsmon, cstore=cstore, flow=flow,
-                                   csq=csq, sent=sent, scr=scr, cal=cal)
+                                   idea_journal=idea_journal, csq=csq, sent=sent, scr=scr, cal=cal)
         finally:
             cal_task.cancel()
             cstore.save(force=True)
@@ -1558,6 +1647,7 @@ def main() -> None:
                 await runner.cleanup()
             monitor_task.cancel()
             flow_task.cancel()
+            flow.close()
             news_task.cancel()
             health_task.cancel()
             await tk.close()

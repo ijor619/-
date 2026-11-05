@@ -25,8 +25,11 @@ import market
 import moex
 import setup as stp
 import tape
+from marketstream import MarketStream
 from journal import CHECKPOINTS, Entry, Journal, HIT_PCT
-from keyboards import flow_kb
+from ideas import (Delivery, IdeaContext, IdeaEngine, IdeaJournal, card,
+                   update_lifecycle)
+from keyboards import flow_kb, idea_kb
 from formatting import fmt_pct
 from moex import now_msk
 from store import Store
@@ -35,7 +38,7 @@ from clusters import price_endpoints
 
 log = logging.getLogger(__name__)
 
-FLOW_INTERVAL_SEC = 30          # опрос ленты/стакана
+FLOW_INTERVAL_SEC = int(os.getenv("FLOW_INTERVAL_SEC", "5"))  # поток; REST реже, как fallback
 SIGNAL_COOLDOWN_SEC = 30 * 60   # один и тот же сигнал по бумаге — не чаще
 KIND_COOLDOWN_SEC = 10 * 60     # один и тот же ТИП сигнала по бумаге — не чаще
 DIGEST_SEC = 300                # сигналы по бумаге копятся и уходят пачкой
@@ -94,7 +97,7 @@ BREAKOUT_HOLD_SEC = 60 * 60     # максимум/минимум дня дол�
 
 class FlowMonitor:
     def __init__(self, bot: Bot, store: Store, tk: TinkoffClient,
-                 journal: Journal, clusters=None) -> None:
+                 journal: Journal, clusters=None, idea_journal: Optional[IdeaJournal] = None) -> None:
         self.bot, self.store, self.tk, self.journal = bot, store, tk, journal
         self.clusters = clusters
         self._books: Dict[str, tape.BookState] = {}
@@ -123,6 +126,18 @@ class FlowMonitor:
         self._breakout_sent: Dict[tuple[str, float], float] = {}
         self._digest_first: Dict[tuple[int, str], float] = {}   # когда в пачке появился первый сигнал
         self._confirmed: Dict[int, dict] = {}                  # id(sig) -> {"facts": [...], "ctx": {...}}
+        self.idea_journal = idea_journal
+        self.idea_engine = IdeaEngine() if idea_journal is not None else None
+        self.stream = MarketStream()
+        self._rest_trades: Dict[str, list[Trade]] = {}
+        self._rest_trades_ts: Dict[str, float] = {}
+        self._rest_book_ts: Dict[str, float] = {}
+        self.screener = None
+        self.newsmon = None
+        self.calendar = None
+
+    def close(self) -> None:
+        self.stream.stop()
 
     # ------------------------------------------------------------------ run
     async def run(self, sess) -> None:
@@ -240,7 +255,10 @@ class FlowMonitor:
             ok.append(("выше" if direction > 0 else "ниже") + " VWAP")
         if direction and rs == direction:
             ok.append("сильнее рынка" if direction > 0 else "слабее рынка")
-        if near:
+        # A level confirms only from the protective side: support below a
+        # long, resistance above a short. Mere proximity is not directional.
+        if near and ((direction > 0 and price >= near[1]) or
+                     (direction < 0 and price <= near[1])):
             ok.append(f"у уровня {near[0]} {near[1]:.{dec}f}".replace(".", ","))
         ctx = {"vwap": vw or None, "hour": now_msk().hour, "delta15": d15, "rs": rs,
                "near": 1 if near else 0, "conf": len(ok)}
@@ -385,7 +403,10 @@ class FlowMonitor:
 
     # ------------------------------------------------------------------ tick
     async def tick(self, sess) -> None:
-        users = [(u, p) for u, p in self.store.all() if p.flow_alerts and p.watchlist]
+        # Raw microstructure events are diagnostic context, not entries.  They
+        # are opt-in separately; actionable ideas are handled below.
+        users = [(u, p) for u, p in self.store.all()
+                 if p.flow_alerts and p.raw_flow_alerts and p.watchlist]
         # ленту копим для кластеров по всем спискам, даже если сигналы выключены
         tickers = sorted({t for _, p in self.store.all() for t in p.watchlist})
         if not tickers:
@@ -401,10 +422,15 @@ class FlowMonitor:
 
         now = time.time()
         hour = now_msk().hour
-        if not self._main_session():
-            return   # вне окна сигналов: лента уже накоплена для кластеров, уведомлений нет
-        # «второй факт»: считаем подтверждение один раз на бумагу и направление
         im = await self.imoex(sess)
+        if self.idea_journal is not None:
+            try:
+                await self._process_ideas(tickers, im)
+            except Exception:
+                log.exception("ideas: ошибка обработки")
+        if not self._main_session():
+            return   # новых идей/сырых push нет, но старые идеи сопровождаются
+        # «второй факт»: считаем подтверждение один раз на бумагу и направление
         for t, sigs in signals.items():
             if not sigs:
                 continue
@@ -418,11 +444,11 @@ class FlowMonitor:
                 if d not in cache:
                     cache[d] = self.facts(t, d, price, ds, im, dec)
                 ok, ctx = cache[d]
-                if sig.kind == "breakout":           # пробой — сам по себе факт у уровня
+                if sig.kind == "breakout":
                     ok = [x for x in ok if not x.startswith("у уровня")]
-                    ctx = dict(ctx, conf=len(ok) + 1)
+                    ctx = dict(ctx, conf=len(ok))
                 self._confirmed[id(sig)] = {"facts": ok, "ctx": ctx,
-                                            "ok": sig.kind == "breakout" or (d != 0 and len(ok) >= CONFIRM_MIN)}
+                                            "ok": d != 0 and len(ok) >= CONFIRM_MIN}
 
         for uid, prof in users:
             if prof.is_quiet(hour):
@@ -466,6 +492,181 @@ class FlowMonitor:
 
         if len(self._sent) > 5000:
             self._sent = {k: v for k, v in self._sent.items() if now - v < 3600}
+
+    # ---------------------------------------------------------- trade ideas
+    def _book_metrics(self, t: str) -> tuple[Optional[float], Optional[float], Optional[float]]:
+        """(spread %, distance-weighted queue imbalance, microprice edge %)."""
+        ob = self._last_book.get(t)
+        if not ob or not ob.bids or not ob.asks:
+            return None, None, None
+        bid, ask = ob.bids[0], ob.asks[0]
+        mid = (bid.price + ask.price) / 2
+        if mid <= 0 or ask.price <= bid.price:
+            return None, None, None
+        spread = (ask.price - bid.price) / mid * 100
+        bq = sum(x.qty / (i + 1) for i, x in enumerate(ob.bids[:10]))
+        aq = sum(x.qty / (i + 1) for i, x in enumerate(ob.asks[:10]))
+        qi = (bq - aq) / (bq + aq) if bq + aq else 0.0
+        micro = (ask.price * bid.qty + bid.price * ask.qty) / (bid.qty + ask.qty) \
+            if bid.qty + ask.qty else mid
+        return spread, qi, (micro / mid - 1) * 100
+
+    def _buy_pct(self, t: str, minutes: int) -> Optional[float]:
+        if self.clusters is None:
+            return None
+        cells = self.clusters.window(t, minutes)
+        b, s = sum(x.buy for x in cells), sum(x.sell for x in cells)
+        return b / (b + s) * 100 if b + s else None
+
+    def _technical_context(self, t: str) -> tuple[Optional[float], Optional[float]]:
+        """RSI14 and EMA9-vs-EMA21; context only, never an entry trigger."""
+        if self.clusters is None:
+            return None, None
+        cells = self.clusters.window(t, 90)
+        by_min: dict[datetime, list[float]] = {}
+        for x in cells:
+            v = x.buy + x.sell
+            row = by_min.setdefault(x.minute, [0.0, 0.0])
+            row[0] += x.price * v
+            row[1] += v
+        prices = [pv / v for _, (pv, v) in sorted(by_min.items()) if v]
+        if len(prices) < 15:
+            return None, None
+        diffs = [b - a for a, b in zip(prices[-15:], prices[-14:])]
+        gain = sum(max(0.0, x) for x in diffs) / 14
+        loss = sum(max(0.0, -x) for x in diffs) / 14
+        rsi = 100.0 if loss == 0 else 100 - 100 / (1 + gain / loss)
+        def ema(period: int) -> float:
+            a = 2 / (period + 1)
+            value = prices[0]
+            for p in prices[1:]:
+                value += a * (p - value)
+            return value
+        e9, e21 = ema(9), ema(21)
+        edge = (e9 / e21 - 1) * 100 if e21 else None
+        return rsi, edge
+
+    def _idea_context(self, t: str, im: dict) -> Optional[IdeaContext]:
+        price = self._last_price.get(t, 0.0)
+        if price <= 0 or time.time() - self._last_price_ts.get(t, 0) > 90:
+            return None
+        inst = self.tk._instr.get(t)
+        info = self._infos.get(t)
+        ds = self._day.get(t)
+        levels: list[tuple[str, float]] = []
+        if ds:
+            levels.extend(self.key_levels(t, ds))
+        for lv in self.levels(t, price, info.decimals if info else 2):
+            levels.append(("POC" if lv.kind == "poc" else "объёмный уровень", lv.price))
+        # Deduplicate nearly identical structural references.
+        uniq: list[tuple[str, float]] = []
+        for name, level in sorted(levels, key=lambda x: abs(x[1] - price)):
+            if level > 0 and not any(abs(level - p) / p < 0.0003 for _, p in uniq):
+                uniq.append((name, level))
+        spread, qi, micro = self._book_metrics(t)
+        tech_rsi, ema_edge = self._technical_context(t)
+        sc = self.screener.idea_context(t) if self.screener is not None else {}
+        va = None
+        if self.clusters is not None:
+            hist = self.clusters.window(t, stp.LEVEL_LOOKBACK_MIN)
+            if hist:
+                end = hist[-1].minute
+                now5 = [x for x in hist if x.minute >= end - timedelta(minutes=4)]
+                x = stp.volume_anomaly(now5, hist, 5)
+                va = x[0] if x else None
+        return IdeaContext(
+            ticker=t, price=price, prev_price=self._prev_price.get(t, 0.0),
+            decimals=info.decimals if info else 2, lot=inst.lot if inst else 1,
+            vwap=ds.vwap if ds else 0.0, levels=uniq[:10],
+            ch5=self.price_change(t, 5), ch15=self.price_change(t, 15),
+            ch60=self.price_change(t, 60), market15=im.get("15m"),
+            buy_pct5=self._buy_pct(t, 5), buy_pct15=self._buy_pct(t, 15),
+            volume_mult=va, spread_pct=spread, book_imbalance=qi,
+            microprice_edge_pct=micro, breadth=sc.get("breadth"),
+            sector_edge=sc.get("sector_edge"), rsi14=tech_rsi,
+            ema_edge_pct=ema_edge, fresh=True,
+            event_risk=self.calendar.risk_for(t) if self.calendar is not None else "",
+            news_risk=self.newsmon.risk_for(t) if self.newsmon is not None else "")
+
+    async def _idea_update_messages(self, idea, transition: str) -> None:
+        """Edit the card and send a short, explicit state-change notification."""
+        for delivery in list(idea.deliveries):
+            prof = self.store.get(delivery.uid)
+            try:
+                await self.bot.edit_message_text(
+                    card(idea, prof.risk_rub), chat_id=delivery.chat_id,
+                    message_id=delivery.msg_id,
+                    reply_markup=idea_kb(idea.id, idea.ticker, idea.status))
+            except TelegramBadRequest as e:
+                if "not modified" not in str(e):
+                    log.debug("ideas: edit %s: %s", idea.id, e)
+            except Exception as e:
+                log.debug("ideas: edit %s: %s", idea.id, e)
+            note = {
+                "active": f"🚀 <b>{idea.ticker} {idea.side}</b>: триггер достигнут, идея активна.",
+                "target": f"✅ <b>{idea.ticker} {idea.side}</b>: идея отработана в плюс, цель 1 достигнута ({idea.realized_r:+.2f}R).",
+                "stop": f"🛑 <b>{idea.ticker} {idea.side}</b>: идея выбита по стопу (−1R).",
+                "cancelled": f"↩️ <b>{idea.ticker} {idea.side}</b>: идея отменилась до входа — {idea.close_reason}.",
+                "expired": f"⌛ <b>{idea.ticker} {idea.side}</b>: время идеи истекло — {idea.close_reason}.",
+            }.get(transition)
+            if note and prof.idea_alerts:
+                try:
+                    await self.bot.send_message(delivery.chat_id, note,
+                                                reply_markup=idea_kb(idea.id, idea.ticker, idea.status))
+                except Exception:
+                    log.exception("ideas: не отправлен переход %s", transition)
+
+    async def _process_ideas(self, tickers: list[str], im: dict) -> None:
+        if self.idea_journal is None or self.idea_engine is None:
+            return
+        contexts = {t: self._idea_context(t, im) for t in tickers}
+        dirty = False
+        # Life cycle first: an existing prepared idea is never duplicated.
+        for idea in list(self.idea_journal.active()):
+            ctx = contexts.get(idea.ticker)
+            if ctx is None:
+                continue  # stale/no price: never invent an outcome
+            transition = update_lifecycle(idea, ctx.price)
+            if transition:
+                dirty = True
+                await self._idea_update_messages(idea, transition)
+        if not self._main_session():
+            if dirty:
+                self.idea_journal.save()
+            return
+        try:
+            positions = await self.tk.portfolio_day_quotes()
+        except Exception:
+            positions = {}
+        for t, ctx in contexts.items():
+            if ctx is None:
+                continue
+            for idea in self.idea_engine.candidates(ctx):
+                if t in positions:
+                    idea.cautions.append("уже есть открытая позиция: проверь суммарный риск")
+                if self.idea_journal.has_active(t, idea.direction):
+                    continue
+                recipients = [(uid, p) for uid, p in self.store.all()
+                              if p.idea_alerts and t in p.watchlist
+                              and not p.is_quiet(now_msk().hour)
+                              and idea.confidence >= p.idea_min_conf]
+                if not recipients:
+                    continue
+                self.idea_journal.ideas.append(idea)
+                for uid, prof in recipients:
+                    try:
+                        msg = await self.bot.send_message(
+                            uid, card(idea, prof.risk_rub),
+                            reply_markup=idea_kb(idea.id, idea.ticker, idea.status))
+                        idea.deliveries.append(Delivery(uid, msg.chat.id, msg.message_id))
+                    except Exception:
+                        log.exception("ideas: не отправлена %s %s", t, uid)
+                if idea.deliveries:
+                    dirty = True
+                else:
+                    self.idea_journal.ideas.remove(idea)
+        if dirty:
+            self.idea_journal.save()
 
     async def _send_signals(self, sess, uid: int, t: str,
                             sigs: list[tape.Signal]) -> bool:
@@ -526,12 +727,40 @@ class FlowMonitor:
             return []
         if inst is None:
             return []
+        self.stream.ensure(t, inst.uid)
         info = await self._info(sess, t)
         dec = info.decimals if info else 2
-        trades, ob = await asyncio.gather(
-            self.tk.last_trades(inst, minutes=10),
-            self.tk.order_book(inst, depth=20),
-            return_exceptions=True)
+        stream_trades, stream_book = self.stream.snapshot(t, minutes=10)
+        now = time.time()
+        need_trades = (not self._rest_trades.get(t) or
+                       now - self._rest_trades_ts.get(t, 0) >= (300 if stream_trades else 30))
+        need_book = stream_book is None and now - self._rest_book_ts.get(t, 0) >= 15
+        calls = []
+        if need_trades:
+            calls.append(self.tk.last_trades(inst, minutes=10))
+        if need_book:
+            calls.append(self.tk.order_book(inst, depth=20))
+        replies = await asyncio.gather(*calls, return_exceptions=True) if calls else []
+        ri = 0
+        rest_trades = None
+        rest_book = None
+        if need_trades:
+            rest_trades = replies[ri]; ri += 1
+            if isinstance(rest_trades, list):
+                self._rest_trades[t] = rest_trades
+                self._rest_trades_ts[t] = now
+        if need_book:
+            rest_book = replies[ri]; ri += 1
+            if isinstance(rest_book, OrderBook):
+                self._rest_book_ts[t] = now
+        cached = self._rest_trades.get(t, [])
+        if stream_trades:
+            first_stream = stream_trades[0].ts
+            trades = [x for x in cached if x.ts < first_stream] + stream_trades
+            self._rest_trades[t] = trades
+        else:
+            trades = rest_trades if isinstance(rest_trades, (list, BaseException)) else cached
+        ob = stream_book or (rest_book if isinstance(rest_book, (OrderBook, BaseException)) else self._last_book.get(t))
         out: list[tape.Signal] = []
         if isinstance(trades, list) and trades:
             trades.sort(key=lambda tr: tr.ts)
@@ -539,7 +768,7 @@ class FlowMonitor:
             self._observed_until[t] = observed
             history = self._prices.setdefault(t, {})
             history.update((tr.ts.timestamp(), tr.price) for tr in trades)
-            self._prices[t] = {ts: p for ts, p in history.items() if observed - ts <= 25 * 60}
+            self._prices[t] = {ts: p for ts, p in history.items() if observed - ts <= 70 * 60}
             self._prev_price[t] = self._last_price.get(t, 0.0)
             self._last_price[t] = trades[-1].price
             self._last_price_ts[t] = trades[-1].ts.timestamp()

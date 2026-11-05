@@ -378,13 +378,15 @@ def build_setup(ticker: str, price: float, prev_close: float, day_high: float,
         if wa:
             F.append(Factor(-1, 1, f"плотность в аске {fmt_price(wa[0].price, decimals)} ({clu.fmt_n(wa[0].qty)} лот) — потолок над ценой"))
 
-    # --- свежие сигналы
+    # --- свежие микроструктурные события: только контекст. Они
+    # уже проявляются в дельте/стакане, поэтому повторный вес был
+    # двойным учётом одного и того же потока.
     for kind, direction, age in signals:
         if age > 30 or not direction:
             continue
         from journal import KIND_EMOJI, KIND_NAME
-        F.append(Factor(direction, 1, f"{KIND_EMOJI.get(kind, '')} {KIND_NAME.get(kind, kind)} "
-                                      f"{age:.0f} мин назад, в сторону {'роста' if direction > 0 else 'падения'}"))
+        F.append(Factor(0, 0, f"{KIND_EMOJI.get(kind, '')} {KIND_NAME.get(kind, kind)} "
+                              f"{age:.0f} мин назад (контекст, без балла)"))
 
     # --- относительная сила
     for rs in (rs15, rs_day):
@@ -405,9 +407,29 @@ def build_setup(ticker: str, price: float, prev_close: float, day_high: float,
     # --- время дня
     phase = session_phase(now)
 
-    long_s = sum(f.weight for f in F if f.sign > 0)
-    short_s = sum(f.weight for f in F if f.sign < 0)
-    total = sum(f.weight for f in F if f.sign != 0)
+    # Correlated observations get one vote per factor family.  In particular,
+    # 15m/1h delta, order-book ratio/walls and two RS windows no longer inflate
+    # the score merely because the same phenomenon is represented twice.
+    def family(text: str) -> str:
+        if text.startswith(("15 мин", "1 час")):
+            return "flow"
+        if text.startswith("стакан") or "плотность в" in text:
+            return "book"
+        if "IMOEX" in text:
+            return "relative"
+        if "VWAP" in text:
+            return "trend"
+        if "уровн" in text:
+            return "structure"
+        return text
+    def grouped(sign: int) -> int:
+        best: dict[str, int] = {}
+        for f in F:
+            if f.sign == sign:
+                best[family(f.text)] = max(best.get(family(f.text), 0), f.weight)
+        return sum(best.values())
+    long_s, short_s = grouped(1), grouped(-1)
+    total = long_s + short_s
     if total == 0:
         verdict = "нет направленных факторов — ждать"
     elif long_s >= short_s * 2 and long_s >= 4:

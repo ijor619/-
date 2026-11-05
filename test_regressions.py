@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, patch
 import clusters
 import flow
 import journal
+import ideas
 import keyboards
 import moex
 import tape
@@ -50,12 +51,16 @@ class DirectionTests(TempCase):
             self.assertEqual(flow._direction(sig), -1)
         self.assertEqual(flow._direction(tape.Signal("wall", "X", "покупки", "k")), 0)
 
-    def test_sell_iceberg_rhythm_and_imbalance(self):
+    def test_sell_flow_without_price_response_is_absorbed_by_buyer(self):
         trades = [self.trade(seconds=-120 + i * 2, side="S") for i in range(60)]
         sigs = tape.analyze_trades("X", trades, 1, 2)
         selected = [s for s in sigs if s.kind in ("iceberg", "rhythm", "imbalance")]
         self.assertEqual({s.kind for s in selected}, {"iceberg", "rhythm", "imbalance"})
-        self.assertTrue(all(s.direction == -1 for s in selected))
+        by_kind = {s.kind: s for s in selected}
+        self.assertEqual(by_kind["iceberg"].direction, -1)
+        self.assertEqual(by_kind["rhythm"].direction, -1)
+        self.assertEqual(by_kind["imbalance"].direction, 1)
+        self.assertIn("поглощается", by_kind["imbalance"].text)
 
     def test_bid_and_ask_walls(self):
         levels = [tinkoff.Level(100 + i, 2000 if i == 0 else 10) for i in range(10)]
@@ -535,6 +540,49 @@ class FlowSourceTests(unittest.IsolatedAsyncioTestCase):
             stats = await mon._daystats(None, "X")
         self.assertEqual((stats.high, stats.low, stats.vwap), (102, 99, 100))
         tk.candles.assert_not_awaited()
+
+
+class IdeaTests(TempCase):
+    def sample(self, direction=1):
+        now = time.time()
+        return ideas.Idea(
+            "abc", "SBER", direction, "pullback", now, now, now + 1000,
+            "prepared", 100.0, 99.9, 100.1, 99.0 if direction > 0 else 101.0,
+            101.5 if direction > 0 else 98.5, 102.5 if direction > 0 else 97.5,
+            75, ["тренд", "поток"], lot=10)
+
+    def test_pre_entry_invalidation_is_cancel_not_stop(self):
+        x = self.sample()
+        event = ideas.update_lifecycle(x, 98.9, now=1100)
+        self.assertEqual(event, "cancelled")
+        self.assertEqual(x.status, "cancelled")
+        self.assertFalse(x.trigger_ts)
+
+    def test_trigger_then_target_records_r_and_excursions(self):
+        x = self.sample()
+        self.assertEqual(ideas.update_lifecycle(x, 100.1, now=1100), "active")
+        self.assertIsNone(ideas.update_lifecycle(x, 100.8, now=1200))
+        self.assertEqual(ideas.update_lifecycle(x, 101.6, now=1300), "target")
+        self.assertEqual(x.status, "target")
+        self.assertAlmostEqual(x.realized_r, 1.5)
+        self.assertGreater(x.mfe_pct, 0)
+
+    def test_risk_size_includes_lot_and_costs(self):
+        x = self.sample()
+        lots, risk = ideas.position_size(x, 1000, costs_bps=10)
+        self.assertGreater(lots, 0)
+        self.assertLessEqual(risk, 1000)
+        self.assertLess((lots + 1) * ((100 - 99) + .1) * 10, 1101)
+
+    def test_journal_roundtrip_and_stats_are_unique_market_ideas(self):
+        path = str(self.path / "ideas.json")
+        j = ideas.IdeaJournal(path)
+        x = self.sample()
+        x.deliveries = [ideas.Delivery(1, 1, 10), ideas.Delivery(2, 2, 20)]
+        j.add(x)
+        loaded = ideas.IdeaJournal(path)
+        self.assertEqual(len(loaded.ideas), 1)
+        self.assertIn("всего: <b>1</b>", loaded.stats(1).lower())
 
 
 if __name__ == "__main__":
