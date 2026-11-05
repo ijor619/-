@@ -17,6 +17,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from uuid import uuid4
 
 from formatting import esc, fmt_pct, fmt_price
 from tinkoff import Level, OrderBook, Trade
@@ -34,6 +35,11 @@ class Signal:
     ticker: str
     text: str       # HTML
     key: str        # для антидубля (kind + детали)
+    direction: int = 0  # задаётся детектором, никогда не извлекается из текста
+    event_id: str = field(default_factory=lambda: uuid4().hex)
+    detected_at: float = 0.0
+    price: float = 0.0
+    price_ts: float = 0.0
 
 
 # ------------------------------------------------------------- параметры
@@ -156,7 +162,7 @@ def analyze_trades(ticker: str, trades: list[Trade], lot: int,
                 f"{len(g)} сделок × {qty} лот. по {fmt_price(price, decimals)} "
                 f"за {int(span)} c, {'покупка' if side == 'B' else 'продажа'}\n"
                 f"Итого {fmt_n(qty * len(g) * lot)} шт.",
-                f"iceberg:{price}:{qty}:{side}"))
+                f"iceberg:{price}:{qty}:{side}", direction=1 if side == "B" else -1))
 
     # --- ритм: постоянный интервал между сделками одной стороны -----------
     for side in ("B", "S"):
@@ -176,7 +182,7 @@ def analyze_trades(ticker: str, trades: list[Trade], lot: int,
                         f"{len(ss)} сделок с шагом ≈{mean:.1f} c "
                         f"(разброс {cv * 100:.0f}%), типичный объём {qtys[0]} лот.\n"
                         f"Характерно для TWAP/VWAP-робота",
-                        f"rhythm:{side}:{round(mean)}"))
+                        f"rhythm:{side}:{round(mean)}", direction=1 if side == "B" else -1))
 
     # --- дисбаланс -----------------------------------------------------
     win = [t for t in trades if now - t.ts <= timedelta(minutes=5)]
@@ -196,7 +202,7 @@ def analyze_trades(ticker: str, trades: list[Trade], lot: int,
                     f"Цена при этом {fmt_pct(move)} → кто-то "
                     f"{'набирает' if vb > vs else 'раздаёт'} позицию, не двигая рынок\n"
                     f"Объём: {fmt_n(tot * lot)} шт. в {len(win)} сделках",
-                    f"imbalance:{side}"))
+                    f"imbalance:{side}", direction=1 if vb > vs else -1))
 
     # --- всплеск -----------------------------------------------------
     per_min: dict[datetime, int] = defaultdict(int)
@@ -246,7 +252,7 @@ def _wall(levels: list[Level], side: str, ticker: str, decimals: int,
             f"({'бид, поддержка' if side == 'B' else 'аск, сопротивление'})\n"
             f"{fmt_price(top.price, decimals)}: {fmt_n(top.qty * lot)} шт. "
             f"(≈{top.qty / med:.0f}× медианы уровня), {idx + 1}-й уровень",
-            f"wall:{side}:{top.price}")
+            f"wall:{side}:{top.price}", direction=1 if side == "B" else -1)
     return None
 
 
@@ -288,7 +294,7 @@ def analyze_book(ticker: str, ob: OrderBook, st: BookState, lot: int,
                 f"Плотность {fmt_n(qty * lot)} шт. по {fmt_price(price, decimals)} "
                 f"({'бид' if side == 'B' else 'аск'}) простояла {int(life)} c и "
                 f"исполнена — уровень {'пробит вниз' if side == 'B' else 'пробит вверх'}",
-                f"eaten:{side}:{price}"))
+                f"eaten:{side}:{price}", direction=-1 if side == "B" else 1))
         elif life <= SPOOF_MAX_LIFE_SEC and not touched:
             out.append(Signal(
                 "spoof", ticker,
@@ -296,7 +302,7 @@ def analyze_book(ticker: str, ob: OrderBook, st: BookState, lot: int,
                 f"Заявка {'на покупку' if side == 'B' else 'на продажу'} "
                 f"{fmt_n(qty * lot)} шт. по {fmt_price(price, decimals)} "
                 f"снята через {int(life)} c, цена до неё не дошла",
-                f"spoof:{side}:{price}:{int(first)}"))
+                f"spoof:{side}:{price}:{int(first)}", direction=-1 if side == "B" else 1))
     st.last = ob
     return out
 
@@ -317,7 +323,7 @@ def context_text(price: float, prev_close: float, day_high: float,
         parts.append(where)
         parts.append(f"H {fmt_price(day_high, decimals)} / L {fmt_price(day_low, decimals)}")
     if vwap:
-        parts.append(f"VWAP {fmt_price(vwap, decimals)} "
+        parts.append(f"≈VWAP {fmt_price(vwap, decimals)} "
                      f"({'выше' if price >= vwap else 'ниже'})")
     line = "📍 " + " · ".join(parts) if parts else ""
     if ob and ob.bids and ob.asks:
@@ -429,7 +435,8 @@ def whale_signals(ticker: str, trades: list[Trade], lot: int, decimals: int,
             f"🐋 <b>{ticker}</b> · кит · <b>{'покупка' if t.side == 'B' else 'продажа'}</b>\n"
             f"{t.ts.astimezone(msk):%H:%M:%S} МСК · <b>{fmt_n(t.qty * lot)} шт.</b> ({fmt_n(t.qty)} лот) "
             f"по <b>{fmt_price(t.price, decimals)}</b> ≈ <b>{fmt_rub(rub)}</b>\n\n{rel}.{ctx}",
-            f"whale:{t.ts.isoformat()}:{t.price}:{t.qty}"))
+            f"whale:{t.ts.isoformat()}:{t.price}:{t.qty}:{t.side}",
+            direction=1 if t.side == "B" else -1))
 
     # серия: N+ крупных сделок одной стороны за WHALE_SERIES_SEC
     big = [t for t in trades if t.qty * t.price * lot >= series_th
@@ -470,5 +477,5 @@ def whale_signals(ticker: str, trades: list[Trade], lot: int, decimals: int,
             f"<pre>{rows}</pre>"
             f"Цена за серию {fmt_price(p0, decimals)} → {fmt_price(p1, decimals)} ({fmt_pct(chg)}) — {verdict}. "
             f"Это {share:.0f}% всего объёма за 15 мин.",
-            f"whale_series:{side}:{best[0].ts.strftime('%H:%M')}"))
+            f"whale_series:{side}:{best[0].ts.isoformat()}", direction=1 if side == "B" else -1))
     return out

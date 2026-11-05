@@ -176,6 +176,13 @@ class TCandle:
     complete: bool
 
 
+@dataclass(frozen=True)
+class DayReference:
+    price: float
+    cutoff: datetime  # 04:00 МСК — начало расчётного дня
+    candle_time: datetime  # начало последней полной минуты ДО cutoff, UTC
+
+
 INTERVALS = {1: "CANDLE_INTERVAL_1_MIN", 5: "CANDLE_INTERVAL_5_MIN",
              15: "CANDLE_INTERVAL_15_MIN", 30: "CANDLE_INTERVAL_30_MIN",
              60: "CANDLE_INTERVAL_HOUR", 240: "CANDLE_INTERVAL_4_HOUR",
@@ -191,6 +198,9 @@ class TinkoffClient:
     def __init__(self) -> None:
         self._sess: Optional[aiohttp.ClientSession] = None
         self._instr: dict[str, Optional[Instrument]] = {}
+        self._day_refs: dict[str, DayReference] = {}
+        self._ref_locks: dict[str, asyncio.Lock] = {}
+        self._ref_sem = asyncio.Semaphore(4)
 
     async def _session(self) -> aiohttp.ClientSession:
         if self._sess is None or self._sess.closed:
@@ -254,7 +264,10 @@ class TinkoffClient:
         asks = [Level(q2f(x["price"]), int(x["quantity"])) for x in d.get("asks", [])]
         if not bids and not asks:
             return None
-        return OrderBook(datetime.now(timezone.utc), bids, asks, q2f(d.get("lastPrice")))
+        if not d.get("orderbookTs"):
+            return None
+        ts = datetime.fromisoformat(d["orderbookTs"].replace("Z", "+00:00"))
+        return OrderBook(ts, bids, asks, q2f(d.get("lastPrice")))
 
     async def candles(self, inst: Instrument, minutes: int,
                       depth: timedelta) -> list[TCandle]:
@@ -273,7 +286,7 @@ class TinkoffClient:
             "instrumentId": inst.uid, "interval": interval,
             "from": a.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "to": b.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "candleSourceType": "CANDLE_SOURCE_UNSPECIFIED", "limit": 2400,
+            "candleSourceType": "CANDLE_SOURCE_EXCHANGE", "limit": 2400,
         }) for a, b in windows), return_exceptions=True)
         seen: dict[str, TCandle] = {}
         for r in results:
@@ -294,15 +307,55 @@ class TinkoffClient:
         if not insts:
             return {}
         d = await self._call("MarketDataService/GetLastPrices",
-                             {"instrumentId": [i.uid for i in insts]})
+                             {"instrumentId": [i.uid for i in insts],
+                              "lastPriceType": "LAST_PRICE_EXCHANGE"})
         by_uid = {i.uid: i.ticker for i in insts}
         out = {}
         for p in d.get("lastPrices", []):
             t = by_uid.get(p.get("instrumentUid"))
-            if t and p.get("price"):
+            if t and p.get("price") and p.get("time") and q2f(p["price"]) > 0:
                 ts = datetime.fromisoformat(p["time"].replace("Z", "+00:00"))
-                out[t] = (q2f(p["price"]), ts)
+                if t not in out or ts > out[t][1]:
+                    out[t] = (q2f(p["price"]), ts)
         return out
+
+    async def daily_reference(self, inst: Instrument,
+                              now: Optional[datetime] = None) -> Optional[DayReference]:
+        """Последняя биржевая цена до 04:00 МСК, восстановленная по свечам.
+
+        Это сравнение котировок, а не доходность позиции из GetPortfolio.
+        Последнюю минуту до границы включаем; минуту после неё — никогда.
+        """
+        local = (now or datetime.now(timezone.utc)).astimezone(_MSK)
+        cutoff = local.replace(hour=4, minute=0, second=0, microsecond=0)
+        if local < cutoff:
+            cutoff -= timedelta(days=1)
+        async with self._ref_locks.setdefault(inst.uid, asyncio.Lock()):
+            cached = self._day_refs.get(inst.uid)
+            if cached and cached.cutoff == cutoff:
+                return cached
+            async with self._ref_sem:
+                end = cutoff.astimezone(timezone.utc)
+                # Праздники: движемся назад целыми днями, не берём сегодняшние свечи.
+                for _ in range(10):
+                    start = end - timedelta(days=1)
+                    d = await self._call("MarketDataService/GetCandles", {
+                        "instrumentId": inst.uid, "interval": "CANDLE_INTERVAL_1_MIN",
+                        "from": start.isoformat(), "to": end.isoformat(),
+                        "candleSourceType": "CANDLE_SOURCE_EXCHANGE", "limit": 2400})
+                    points = []
+                    for c in d.get("candles", []):
+                        ts = datetime.fromisoformat(c["time"].replace("Z", "+00:00"))
+                        price = q2f(c.get("close"))
+                        if start <= ts and ts + timedelta(minutes=1) <= end and c.get("isComplete") and price > 0:
+                            points.append((ts, price))
+                    if points:
+                        ts, price = max(points)
+                        ref = DayReference(price, cutoff, ts)
+                        self._day_refs[inst.uid] = ref
+                        return ref
+                    end = start
+            return None
 
     async def last_trades(self, inst: Instrument, minutes: int = 10) -> list[Trade]:
         now = datetime.now(timezone.utc)
@@ -314,7 +367,9 @@ class TinkoffClient:
         out = []
         for x in d.get("trades", []):
             ts = datetime.fromisoformat(x["time"].replace("Z", "+00:00"))
-            side = "B" if x.get("direction") == "TRADE_DIRECTION_BUY" else "S"
-            out.append(Trade(ts, q2f(x["price"]), int(x.get("quantity") or 0), side))
+            side = {"TRADE_DIRECTION_BUY": "B", "TRADE_DIRECTION_SELL": "S"}.get(x.get("direction"))
+            price, qty = q2f(x["price"]), int(x.get("quantity") or 0)
+            if side and price > 0 and qty > 0:
+                out.append(Trade(ts, price, qty, side))
         out.sort(key=lambda t: t.ts)
         return out

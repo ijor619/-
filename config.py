@@ -28,7 +28,7 @@ MOEX_BOARDS: tuple[str, ...] = ("TQBR", "TQDR", "SPEQ")
 
 # --- Мониторинг ---
 # Как часто (сек) опрашивать цены
-CHECK_INTERVAL_SEC: int = int(os.getenv("CHECK_INTERVAL_SEC", "60"))
+CHECK_INTERVAL_SEC: int = int(os.getenv("CHECK_INTERVAL_SEC", "30"))
 # Данные старше N минут считаем «рынок закрыт / нет торгов»
 FRESHNESS_MIN: int = 10
 # Кэш справочника ценных бумаг (сек)

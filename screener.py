@@ -95,18 +95,18 @@ class Sec:
         """Цена «ago_sec назад»: последний сэмпл не позже целевого момента.
         Если история не дотягивается (после рестарта / ночной разрыв) — None."""
         target = time.time() - ago_sec
-        best = None
+        best, best_ts = None, 0.0
         for ts, p in self.hist:
             if ts <= target:
-                best = p
+                best, best_ts = p, ts
             else:
                 break
-        if best is None:
+        if best is None or target - best_ts > 5 * 60:
             return None
         return best
 
     def change(self, win: str) -> Optional[float]:
-        if not self.last:
+        if not self.last or not 0 <= time.time() - self.last_ts <= 90:
             return None
         if win == "1d":
             if self.prev_close <= 0:
@@ -243,12 +243,15 @@ class Screener:
                     return
             pts = []
             for c in candles:
+                if not c.complete:
+                    continue
                 # закрытие свечи относим к её концу
                 ts = (c.begin.replace(tzinfo=_MSK) + timedelta(minutes=5)).timestamp()
-                pts.append((min(ts, time.time()), c.close))
+                if ts <= time.time():
+                    pts.append((ts, c.close))
             existing = list(s.hist)
             s.hist.clear()
-            for p in sorted(pts + existing):
+            for p in sorted(dict(pts + existing).items()):
                 s.hist.append(p)
         await asyncio.gather(*(one(s) for s in secs))
         self._warm = True
@@ -260,18 +263,17 @@ class Screener:
         now = time.time()
         for i in range(0, len(secs), 100):
             chunk = secs[i:i + 100]
-            d = await self.tk._call("MarketDataService/GetLastPrices",
-                                    {"instrumentId": [s.uid for s in chunk]})
-            by_uid = {s.uid: s for s in chunk}
-            for p in d.get("lastPrices", []):
-                s = by_uid.get(p.get("instrumentUid"))
-                if not s or not p.get("price"):
-                    continue
-                price = q2f(p["price"])
-                if price <= 0:
-                    continue
-                s.last, s.last_ts = price, now
-                s.hist.append((now, price))
+            prices = await self.tk.last_prices([Instrument(s.ticker, s.uid, "", s.lot, s.name) for s in chunk])
+            for s in chunk:
+                if s.ticker in prices:
+                    price, dt = prices[s.ticker]
+                    ts = dt.timestamp()
+                    if ts >= s.last_ts and ts <= now:
+                        s.last, s.last_ts = price, ts
+                        hist = dict(s.hist)
+                        hist[ts] = price
+                        s.hist.clear()
+                        s.hist.extend(sorted(hist.items()))
         self.updated = now_msk()
 
     # ------------------------------------------------------------ объём
@@ -375,6 +377,8 @@ def format_screener(scr: Screener, win: str, esc, only: Optional[set] = None) ->
     title = WINDOW_TITLES.get(win, win)
     head = (f"🔎 <b>Скринер MOEX — {esc(title)}</b>\n" if win == VOL_WIN
             else f"🔎 <b>Скринер MOEX — изменение за {esc(title)}</b>\n")
+    if win == "1d":
+        head += "<i>База скринера: официальное закрытие MOEX; это другой период, чем «до 04:00» в списке и алертах.</i>\n"
     if only is not None:
         head += "<i>только мои бумаги</i>\n"
     if not scr.secs:
@@ -485,7 +489,9 @@ def render_png(scr: "Screener", win: str, only: Optional[set] = None) -> bytes:
             y -= row_h
         y -= 0.3
 
-    foot = f"{len(scr.secs)} бумаг, оборот ≥ {MIN_TURNOVER / 1e6:.0f} млн ₽ · T-Invest realtime"
+    foot = f"{len(scr.secs)} бумаг · T-Invest, биржа · свежесть до 90 с"
+    if win == "1d":
+        foot = "База: официальное закрытие MOEX · " + foot
     if vol:
         foot = f"оборот за 15 мин к обычному для этого часа (порог ×{VOL_MIN_RATIO:g}) · " + foot
     if not trading_time():

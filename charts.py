@@ -273,8 +273,8 @@ def render(info: SecurityInfo, p: Period, cs: list[Candle],
         for s in ("top", "right"):
             a.spines[s].set_visible(False)
         a.set_facecolor("white")
-    src = "T-Invest · реальное время" if ov.realtime else "MOEX ISS · задержка 15 мин"
-    fig.text(0.99, 0.01, f"{src} · {now_msk():%d.%m %H:%M} МСК",
+    src = "T-Invest · биржевые свечи" if ov.realtime else "MOEX ISS · задержка 15 мин"
+    fig.text(0.99, 0.01, f"{src} · последняя свеча с {cs[-1].begin:%d.%m %H:%M} МСК",
              ha="right", fontsize=7, color="#9ca3af")
     fig.subplots_adjust(left=0.09, right=0.97, top=0.92, bottom=0.09)
 

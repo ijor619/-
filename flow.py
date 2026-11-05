@@ -31,6 +31,7 @@ from formatting import fmt_pct
 from moex import now_msk
 from store import Store
 from tinkoff import OrderBook, TinkoffClient, Trade, enabled
+from clusters import price_endpoints
 
 log = logging.getLogger(__name__)
 
@@ -43,18 +44,7 @@ DAYSTATS_TTL = 60               # как часто обновлять high/low/
 
 # направление сигнала для оценки «попаданий»
 def _direction(sig: tape.Signal) -> int:
-    t = sig.text
-    if sig.kind in ("iceberg", "whale", "whale_series", "imbalance", "rhythm"):
-        return 1 if "покуп" in t else -1 if "прода" in t else 0
-    if sig.kind == "eaten":
-        return 1 if "вверх" in t else -1 if "вниз" in t else 0
-    if sig.kind == "wall":
-        return 1 if "бид" in t else -1      # поддержка -> ждём отскок вверх
-    if sig.kind == "spoof":
-        return -1 if "на покупку" in t else 1  # ложный бид -> реальный интерес продать
-    if sig.kind == "breakout":
-        return 1 if "вверх" in t else -1
-    return 0
+    return sig.direction if sig.direction in (-1, 1) else 0
 
 
 def _hm(s: str, default: int) -> int:
@@ -71,11 +61,12 @@ SIGNAL_TO_MIN = _hm(os.getenv("SIGNAL_TO", "19:00"), 19 * 60)
 
 class DayStats:
     __slots__ = ("high", "low", "vwap", "ts", "prev_high", "prev_low", "prev_date",
-                 "hl_hist")
+                 "hl_hist", "day")
 
     def __init__(self) -> None:
         self.high = self.low = self.vwap = 0.0
         self.ts = 0.0
+        self.day = now_msk().date()
         self.prev_high = self.prev_low = 0.0     # вчерашние экстремумы
         self.prev_date = ""                      # на какой день загружены
         self.hl_hist: list[tuple[float, float, float]] = []   # (ts, high, low) по опросам
@@ -114,7 +105,12 @@ class FlowMonitor:
         self._digest_ts: Dict[tuple[int, str], float] = {}
         self._dec: Dict[str, int] = {}
         self._infos: Dict[str, Optional[moex.SecurityInfo]] = {}
+        self._infos_ts: dict[str, float] = {}
         self._last_price: Dict[str, float] = {}
+        self._last_price_ts: dict[str, float] = {}
+        self._prices: dict[str, dict[float, float]] = {}
+        self._observed_until: dict[str, float] = {}
+        self._recent_events: dict[str, float] = {}
         self._last_book: Dict[str, OrderBook] = {}
         self._imoex: dict = {"15m": None, "day": None}
         self._imoex_ts = 0.0
@@ -148,15 +144,18 @@ class FlowMonitor:
 
     # -------------------------------------------------------------- helpers
     async def _info(self, sess, t: str) -> Optional[moex.SecurityInfo]:
-        if t not in self._infos:
+        if t not in self._infos or time.time() - self._infos_ts.get(t, 0) >= 300:
             try:
                 self._infos[t] = await moex.get_security_info(sess, t)
+                self._infos_ts[t] = time.time()
             except Exception:
                 return None
         return self._infos[t]
 
     async def _daystats(self, sess, t: str) -> DayStats:
         ds = self._day.setdefault(t, DayStats())
+        if ds.day != now_msk().date():
+            ds = self._day[t] = DayStats()
         if time.time() - ds.ts < DAYSTATS_TTL:
             return ds
         ds.ts = time.time()
@@ -165,8 +164,12 @@ class FlowMonitor:
             return ds
         try:
             day0 = now_msk().replace(hour=0, minute=0, second=0, microsecond=0)
-            rows = await moex._candles(sess, t, info.board, day0)
-            rows = [r for r in rows if r[6][:10] == day0.strftime("%Y-%m-%d")]
+            inst = await self.tk.instrument(t)
+            candles = await self.tk.candles(inst, 1, now_msk() - day0) if inst else []
+            # Тот же источник, что и лента; VWAP по минутным свечам — оценка.
+            rows = [[c.open, c.close, c.high, c.low,
+                     (c.high + c.low + c.close) / 3 * c.volume, c.volume,
+                     c.begin.isoformat()] for c in candles if c.begin >= day0]
             if rows:
                 ds.high = max(float(r[2]) for r in rows)
                 ds.low = min(float(r[3]) for r in rows)
@@ -267,7 +270,7 @@ class FlowMonitor:
             out.append(tape.Signal(
                 kind="breakout", ticker=t,
                 text=f"{arrow}: <b>{t}</b> прошла {name} <b>{lvl}</b> — цена {ptxt} ₽, {dtxt}",
-                key=f"breakout:{name}:{'up' if up else 'down'}"))
+                key=f"breakout:{name}:{'up' if up else 'down'}", direction=1 if up else -1))
         return out
 
     async def imoex(self, sess) -> dict:
@@ -316,7 +319,7 @@ class FlowMonitor:
         cells = self.clusters.window(t, minutes)
         if len(cells) < 2:
             return None
-        first, last = cells[0].price, cells[-1].price
+        first, last = price_endpoints(cells)
         return (last - first) / first * 100 if first else None
 
     def _level_signals(self, t: str, price: float, decimals: int) -> list[tape.Signal]:
@@ -427,6 +430,9 @@ class FlowMonitor:
                     # авто-фильтр по статистике: слабые пары «бумага × тип» не шлём
                     if self.journal.is_muted(t, sig.kind):
                         continue
+                    if self.journal.recently_sent(uid, t, sig.kind, sig.key, now,
+                                                  KIND_COOLDOWN_SEC, SIGNAL_COOLDOWN_SEC):
+                        continue
                     k = (uid, f"{t}:{sig.key}")
                     kk = (uid, f"{t}:{sig.kind}")
                     if now - self._sent.get(k, 0) < SIGNAL_COOLDOWN_SEC:
@@ -442,13 +448,17 @@ class FlowMonitor:
         for (uid, t), sigs in list(self._digest.items()):
             if not sigs:
                 continue
+            prof = self.store.get(uid)
+            if not prof.flow_alerts or t not in prof.watchlist or prof.is_quiet(hour):
+                self._digest[(uid, t)] = []
+                continue
             first = self._digest_first.get((uid, t), now)
             has_conf = any(self._confirmed.get(id(s), {}).get("ok") for s in sigs)
             if not has_conf and now - first < DIGEST_SEC and len(sigs) < MAX_SIGNALS_PER_MSG:
                 continue
-            self._digest[(uid, t)] = []
-            self._digest_ts[(uid, t)] = now
-            await self._send_signals(sess, uid, t, sigs[:MAX_SIGNALS_PER_MSG])
+            if await self._send_signals(sess, uid, t, sigs[:MAX_SIGNALS_PER_MSG]):
+                self._digest[(uid, t)] = sigs[MAX_SIGNALS_PER_MSG:]
+                self._digest_ts[(uid, t)] = now
         if len(self._confirmed) > 2000:
             self._confirmed = {}
 
@@ -456,7 +466,7 @@ class FlowMonitor:
             self._sent = {k: v for k, v in self._sent.items() if now - v < 3600}
 
     async def _send_signals(self, sess, uid: int, t: str,
-                            sigs: list[tape.Signal]) -> None:
+                            sigs: list[tape.Signal]) -> bool:
         info = await self._info(sess, t)
         dec = info.decimals if info else 2
         price = self._last_price.get(t, 0.0)
@@ -473,10 +483,12 @@ class FlowMonitor:
         confs = [self._confirmed.get(id(s)) or {"facts": [], "ctx": {}, "ok": False} for s in sigs]
         parts = []
         for s, c in zip(sigs, confs):
+            when = datetime.fromtimestamp(s.detected_at, moex.MSK)
+            stamp = f"\n<i>Обнаружено {when:%H:%M:%S} МСК · база оценки {s.price:.{dec}f} ₽</i>"
             if c["ok"] and c["facts"]:
-                parts.append(s.text + "\n⭐ подтверждено: " + ", ".join(c["facts"]))
+                parts.append(s.text + "\n⭐ подтверждено: " + ", ".join(c["facts"]) + stamp)
             else:
-                parts.append(s.text)
+                parts.append(s.text + stamp)
         body = "\n\n".join(parts)
         if not any(c["ok"] for c in confs):
             body = "🗂 <i>Сводка за 5 мин (без подтверждения)</i>\n\n" + body
@@ -488,16 +500,21 @@ class FlowMonitor:
             msg = await self.bot.send_message(uid, text, reply_markup=flow_kb(t))
         except Exception:
             log.exception("flow: не отправлено %s", uid)
-            return
-        if price:
+            return False
+        if sigs:
             # журналируем каждый сигнал; результат дописываем к одному сообщению
             for s, c in zip(sigs, confs):
                 ctx_d = c["ctx"] or {"hour": now_msk().hour}
-                self.journal.add(Entry(ts=time.time(), uid=uid, chat_id=msg.chat.id,
+                self.journal.add(Entry(ts=s.detected_at, uid=uid, chat_id=msg.chat.id,
                                        msg_id=msg.message_id, ticker=t, kind=s.kind,
-                                       price=price, direction=_direction(s), text=text,
-                                       ctx=ctx_d))
-                self._recent.setdefault(t, []).append((s.kind, _direction(s), time.time()))
+                                       price=s.price, direction=_direction(s), text=text,
+                                       ctx=ctx_d, event_id=s.event_id, signal_key=s.key,
+                                       price_ts=s.price_ts))
+                if s.event_id not in self._recent_events:
+                    self._recent.setdefault(t, []).append((s.kind, _direction(s), s.detected_at))
+                    self._recent_events[s.event_id] = s.detected_at
+            self._recent_events = {k: v for k, v in self._recent_events.items() if time.time() - v < 3600}
+        return True
 
     async def _analyze(self, sess, t: str) -> list[tape.Signal]:
         try:
@@ -515,8 +532,15 @@ class FlowMonitor:
             return_exceptions=True)
         out: list[tape.Signal] = []
         if isinstance(trades, list) and trades:
+            trades.sort(key=lambda tr: tr.ts)
+            observed = time.time()
+            self._observed_until[t] = observed
+            history = self._prices.setdefault(t, {})
+            history.update((tr.ts.timestamp(), tr.price) for tr in trades)
+            self._prices[t] = {ts: p for ts, p in history.items() if observed - ts <= 25 * 60}
             self._prev_price[t] = self._last_price.get(t, 0.0)
             self._last_price[t] = trades[-1].price
+            self._last_price_ts[t] = trades[-1].ts.timestamp()
             if self.clusters is not None:
                 try:
                     self.clusters.ingest(t, trades)
@@ -524,7 +548,7 @@ class FlowMonitor:
                     log.exception("clusters: ingest %s", t)
             base = self._base.setdefault(t, tape.Baseline())
             base.update(trades[-300:], inst.lot)
-            if self._main_session():
+            if self._main_session() and 0 <= observed - self._last_price_ts[t] <= 90:
                 out += tape.analyze_trades(t, trades, inst.lot, dec, base)
                 try:
                     out += self._level_signals(t, trades[-1].price, dec)
@@ -537,52 +561,68 @@ class FlowMonitor:
             log.warning("flow: лента %s: %s", t, trades)
         if isinstance(ob, OrderBook):
             self._last_book[t] = ob
-            if ob.last:
-                self._last_price.setdefault(t, ob.last)
             st = self._books.setdefault(t, tape.BookState())
-            if self._main_session():
+            if self._main_session() and 0 <= time.time() - ob.ts.timestamp() <= 90:
                 out += tape.analyze_book(t, ob, st, inst.lot, dec)
         elif isinstance(ob, BaseException):
             log.warning("flow: стакан %s: %s", t, ob)
+        ts = time.time()
+        if not 0 <= ts - self._last_price_ts.get(t, 0) <= 90:
+            return []  # нет свежей стартовой цены для оценки сигнала
+        for sig in out:
+            sig.detected_at, sig.price, sig.price_ts = ts, self._last_price[t], self._last_price_ts[t]
         return out
 
     # ------------------------------------------------------------ follow-up
     async def followups(self) -> None:
         now = time.time()
-        touched = False
-        # группируем по сообщению — одно редактирование на сообщение
-        by_msg: Dict[tuple[int, int], list[Entry]] = {}
+        touched: set[tuple[int, int]] = set()
+        # Замер строго к целевому времени. Последняя сделка должна быть
+        # не старше 60 с на эту точку; опрос должен уже покрыть её.
         for e in self.journal.pending():
-            by_msg.setdefault((e.chat_id, e.msg_id), []).append(e)
+            for cp in CHECKPOINTS:
+                key = str(cp)
+                target = e.ts + cp * 60
+                if key in e.results or key in e.missing or now < target:
+                    continue
+                points = [(ts, p) for ts, p in self._prices.get(e.ticker, {}).items()
+                          if target - 60 <= ts <= target]
+                if points and self._observed_until.get(e.ticker, 0) >= target and e.price > 0:
+                    ts, price = max(points)
+                    e.results[key] = round((price / e.price - 1) * 100, 3)
+                    e.result_times[key] = ts
+                elif now >= target + 90:
+                    e.missing.append(key)
+                else:
+                    continue
+                touched.add((e.chat_id, e.msg_id))
+            e.done = all(str(cp) in e.results or str(cp) in e.missing for cp in CHECKPOINTS)
+        if not touched:
+            return
+        self.journal.save()  # данные сохраняются независимо от успеха Telegram edit
+        by_msg: Dict[tuple[int, int], list[Entry]] = {}
+        for e in self.journal.entries:
+            if (e.chat_id, e.msg_id) in touched:
+                by_msg.setdefault((e.chat_id, e.msg_id), []).append(e)
         for (chat_id, msg_id), es in by_msg.items():
             first = es[0]
-            age_min = (now - first.ts) / 60
-            price = self._last_price.get(first.ticker)
-            if not price or not first.price:
-                continue
-            changed = False
-            for cp in CHECKPOINTS:
-                if age_min >= cp and str(cp) not in first.results:
-                    chg = (price - first.price) / first.price * 100
-                    for e in es:
-                        e.results[str(cp)] = round(chg, 3)
-                    changed = True
-            if not changed:
-                continue
-            touched = True
-            if all(str(cp) in first.results for cp in CHECKPOINTS):
-                for e in es:
-                    e.done = True
-            parts = []
-            for cp in CHECKPOINTS:
-                if str(cp) in first.results:
-                    v = first.results[str(cp)]
-                    mark = ""
-                    if first.direction:
-                        mark = " ✅" if v * first.direction >= HIT_PCT else (
-                            " ❌" if v * first.direction <= -HIT_PCT else " ➖")
-                    parts.append(f"{cp}м: {v:+.2f}%{mark}".replace(".", ","))
-            new_text = first.text + "\n\n⏱ После сигнала → " + " · ".join(parts)
+            rows = []
+            for e in es:
+                parts = []
+                for cp in CHECKPOINTS:
+                    if str(cp) in e.results:
+                        v = e.results[str(cp)]
+                        mark = ""
+                        if e.direction:
+                            mark = " ✅" if v * e.direction >= HIT_PCT else (
+                                " ❌" if v * e.direction <= -HIT_PCT else " ➖")
+                        parts.append(f"{cp}м: {v:+.2f}%{mark}".replace(".", ","))
+                    elif str(cp) in e.missing:
+                        parts.append(f"{cp}м: нет свежего замера")
+                if parts:
+                    from journal import KIND_NAME
+                    rows.append(KIND_NAME.get(e.kind, e.kind) + " → " + " · ".join(parts))
+            new_text = first.text + "\n\n⏱ Изменение цены от обнаружения:\n" + "\n".join(rows)
             try:
                 await self.bot.edit_message_text(new_text, chat_id=chat_id,
                                                  message_id=msg_id,
@@ -592,5 +632,3 @@ class FlowMonitor:
                     log.debug("flow: edit follow-up: %s", e)
             except Exception as e:
                 log.debug("flow: edit follow-up: %s", e)
-        if touched:
-            self.journal.save()

@@ -13,6 +13,7 @@ import json
 import logging
 import math
 import os
+import shutil
 import time
 from collections import Counter
 from dataclasses import dataclass
@@ -65,6 +66,21 @@ class Cell:
     buy: int           # лоты
     sell: int
     n: int             # число сделок
+    first_ts: float = 0.0
+    last_ts: float = 0.0
+
+
+def price_endpoints(cells: list[Cell]) -> tuple[float, float]:
+    """Цены первой и последней сделки, независимо от сортировки уровней."""
+    timed = [c for c in cells if c.first_ts and c.last_ts]
+    if not timed:
+        return 0.0, 0.0  # старые агрегаты не содержат порядка сделок
+    first_ts, last_ts = min(c.first_ts for c in timed), max(c.last_ts for c in timed)
+    first = {c.price for c in timed if c.first_ts == first_ts}
+    last = {c.price for c in timed if c.last_ts == last_ts}
+    if len(first) != 1 or len(last) != 1:
+        return 0.0, 0.0  # API не позволяет определить порядок разных цен на одном timestamp
+    return first.pop(), last.pop()
 
 
 class ClusterStore:
@@ -75,7 +91,8 @@ class ClusterStore:
         # ticker -> minute_key -> price_str -> [buy, sell, n]
         self.data: dict[str, dict[str, dict[str, list[int]]]] = {}
         # дедупликация: ticker -> (последний ts, отпечатки сделок на этом ts)
-        self._last: dict[str, tuple[datetime, Counter]] = {}
+        self._seen: dict[str, dict[str, dict[str, int]]] = {}
+        self._floor: dict[str, float] = {}
         self._dirty = False
         self._saved_at = 0.0
         self.started_at = datetime.now(MSK).replace(tzinfo=None)
@@ -85,12 +102,26 @@ class ClusterStore:
     def _load(self) -> None:
         try:
             with open(self.path, encoding="utf-8") as f:
-                self.data = json.load(f)
+                raw = json.load(f)
+            if raw.get("version") == 2:
+                self.data = raw["data"]
+                self._seen = raw["seen"]
+                self._floor = raw["floor"]
+            elif "version" in raw:
+                raise ValueError("Неизвестная версия clusters.json")
+            else:
+                # Старые суммы не позволяют восстановить порядок и дубли.
+                backup = self.path + ".legacy-v1.bak"
+                if not os.path.exists(backup):
+                    shutil.copy2(self.path, backup)
+                self._dirty = True
+                log.warning("clusters: старый агрегат сохранён в %s; начинается новый", backup)
             log.info("clusters: загружено %d бумаг из %s", len(self.data), self.path)
         except FileNotFoundError:
             pass
         except Exception:
             log.exception("clusters: не удалось прочитать %s", self.path)
+            raise  # не перезаписываем повреждённую историю пустыми данными
         self.prune()
 
     def save(self, force: bool = False) -> None:
@@ -102,7 +133,8 @@ class ClusterStore:
             os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
             tmp = self.path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, ensure_ascii=False, separators=(",", ":"))
+                json.dump({"version": 2, "data": self.data, "seen": self._seen,
+                           "floor": self._floor}, f, ensure_ascii=False, separators=(",", ":"))
             os.replace(tmp, self.path)
             self._dirty = False
             self._saved_at = time.time()
@@ -128,36 +160,47 @@ class ClusterStore:
         """
         if not trades:
             return 0
-        last_ts, seen = self._last.get(ticker, (None, Counter()))
+        # T-Invest возвращает не более часа. Храним отпечатки 65 минут,
+        # включая кратность одинаковых сделок на одной временной отметке.
+        # Всё до floor уже закрыто для записи — удаление отпечатков не
+        # должно разрешать повторно добавлять старую историю.
+        valid = [tr for tr in trades if tr.price > 0 and tr.qty > 0 and tr.side in ("B", "S")]
+        if not valid:
+            return 0
+        floor = max(self._floor.get(ticker, 0), max(tr.ts.timestamp() for tr in valid) - 65 * 60)
+        self._floor[ticker] = floor
+        seen = self._seen.setdefault(ticker, {})
+        for stamp in list(seen):
+            if float(stamp) < floor:
+                del seen[stamp]
         mins = self.data.setdefault(ticker, {})
         added = 0
         batch: Counter = Counter()
-        for tr in sorted(trades, key=lambda x: x.ts):
-            if last_ts is not None and tr.ts < last_ts:
+        for tr in sorted(valid, key=lambda x: x.ts):
+            ts = tr.ts.timestamp()
+            if ts < floor:
                 continue
-            fp = (tr.price, tr.qty, tr.side)
-            if last_ts is not None and tr.ts == last_ts:
-                batch[fp] += 1
-                if batch[fp] <= seen[fp]:
-                    continue
-                seen[fp] += 1
-            else:
-                last_ts, seen, batch = tr.ts, Counter(), Counter()
-                batch[fp] += 1
-                seen[fp] += 1
+            stamp = repr(ts)
+            fp = f"{tr.price!r}:{tr.qty}:{tr.side}"
+            counts = seen.setdefault(stamp, {})
+            batch[(stamp, fp)] += 1
+            if batch[(stamp, fp)] <= counts.get(fp, 0):
+                continue
+            counts[fp] = batch[(stamp, fp)]
             mk = tr.ts.astimezone(MSK).strftime("%Y-%m-%dT%H:%M")
             pk = repr(tr.price)
-            cell = mins.setdefault(mk, {}).setdefault(pk, [0, 0, 0])
+            cell = mins.setdefault(mk, {}).setdefault(pk, [0, 0, 0, ts, ts])
             if tr.side == "B":
                 cell[0] += tr.qty
             else:
                 cell[1] += tr.qty
             cell[2] += 1
+            cell[3] = min(cell[3], ts)
+            cell[4] = max(cell[4], ts)
             added += 1
-        self._last[ticker] = (last_ts, seen)
-        if added:
-            self._dirty = True
-            self.save()
+        self._dirty = True
+        self.prune()
+        self.save()
         return added
 
     # ------------------------------------------------------------- query
@@ -167,11 +210,11 @@ class ClusterStore:
         frm = (now - timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M")
         out: list[Cell] = []
         for mk, prices in self.data.get(ticker, {}).items():
-            if mk < frm:
+            if mk < frm or mk > now.strftime("%Y-%m-%dT%H:%M"):
                 continue
             m = datetime.strptime(mk, "%Y-%m-%dT%H:%M")
-            for pk, (b, s, n) in prices.items():
-                out.append(Cell(m, float(pk), b, s, n))
+            for pk, (b, s, n, first_ts, last_ts) in prices.items():
+                out.append(Cell(m, float(pk), b, s, n, first_ts, last_ts))
         out.sort(key=lambda c: (c.minute, c.price))
         return out
 
@@ -323,7 +366,7 @@ def analyze(ticker: str, window: str, cells: list[Cell], lot: int,
         heat={k: (v[0], v[1]) for k, v in heat.items()},
         buy=buy, sell=sell, n=n, turnover=turnover,
         poc=levels[pi].price, va_lo=levels[a].price, va_hi=levels[b].price + step,
-        first=cells[0].price, last=cells[-1].price,
+        first=price_endpoints(cells)[0], last=price_endpoints(cells)[1],
         since=cells[0].minute, until=cells[-1].minute,
     )
 

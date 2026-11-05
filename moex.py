@@ -21,6 +21,7 @@ from typing import Any, Optional
 import aiohttp
 
 from config import MOEX_BASE, MOEX_BOARDS, FRESHNESS_MIN
+from formatting import esc, fmt_price
 
 log = logging.getLogger(__name__)
 
@@ -54,6 +55,16 @@ class Quote:
     as_of: datetime          # время последней свечи (MSK)
     change_pct: float        # изменение к закрытию предыдущего дня, %
     trading: bool            # данные свежие => рынок торгует
+    source: str = "MOEX ISS · резерв, возможна задержка"
+    reference_price: float = 0.0
+    reference_label: str = "к официальному закрытию MOEX"
+    reference_key: str = ""
+
+    def details(self) -> str:
+        state = "" if self.trading else " · ⚠️ нет свежей сделки"
+        return (f"<i>{esc(self.source)} · цена на {self.as_of:%d.%m %H:%M:%S} МСК{state}\n"
+                f"База: {esc(self.reference_label)} — "
+                f"{fmt_price(self.reference_price or self.info.prev_close, self.info.decimals)} ₽</i>")
 
 
 def _rows(data: dict[str, Any]) -> tuple[list[str], list[list[Any]]]:
@@ -137,7 +148,7 @@ async def get_last_candle(session: aiohttp.ClientSession, ticker: str,
     now = now_msk()
     if hint is not None:
         try:
-            rows = await _candles(session, ticker, board, hint - timedelta(seconds=30))
+            rows = await _candles(session, ticker, board, max(hint - timedelta(seconds=30), now - _PROBE_STEP))
             if rows:
                 return rows[-1]
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -171,9 +182,11 @@ async def get_quote(session: aiohttp.ClientSession, info: SecurityInfo,
     change_pct = 0.0
     if info.prev_close > 0:
         change_pct = (price - info.prev_close) / info.prev_close * 100.0
-    trading = (now_msk() - as_of) < timedelta(minutes=FRESHNESS_MIN)
+    trading = timedelta(0) <= now_msk() - as_of < timedelta(minutes=FRESHNESS_MIN)
     return Quote(info=info, price=price, as_of=as_of,
-                 change_pct=change_pct, trading=trading)
+                 change_pct=change_pct, trading=trading,
+                 reference_label=f"закрытие MOEX {info.prev_date}",
+                 reference_key=f"moex:{info.prev_date}:{info.prev_close}")
 
 
 async def fetch_quotes(session: aiohttp.ClientSession,
@@ -189,20 +202,24 @@ async def fetch_quotes(session: aiohttp.ClientSession,
     out: dict[str, Quote] = {}
     if tk is not None:
         try:
-            insts = []
-            for t in infos:
-                inst = await tk.instrument(t)
-                if inst is not None:
-                    insts.append(inst)
+            found = await asyncio.gather(*(tk.instrument(t) for t in infos), return_exceptions=True)
+            insts = [i for i in found if i is not None and not isinstance(i, BaseException)]
             prices = await tk.last_prices(insts)
+            refs = await asyncio.gather(*(tk.daily_reference(i) for i in insts), return_exceptions=True)
+            references = {i.ticker: r for i, r in zip(insts, refs) if r is not None and not isinstance(r, BaseException)}
             for t, (price, ts) in prices.items():
                 info = infos[t]
                 as_of = ts.astimezone(MSK).replace(tzinfo=None)
-                change = ((price - info.prev_close) / info.prev_close * 100.0
-                          if info.prev_close > 0 else 0.0)
-                trading = (now_msk() - as_of) < timedelta(minutes=FRESHNESS_MIN)
+                ref = references.get(t)
+                base = ref.price if ref else info.prev_close
+                label = (f"до {ref.cutoff:%d.%m %H:%M} МСК, по биржевым свечам T‑Invest"
+                         if ref else f"закрытие MOEX {info.prev_date}; база 04:00 недоступна")
+                change = ((price - base) / base * 100.0 if base > 0 else 0.0)
+                trading = timedelta(0) <= now_msk() - as_of < timedelta(seconds=90)
                 out[t] = Quote(info=info, price=price, as_of=as_of,
-                               change_pct=change, trading=trading)
+                               change_pct=change, trading=trading, source="T‑Invest · биржевая цена",
+                               reference_price=base, reference_label=label,
+                               reference_key=f"04:{ref.cutoff.isoformat()}:{base}" if ref else f"moex:{info.prev_date}:{base}")
                 hints[t] = as_of
         except Exception as e:
             log.warning("T-Invest last prices: %s — беру MOEX", e)

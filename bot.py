@@ -180,7 +180,7 @@ async def _list(m, store: Store, sess: aiohttp.ClientSession, tk=None) -> str:
                      else "⬇️" if q.change_pct < -0.005 else "⚪")
             lines.append(
                 f"{arrow} <b>{t}</b> · {fmt_price(q.price, q.info.decimals)} {cur} · "
-                f"{fmt_pct(q.change_pct)}"
+                f"{fmt_pct(q.change_pct)}\n{q.details()}"
             )
     return "\n".join(lines)
 
@@ -348,7 +348,7 @@ async def cmd_alert(m: Message, store: Store) -> None:
     p = store.get(m.from_user.id)
     p.threshold_pct = v
     store.save()
-    await m.answer(f"🔔 Порог алерта: {v:g}% за день (от предыдущего закрытия).")
+    await m.answer(f"🔔 Порог алерта: {v:g}%. С T‑Invest база — последняя биржевая цена до 04:00 МСК; резерв — официальное закрытие MOEX. База подписана в каждом алерте.")
 
 
 @router.message(Command("quiet"))
@@ -609,13 +609,14 @@ async def _setup_text(sess, tk: tinkoff.TinkoffClient, cstore: clu.ClusterStore,
     day_chg = (price - info.prev_close) / info.prev_close * 100 if info and info.prev_close else None
     im = im if isinstance(im, dict) else {}
     rs15 = stp.rel_strength(ch15, im.get("15m"), "15 мин")
-    rsd = stp.rel_strength(day_chg, im.get("day"), "день")
+    rsd = stp.rel_strength(day_chg, im.get("day"), "к закрытию MOEX")
     hi, lo, vwap = (ds.high, ds.low, ds.vwap) if not isinstance(ds, BaseException) else (0, 0, 0)
     s = await asyncio.to_thread(
         stp.build_setup, t, price, info.prev_close if info else 0.0, hi, lo, vwap, ob,
         cells, dec, inst.lot, flow.recent_signals(t), rs15, rsd)
     cov = cstore.coverage(t)
     text = stp.setup_text(s, name, dec)
+    text += "\n<i>Дневной контекст сетапа — к официальному закрытию MOEX; VWAP — оценка по минутным свечам T‑Invest.</i>"
     try:
         ml = market.line(await market.snapshot(sess))
         if ml:

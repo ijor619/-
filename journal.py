@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Optional
@@ -50,6 +51,11 @@ class Entry:
     results: dict = field(default_factory=dict)  # "5": +0.42, "15": -0.1
     done: bool = False
     ctx: dict = field(default_factory=dict)      # контекст: vwap (+1/-1), hour, delta15 (+1/0/-1), rs
+    event_id: str = ""
+    signal_key: str = ""
+    price_ts: float = 0.0
+    missing: list[str] = field(default_factory=list)
+    result_times: dict = field(default_factory=dict)
 
 
 class Journal:
@@ -63,8 +69,19 @@ class Journal:
         try:
             with open(self.path, encoding="utf-8") as f:
                 raw = json.load(f)
-            self.entries = [Entry(**e) for e in raw]
-        except (FileNotFoundError, json.JSONDecodeError, TypeError):
+            if isinstance(raw, list):
+                backup = self.path + ".legacy-v1.bak"
+                if not os.path.exists(backup):
+                    shutil.copy2(self.path, backup)
+                # Направление, время замера и идентичность события ненадёжны.
+                # Сохраняем оригинал, но не включаем его в новую статистику.
+                self.entries = []
+                self.save()
+            elif raw.get("version") == 2:
+                self.entries = [Entry(**e) for e in raw["entries"]]
+            else:
+                raise ValueError("Неизвестная версия журнала")
+        except FileNotFoundError:
             self.entries = []
 
     def save(self) -> None:
@@ -76,13 +93,32 @@ class Journal:
         self.entries = [e for e in self.entries if e.ts >= cutoff]
         tmp = self.path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump([asdict(e) for e in self.entries], f, ensure_ascii=False)
+            json.dump({"version": 2, "entries": [asdict(e) for e in self.entries]}, f, ensure_ascii=False)
         os.replace(tmp, self.path)
 
     # ----------------------------------------------------------- операции
     def add(self, e: Entry) -> None:
+        if not e.event_id:
+            raise ValueError("Для статистики нужен event_id")
+        if any(x.uid == e.uid and x.event_id == e.event_id for x in self.entries):
+            return
         self.entries.append(e)
         self.save()
+
+    @staticmethod
+    def unique(entries: list[Entry]) -> list[Entry]:
+        by_id: dict[str, Entry] = {}
+        for e in entries:
+            old = by_id.get(e.event_id)
+            if e.event_id and (old is None or len(e.results) > len(old.results)):
+                by_id[e.event_id] = e
+        return list(by_id.values())
+
+    def recently_sent(self, uid: int, ticker: str, kind: str, key: str,
+                      now: float, kind_sec: int, key_sec: int) -> bool:
+        return any(e.uid == uid and e.ticker == ticker and (
+            (e.kind == kind and now - e.ts < kind_sec) or
+            (e.signal_key == key and now - e.ts < key_sec)) for e in self.entries)
 
     def pending(self) -> list[Entry]:
         return [e for e in self.entries if not e.done]
@@ -91,10 +127,10 @@ class Journal:
     def stats(self, uid: int, days: int = 7,
               ticker: Optional[str] = None) -> str:
         cutoff = time.time() - days * 86400
-        es = [e for e in self.entries
-              if e.uid == uid and e.ts >= cutoff and (not ticker or e.ticker == ticker)]
+        es = self.unique([e for e in self.entries
+              if e.uid == uid and e.ts >= cutoff and (not ticker or e.ticker == ticker)])
         if not es:
-            return "Сигналов за период нет."
+            return "Новых сигналов за период нет. Старая статистика, если была, сохранена в резервной копии и исключена из расчёта."
         by: dict[tuple[str, str], list[Entry]] = {}
         for e in es:
             by.setdefault((e.ticker, e.kind), []).append(e)
@@ -103,9 +139,9 @@ class Journal:
                  + (f" · {ticker}" if ticker else "")
                  + f" · всего {len(es)}"]
         lines.append("<pre>")
-        lines.append(f"{'бумага':<6} {'сигнал':<12} {'n':>3} {'15м ср.':>8} {'попад.':>6}")
+        lines.append(f"{'бумага':<6} {'сигнал':<12} {'оцен./всего':>11} {'ход 15м':>8} {'попад.':>6}")
         for (t, k), grp in sorted(by.items(), key=lambda kv: -len(kv[1])):
-            r15 = [e.results.get("15") for e in grp if "15" in e.results]
+            r15 = [e.results["15"] * e.direction for e in grp if "15" in e.results and e.direction]
             avg = sum(r15) / len(r15) if r15 else None
             # «попадание» — движение ≥0,2% в сторону сигнала (если направление есть)
             hits = [e for e in grp if "15" in e.results and e.direction
@@ -115,10 +151,11 @@ class Journal:
             avg_s = f"{avg:+.2f}%" if avg is not None else "—"
             mark = "🔇" if self.is_muted(t, k) else " "
             lines.append(f"{mark}{t:<6} {KIND_EMOJI.get(k, '')}{KIND_NAME.get(k, k):<11} "
-                         f"{len(grp):>3} {avg_s:>8} {hit_s:>6}")
+                         f"{str(len(r15)) + '/' + str(len(grp)):>11} {avg_s:>8} {hit_s:>6}")
         lines.append("</pre>")
-        lines.append("<i>15м ср. — среднее изменение цены через 15 мин после сигнала; "
+        lines.append("<i>Ход 15м — среднее движение в сторону сигнала через 15 мин от обнаружения: плюс означает верное направление; "
                      f"попад. — доля случаев, когда цена пошла в сторону сигнала на ≥{HIT_PCT:.1f}%. "
+                     "Оцен./всего — число замеров / уникальных событий. Пропуски не считаются нулевыми результатами. "
                      "🔇 — пара отключена автоматически (n≥30, попадание ниже 25 %).</i>")
         ctx = self._ctx_stats(es)
         if ctx:
@@ -130,8 +167,8 @@ class Journal:
     def quality(self, ticker: str, kind: str, days: int = MUTE_DAYS) -> tuple[int, Optional[float]]:
         """(n оценённых направленных сигналов, попадание %) по всем пользователям."""
         cutoff = time.time() - days * 86400
-        es = [e for e in self.entries if e.ticker == ticker and e.kind == kind
-              and e.ts >= cutoff and e.direction and "15" in e.results]
+        es = self.unique([e for e in self.entries if e.ticker == ticker and e.kind == kind
+              and e.ts >= cutoff and e.direction and "15" in e.results])
         if not es:
             return 0, None
         hits = sum(1 for e in es if e.results["15"] * e.direction >= HIT_PCT)
