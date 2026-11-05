@@ -59,6 +59,7 @@ class Quote:
     reference_price: float = 0.0
     reference_label: str = "к официальному закрытию MOEX"
     reference_key: str = ""
+    reference_kind: str = "moex_close"
 
     def details(self) -> str:
         state = "" if self.trading else " · ⚠️ нет свежей сделки"
@@ -151,6 +152,8 @@ async def get_last_candle(session: aiohttp.ClientSession, ticker: str,
             rows = await _candles(session, ticker, board, max(hint - timedelta(seconds=30), now - _PROBE_STEP))
             if rows:
                 return rows[-1]
+            # После ночи/выходных быстрый диапазон может быть пуст. Это не
+            # означает, что цены нет: продолжаем обычный поиск назад.
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             log.warning("MOEX: свечи %s: %s", ticker, e)
             return None
@@ -201,28 +204,52 @@ async def fetch_quotes(session: aiohttp.ClientSession,
     """
     out: dict[str, Quote] = {}
     if tk is not None:
-        try:
-            found = await asyncio.gather(*(tk.instrument(t) for t in infos), return_exceptions=True)
-            insts = [i for i in found if i is not None and not isinstance(i, BaseException)]
-            prices = await tk.last_prices(insts)
-            refs = await asyncio.gather(*(tk.daily_reference(i) for i in insts), return_exceptions=True)
-            references = {i.ticker: r for i, r in zip(insts, refs) if r is not None and not isinstance(r, BaseException)}
-            for t, (price, ts) in prices.items():
+        found = await asyncio.gather(*(tk.instrument(t) for t in infos), return_exceptions=True)
+        insts = [i for i in found if i is not None and not isinstance(i, BaseException)]
+        if insts:
+            prices_r, portfolio_r, closes_r = await asyncio.gather(
+                tk.last_prices(insts), tk.portfolio_day_quotes(), tk.close_prices(insts),
+                return_exceptions=True)
+            prices = prices_r if isinstance(prices_r, dict) else {}
+            portfolio = portfolio_r if isinstance(portfolio_r, dict) else {}
+            closes = closes_r if isinstance(closes_r, dict) else {}
+            if isinstance(portfolio_r, BaseException):
+                log.warning("T-Invest GetPortfolio: %s; для бумаг без точной позиции беру закрытие", portfolio_r)
+            if isinstance(closes_r, BaseException):
+                log.warning("T-Invest GetClosePrices: %s", closes_r)
+            for t, (market_price, ts) in prices.items():
                 info = infos[t]
                 as_of = ts.astimezone(MSK).replace(tzinfo=None)
-                ref = references.get(t)
-                base = ref.price if ref else info.prev_close
-                label = (f"до {ref.cutoff:%d.%m %H:%M} МСК, по биржевым свечам T‑Invest"
-                         if ref else f"закрытие MOEX {info.prev_date}; база 04:00 недоступна")
-                change = ((price - base) / base * 100.0 if base > 0 else 0.0)
                 trading = timedelta(0) <= now_msk() - as_of < timedelta(seconds=90)
+                pos = portfolio.get(t)
+                close = closes.get(t)
+                if pos is not None:
+                    # Цена, дневной P/L и база относятся к одной позиции.
+                    price, base, change = pos.price, pos.base_price, pos.change_pct
+                    accounts = f" · счетов {pos.account_count}" if pos.account_count > 1 else ""
+                    label = f"позиция T‑Invest «за сегодня»{accounts}"
+                    source = "T‑Invest GetPortfolio · цена и дневная доходность позиции"
+                    calc_day = (datetime.now(MSK) - timedelta(hours=4)).date()
+                    # Числовая база округлена, чтобы микроскопический пересчёт
+                    # MoneyValue не сбрасывал ступени на каждом опросе.
+                    key = (f"portfolio:{calc_day}:{pos.quantity:g}:"
+                           f"{base:.{info.decimals + 2}f}")
+                    kind = "portfolio"
+                elif close is not None:
+                    base, close_ts, close_label = close
+                    price = market_price
+                    change = (price / base - 1) * 100 if base > 0 else 0.0
+                    label = f"{close_label} {close_ts.astimezone(MSK):%d.%m %H:%M} МСК"
+                    source = "T‑Invest · биржевая цена (бумаги нет в портфеле)"
+                    key = f"close:{close_ts.isoformat()}:{base:.9f}"
+                    kind = "tinvest_close"
+                else:
+                    continue  # нет надёжной базы — процент не выдумываем
                 out[t] = Quote(info=info, price=price, as_of=as_of,
-                               change_pct=change, trading=trading, source="T‑Invest · биржевая цена",
+                               change_pct=change, trading=trading, source=source,
                                reference_price=base, reference_label=label,
-                               reference_key=f"04:{ref.cutoff.isoformat()}:{base}" if ref else f"moex:{info.prev_date}:{base}")
+                               reference_key=key, reference_kind=kind)
                 hints[t] = as_of
-        except Exception as e:
-            log.warning("T-Invest last prices: %s — беру MOEX", e)
     infos = {t: i for t, i in infos.items() if t not in out}
     if not infos:
         return out

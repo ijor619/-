@@ -1,6 +1,7 @@
 """Клиент T-Invest API (REST/JSON) — стакан и лента обезличенных сделок.
 
-Только чтение: используются MarketDataService и InstrumentsService.
+Только чтение: используются MarketDataService, InstrumentsService,
+UsersService и OperationsService/GetPortfolio.
 Токен берётся из переменной окружения TINKOFF_TOKEN и никуда не логируется.
 Сертификаты Минцифры (certs/) нужны, т.к. invest-public-api.tinkoff.ru
 подписан российским CA, которого нет в системных хранилищах вне РФ.
@@ -11,6 +12,7 @@ import asyncio
 import logging
 import os
 import ssl
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -177,10 +179,13 @@ class TCandle:
 
 
 @dataclass(frozen=True)
-class DayReference:
+class PortfolioDayQuote:
+    """Дневная доходность позиции, которую рассчитал сам T‑Invest."""
     price: float
-    cutoff: datetime  # 04:00 МСК — начало расчётного дня
-    candle_time: datetime  # начало последней полной минуты ДО cutoff, UTC
+    change_pct: float
+    base_price: float
+    quantity: float
+    account_count: int
 
 
 INTERVALS = {1: "CANDLE_INTERVAL_1_MIN", 5: "CANDLE_INTERVAL_5_MIN",
@@ -198,9 +203,9 @@ class TinkoffClient:
     def __init__(self) -> None:
         self._sess: Optional[aiohttp.ClientSession] = None
         self._instr: dict[str, Optional[Instrument]] = {}
-        self._day_refs: dict[str, DayReference] = {}
-        self._ref_locks: dict[str, asyncio.Lock] = {}
-        self._ref_sem = asyncio.Semaphore(4)
+        self._accounts_cache: tuple[float, list[str]] = (0.0, [])
+        self._portfolio_cache: tuple[float, dict[str, PortfolioDayQuote]] = (0.0, {})
+        self._close_cache: tuple[float, dict[str, tuple[float, datetime, str]]] = (0.0, {})
 
     async def _session(self) -> aiohttp.ClientSession:
         if self._sess is None or self._sess.closed:
@@ -264,9 +269,15 @@ class TinkoffClient:
         asks = [Level(q2f(x["price"]), int(x["quantity"])) for x in d.get("asks", [])]
         if not bids and not asks:
             return None
-        if not d.get("orderbookTs"):
-            return None
-        ts = datetime.fromisoformat(d["orderbookTs"].replace("Z", "+00:00"))
+        # В некоторых REST-ответах уровни есть, а orderbookTs отсутствует.
+        # Это не должно ломать ручную кнопку «Стакан». Для фоновых сигналов
+        # такой снимок помечается временем получения и всё равно проходит
+        # обычную проверку свежести в FlowMonitor.
+        stamp = d.get("orderbookTs") or d.get("lastPriceTs")
+        try:
+            ts = datetime.fromisoformat(stamp.replace("Z", "+00:00")) if stamp else datetime.now(timezone.utc)
+        except (AttributeError, TypeError, ValueError):
+            ts = datetime.now(timezone.utc)
         return OrderBook(ts, bids, asks, q2f(d.get("lastPrice")))
 
     async def candles(self, inst: Instrument, minutes: int,
@@ -319,43 +330,104 @@ class TinkoffClient:
                     out[t] = (q2f(p["price"]), ts)
         return out
 
-    async def daily_reference(self, inst: Instrument,
-                              now: Optional[datetime] = None) -> Optional[DayReference]:
-        """Последняя биржевая цена до 04:00 МСК, восстановленная по свечам.
+    async def close_prices(self, insts: list[Instrument]) -> dict[str, tuple[float, datetime, str]]:
+        """Официальная цена завершённой сессии; вечерняя имеет приоритет."""
+        if not insts:
+            return {}
+        cached_at, cached = self._close_cache
+        wanted = {i.ticker for i in insts}
+        if time.time() - cached_at < 300 and wanted.issubset(cached):
+            return {t: cached[t] for t in wanted}
+        d = await self._call("MarketDataService/GetClosePrices", {
+            "instruments": [{"instrumentId": i.uid} for i in insts]})
+        by_uid = {i.uid: i.ticker for i in insts}
+        out: dict[str, tuple[float, datetime, str]] = {}
+        for row in d.get("closePrices", []):
+            ticker = by_uid.get(row.get("instrumentUid")) or row.get("ticker")
+            if not ticker:
+                continue
+            options = []
+            for price_key, time_key, label in (
+                    ("price", "time", "закрытие основной сессии T‑Invest"),
+                    ("eveningSessionPrice", "eveningSessionPriceTime", "закрытие вечерней сессии T‑Invest")):
+                price, stamp = q2f(row.get(price_key)), row.get(time_key)
+                if price > 0 and stamp:
+                    options.append((datetime.fromisoformat(stamp.replace("Z", "+00:00")), price, label))
+            if options:
+                ts, price, label = max(options)
+                out[ticker] = (price, ts, label)
+        self._close_cache = (time.time(), out)
+        return out
 
-        Это сравнение котировок, а не доходность позиции из GetPortfolio.
-        Последнюю минуту до границы включаем; минуту после неё — никогда.
+    async def _account_ids(self) -> list[str]:
+        configured = config.TINKOFF_ACCOUNT_ID
+        if configured:
+            return [x.strip() for x in configured.split(",") if x.strip()]
+        cached_at, ids = self._accounts_cache
+        if time.time() - cached_at < 300:
+            return ids
+        d = await self._call("UsersService/GetAccounts", {"status": "ACCOUNT_STATUS_OPEN"})
+        ids = [str(a["id"]) for a in d.get("accounts", [])
+               if a.get("id") and a.get("status") in (None, "ACCOUNT_STATUS_OPEN")]
+        self._accounts_cache = (time.time(), ids)
+        return ids
+
+    async def portfolio_day_quotes(self) -> dict[str, PortfolioDayQuote]:
+        """Точная «за сегодня» по открытым позициям из GetPortfolio.
+
+        В отличие от восстановления по свечам, dailyYield учитывает расчётную
+        базу брокера. При нескольких счетах значения одной бумаги суммируются.
         """
-        local = (now or datetime.now(timezone.utc)).astimezone(_MSK)
-        cutoff = local.replace(hour=4, minute=0, second=0, microsecond=0)
-        if local < cutoff:
-            cutoff -= timedelta(days=1)
-        async with self._ref_locks.setdefault(inst.uid, asyncio.Lock()):
-            cached = self._day_refs.get(inst.uid)
-            if cached and cached.cutoff == cutoff:
-                return cached
-            async with self._ref_sem:
-                end = cutoff.astimezone(timezone.utc)
-                # Праздники: движемся назад целыми днями, не берём сегодняшние свечи.
-                for _ in range(10):
-                    start = end - timedelta(days=1)
-                    d = await self._call("MarketDataService/GetCandles", {
-                        "instrumentId": inst.uid, "interval": "CANDLE_INTERVAL_1_MIN",
-                        "from": start.isoformat(), "to": end.isoformat(),
-                        "candleSourceType": "CANDLE_SOURCE_EXCHANGE", "limit": 2400})
-                    points = []
-                    for c in d.get("candles", []):
-                        ts = datetime.fromisoformat(c["time"].replace("Z", "+00:00"))
-                        price = q2f(c.get("close"))
-                        if start <= ts and ts + timedelta(minutes=1) <= end and c.get("isComplete") and price > 0:
-                            points.append((ts, price))
-                    if points:
-                        ts, price = max(points)
-                        ref = DayReference(price, cutoff, ts)
-                        self._day_refs[inst.uid] = ref
-                        return ref
-                    end = start
-            return None
+        cached_at, cached = self._portfolio_cache
+        if time.time() - cached_at < 15:
+            return cached
+        ids = await self._account_ids()
+        if not ids:
+            return {}
+        replies = await asyncio.gather(*(
+            self._call("OperationsService/GetPortfolio", {
+                "accountId": account_id}) for account_id in ids),
+            return_exceptions=True)
+        totals: dict[str, list[float]] = {}
+        accounts: dict[str, set[str]] = {}
+        errors = []
+        for account_id, reply in zip(ids, replies):
+            if isinstance(reply, BaseException):
+                errors.append(reply)
+                continue
+            for p in reply.get("positions", []):
+                ticker = str(p.get("ticker") or "").upper()
+                if not ticker or "dailyYield" not in p:
+                    continue
+                quantity = q2f(p.get("quantity"))
+                price = q2f(p.get("currentPrice"))
+                daily_yield = q2f(p.get("dailyYield"))
+                # Для шортов знак и база зависят от маржинальной модели; не
+                # выдаём приблизительный процент за брокерский.
+                if quantity <= 0 or price <= 0:
+                    continue
+                row = totals.setdefault(ticker, [0.0, 0.0, 0.0])
+                row[0] += price * quantity       # текущая стоимость
+                row[1] += daily_yield            # дневной P/L
+                row[2] += quantity
+                accounts.setdefault(ticker, set()).add(account_id)
+        if errors:
+            # Частичная сумма по счетам выглядела бы правдоподобно, но могла
+            # бы не совпасть с общим экраном портфеля.
+            raise RuntimeError(f"GetPortfolio недоступен для {len(errors)} счёта(ов)")
+        out = {}
+        for ticker, (value, pnl, quantity) in totals.items():
+            base_value = value - pnl
+            if base_value <= 0 or quantity <= 0:
+                continue
+            out[ticker] = PortfolioDayQuote(
+                price=value / quantity,
+                change_pct=pnl / base_value * 100,
+                base_price=base_value / quantity,
+                quantity=quantity,
+                account_count=len(accounts[ticker]))
+        self._portfolio_cache = (time.time(), out)
+        return out
 
     async def last_trades(self, inst: Instrument, minutes: int = 10) -> list[Trade]:
         now = datetime.now(timezone.utc)

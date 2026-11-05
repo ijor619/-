@@ -134,16 +134,16 @@ class Monitor:
         thr = prof.threshold_pct
         if step == 0:
             what = f"вернулась внутрь ±{thr:g}%"
-        elif abs(step) > abs(prev_step):
-            what = f"прошла {'+' if step > 0 else '-'}{abs(step) * thr:g}%"
-        elif step > 0:
-            what = f"откатилась ниже +{(abs(step) + 1) * thr:g}%"
+        elif step > prev_step:
+            what = (f"прошла +{step * thr:g}%" if step > 0 else
+                    f"восстановилась выше -{(abs(step) + 1) * thr:g}%")
         else:
-            what = f"восстановилась выше -{(abs(step) + 1) * thr:g}%"
+            what = (f"прошла -{abs(step) * thr:g}%" if step < 0 else
+                    f"откатилась ниже +{(step + 1) * thr:g}%")
         return (
             f"{emoji} <b>{esc(q.info.ticker)}</b> — "
             f"<b>{fmt_price(q.price, q.info.decimals)} {cur}</b>\n"
-            f"{esc(q.info.name)}: <b>{fmt_pct(q.change_pct)}</b> к базе ниже — {what} "
+            f"{esc(q.info.name)}: <b>{fmt_pct(q.change_pct)}</b> — {what} "
             f"(шаг {thr:g}%)\n"
             + q.details()
         )

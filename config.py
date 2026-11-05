@@ -21,6 +21,11 @@ _load_dotenv()
 # --- Telegram ---
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
 
+# Необязательно: конкретный брокерский счёт для точной дневной доходности
+# позиции из GetPortfolio. Если пусто, позиции суммируются по всем открытым
+# счетам, как на общем экране портфеля T‑Invest.
+TINKOFF_ACCOUNT_ID: str = os.getenv("TINKOFF_ACCOUNT_ID", "").strip()
+
 # --- MOEX ISS API (бесплатный, без ключа) ---
 MOEX_BASE: str = "https://iss.moex.com/iss"
 # Основной торговый режим для акций (T+). Fallback'и для редких тикеров.
@@ -28,7 +33,7 @@ MOEX_BOARDS: tuple[str, ...] = ("TQBR", "TQDR", "SPEQ")
 
 # --- Мониторинг ---
 # Как часто (сек) опрашивать цены
-CHECK_INTERVAL_SEC: int = int(os.getenv("CHECK_INTERVAL_SEC", "30"))
+CHECK_INTERVAL_SEC: int = int(os.getenv("CHECK_INTERVAL_SEC", "60"))
 # Данные старше N минут считаем «рынок закрыт / нет торгов»
 FRESHNESS_MIN: int = 10
 # Кэш справочника ценных бумаг (сек)

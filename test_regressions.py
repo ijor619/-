@@ -13,11 +13,12 @@ from unittest.mock import AsyncMock, patch
 import clusters
 import flow
 import journal
+import keyboards
 import moex
 import tape
 import tinkoff
 from monitor import Monitor
-from screener import Sec
+from screener import Row, Sec, Screener
 from store import Store, UserProfile
 
 UTC = timezone.utc
@@ -101,16 +102,23 @@ class ClusterTests(TempCase):
         monitor = flow.FlowMonitor(None, None, None, None, cs)
         self.assertAlmostEqual(monitor.price_change("X", 5), -100 / 11)
 
-    def test_legacy_aggregate_backed_up_and_not_reused(self):
+    def test_legacy_aggregate_is_preserved_but_not_replayed(self):
         path = self.path / "clusters.json"
-        raw = {"X": {"2026-11-05T12:00": {"100": [10, 0, 2]}}}
+        minute = self.now.astimezone(clusters.MSK).strftime("%Y-%m-%dT%H:%M")
+        raw = {"X": {minute: {"100": [10, 0, 2]}}}
         path.write_text(json.dumps(raw))
         cs = self.store()
-        self.assertEqual(cs.data, {})
+        self.assertEqual(sum(c.n for c in cs.window("X", 60)), 2)
+        self.assertEqual(cs.ingest("X", [self.trade(100, seconds=-10)]), 0)
         self.assertEqual(json.loads(Path(str(path) + ".legacy-v1.bak").read_text()), raw)
-        cs.ingest("X", [self.trade()])
         cs.save(force=True)
         self.assertEqual(json.loads(path.read_text())["version"], 2)
+
+    def test_mixed_legacy_and_new_cells_do_not_invent_price_change(self):
+        old = clusters.Cell(self.now.astimezone(clusters.MSK).replace(tzinfo=None), 100, 10, 0, 2)
+        new = clusters.Cell(old.minute + timedelta(minutes=1), 110, 5, 0, 1,
+                            self.now.timestamp(), self.now.timestamp())
+        self.assertEqual(clusters.price_endpoints([old, new]), (0, 0))
 
     def test_expired_fingerprints_do_not_allow_replays(self):
         cs = self.store()
@@ -262,41 +270,6 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
     def inst(self):
         return tinkoff.Instrument("RUAL", "uid", "figi", 10, "РУСАЛ")
 
-    def candle(self, ts, price, complete=True):
-        return {"time": ts, "close": {"units": str(int(price)), "nano": round((price % 1) * 1e9)}, "isComplete": complete}
-
-    async def test_0400_reference_excludes_later_and_incomplete_candles(self):
-        tk = tinkoff.TinkoffClient()
-        tk._call = AsyncMock(return_value={"candles": [
-            self.candle("2026-11-05T00:59:00Z", 23.085),
-            self.candle("2026-11-05T01:00:00Z", 30),
-            self.candle("2026-11-05T00:59:30Z", 31, False)]})
-        now = datetime(2026, 11, 5, 18, tzinfo=UTC)
-        ref = await tk.daily_reference(self.inst(), now)
-        self.assertAlmostEqual(ref.price, 23.085)
-        self.assertEqual(ref.cutoff.hour, 4)
-        body = tk._call.call_args.args[1]
-        self.assertEqual(datetime.fromisoformat(body["to"]), ref.cutoff)
-        self.assertEqual(body["candleSourceType"], "CANDLE_SOURCE_EXCHANGE")
-        await tk.daily_reference(self.inst(), now)
-        self.assertEqual(tk._call.await_count, 1)
-
-    async def test_holiday_search_and_0400_rollover(self):
-        tk = tinkoff.TinkoffClient()
-        tk._call = AsyncMock(side_effect=[{"candles": []}, {"candles": [self.candle("2026-11-03T20:00:00Z", 23.085)]}])
-        ref = await tk.daily_reference(self.inst(), datetime(2026, 11, 5, 18, tzinfo=UTC))
-        self.assertEqual(ref.candle_time.day, 3)
-        tk._call = AsyncMock(return_value={"candles": [self.candle("2026-11-05T20:00:00Z", 24)]})
-        ref2 = await tk.daily_reference(self.inst(), datetime(2026, 11, 6, 2, tzinfo=UTC))
-        self.assertEqual(ref2.cutoff.day, 6)
-        self.assertEqual(ref2.price, 24)
-
-    async def test_before_0400_uses_previous_boundary(self):
-        tk = tinkoff.TinkoffClient()
-        tk._call = AsyncMock(return_value={"candles": [self.candle("2026-11-04T00:59:00Z", 23)]})
-        ref = await tk.daily_reference(self.inst(), datetime(2026, 11, 5, 0, tzinfo=UTC))
-        self.assertEqual(ref.cutoff.day, 4)
-
     async def test_unknown_trade_side_is_not_a_sell(self):
         tk = tinkoff.TinkoffClient()
         trade = {"time": "2026-11-05T12:00:00Z", "price": {"units": "100"}, "quantity": "5"}
@@ -311,28 +284,117 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         ob = await tk.order_book(self.inst())
         self.assertEqual(ob.ts, datetime(2026, 11, 5, 12, tzinfo=UTC))
 
+    async def test_orderbook_without_timestamp_still_opens(self):
+        tk = tinkoff.TinkoffClient()
+        tk._call = AsyncMock(return_value={
+            "bids": [{"price": {"units": "100"}, "quantity": "10"}],
+            "asks": [{"price": {"units": "101"}, "quantity": "7"}]})
+        before = datetime.now(UTC)
+        ob = await tk.order_book(self.inst())
+        self.assertIsNotNone(ob)
+        self.assertGreaterEqual(ob.ts, before)
+
     async def test_quote_screenshot_math_and_explicit_basis(self):
         tk = tinkoff.TinkoffClient()
         tk.instrument = AsyncMock(return_value=self.inst())
         tk.last_prices = AsyncMock(return_value={"RUAL": (23.88, datetime.now(UTC))})
-        tk.daily_reference = AsyncMock(return_value=tinkoff.DayReference(23.085, datetime(2026, 11, 5, 4, tzinfo=moex.MSK), datetime(2026, 11, 3, 20, tzinfo=UTC)))
+        tk.portfolio_day_quotes = AsyncMock(return_value={
+            "RUAL": tinkoff.PortfolioDayQuote(23.88, 3.4437946740, 23.085, 5800, 1)})
+        tk.close_prices = AsyncMock(return_value={})
         info = moex.SecurityInfo("RUAL", "РУСАЛ", "TQBR", "SUR", 3, 23.27, "2026-11-03")
         q = (await moex.fetch_quotes(None, {"RUAL": info}, {}, tk))["RUAL"]
         self.assertAlmostEqual(q.change_pct, 3.4437946740, places=6)
+        self.assertEqual(q.price, 23.88)
+        self.assertEqual(q.reference_kind, "portfolio")
         self.assertEqual(info.prev_close, 23.27)
-        self.assertIn("04:00", q.details())
+        self.assertIn("позиция T‑Invest", q.details())
         self.assertIn("цена на", q.details())
 
-    async def test_reference_failure_keeps_live_price_and_labels_fallback(self):
+    async def test_portfolio_failure_uses_official_close_not_candle_guess(self):
         tk = tinkoff.TinkoffClient()
         tk.instrument = AsyncMock(return_value=self.inst())
-        tk.last_prices = AsyncMock(return_value={"RUAL": (23.955, datetime.now(UTC))})
-        tk.daily_reference = AsyncMock(side_effect=RuntimeError("offline"))
+        tk.last_prices = AsyncMock(return_value={"RUAL": (23.88, datetime.now(UTC))})
+        tk.portfolio_day_quotes = AsyncMock(side_effect=RuntimeError("offline"))
+        tk.close_prices = AsyncMock(return_value={
+            "RUAL": (24.0, datetime(2026, 11, 4, 20, tzinfo=UTC), "закрытие вечерней сессии T‑Invest")})
         info = moex.SecurityInfo("RUAL", "РУСАЛ", "TQBR", "SUR", 3, 23.27, "2026-11-03")
         q = (await moex.fetch_quotes(None, {"RUAL": info}, {}, tk))["RUAL"]
-        self.assertAlmostEqual(q.change_pct, 2.9437043403)
-        self.assertIn("база 04:00 недоступна", q.details())
-        self.assertIn("T‑Invest", q.source)
+        self.assertAlmostEqual(q.change_pct, -0.5)
+        self.assertEqual(q.reference_price, 24.0)
+        self.assertEqual(q.reference_kind, "tinvest_close")
+        self.assertNotIn("04:00", q.details())
+
+    async def test_portfolio_daily_yield_reproduces_plzl_minus_half_percent(self):
+        tk = tinkoff.TinkoffClient()
+        response = {"positions": [{
+            "ticker": "PLZL", "quantity": {"units": "100"},
+            "currentPrice": {"units": "1067", "nano": 200_000_000},
+            "dailyYield": {"units": "-536"}}]}
+        tk._call = AsyncMock(return_value=response)
+        with patch.object(tinkoff.config, "TINKOFF_ACCOUNT_ID", "account-1"):
+            result = await tk.portfolio_day_quotes()
+        quote = result["PLZL"]
+        self.assertEqual(quote.price, 1067.2)
+        self.assertAlmostEqual(quote.base_price, 1072.56)
+        self.assertAlmostEqual(quote.change_pct, -0.49973894, places=6)
+        method, body = tk._call.call_args.args
+        self.assertEqual(method, "OperationsService/GetPortfolio")
+        self.assertEqual(body, {"accountId": "account-1"})
+
+    async def test_portfolio_aggregates_same_ticker_across_accounts(self):
+        tk = tinkoff.TinkoffClient()
+        tk._account_ids = AsyncMock(return_value=["a", "b"])
+        one = {"positions": [{"ticker": "PLZL", "quantity": {"units": "50"},
+                               "currentPrice": {"units": "1067", "nano": 200_000_000},
+                               "dailyYield": {"units": "-268"}}]}
+        tk._call = AsyncMock(side_effect=[one, one])
+        quote = (await tk.portfolio_day_quotes())["PLZL"]
+        self.assertEqual(quote.quantity, 100)
+        self.assertEqual(quote.account_count, 2)
+        self.assertAlmostEqual(quote.base_price, 1072.56)
+
+    async def test_portfolio_rejects_partial_account_result(self):
+        tk = tinkoff.TinkoffClient()
+        tk._account_ids = AsyncMock(return_value=["a", "b"])
+        one = {"positions": [{"ticker": "PLZL", "quantity": {"units": "50"},
+                               "currentPrice": {"units": "1067"},
+                               "dailyYield": {"units": "-250"}}]}
+        tk._call = AsyncMock(side_effect=[one, RuntimeError("account unavailable")])
+        with self.assertRaisesRegex(RuntimeError, "1 счёта"):
+            await tk.portfolio_day_quotes()
+
+    async def test_candle_guess_is_never_used_for_portfolio_percentage(self):
+        tk = tinkoff.TinkoffClient()
+        tk.instrument = AsyncMock(return_value=self.inst())
+        tk.last_prices = AsyncMock(return_value={"RUAL": (1067.2, datetime.now(UTC))})
+        tk.portfolio_day_quotes = AsyncMock(return_value={
+            "RUAL": tinkoff.PortfolioDayQuote(1067.2, -0.5, 1072.56, 100, 1)})
+        tk.close_prices = AsyncMock(return_value={})
+        info = moex.SecurityInfo("RUAL", "РУСАЛ", "TQBR", "SUR", 1, 1031.6, "2026-11-03")
+        q = (await moex.fetch_quotes(None, {"RUAL": info}, {}, tk))["RUAL"]
+        self.assertEqual(q.change_pct, -0.5)
+
+    async def test_get_close_prices_prefers_later_evening_session(self):
+        tk = tinkoff.TinkoffClient()
+        tk._call = AsyncMock(return_value={"closePrices": [{
+            "instrumentUid": "uid", "price": {"units": "1050"},
+            "time": "2026-11-04T15:45:00Z",
+            "eveningSessionPrice": {"units": "1072", "nano": 600_000_000},
+            "eveningSessionPriceTime": "2026-11-04T20:49:00Z"}]})
+        price, ts, label = (await tk.close_prices([self.inst()]))["RUAL"]
+        self.assertEqual(price, 1072.6)
+        self.assertEqual(ts, datetime(2026, 11, 4, 20, 49, tzinfo=UTC))
+        self.assertIn("вечерней", label)
+        await tk.close_prices([self.inst()])
+        self.assertEqual(tk._call.await_count, 1)
+
+    async def test_empty_hint_range_continues_searching_older_moex_candle(self):
+        row = [100, 101, 102, 99, 1000, 10,
+               "2026-11-04 18:49:00", "2026-11-04 18:50:00"]
+        with patch("moex._candles", AsyncMock(side_effect=[[], [row]])) as candles:
+            got = await moex.get_last_candle(None, "X", "TQBR", moex.now_msk())
+        self.assertEqual(got, row)
+        self.assertEqual(candles.await_count, 2)
 
 
 class MonitorTests(unittest.IsolatedAsyncioTestCase):
@@ -371,11 +433,108 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
         p.threshold_pct = 1
         self.assertIn("выше -3%", Monitor._alert_text(q, p, -2, -3))
 
-    async def test_stale_screener_price_is_not_refreshed_by_poll_time(self):
-        s = Sec("X", "X", "uid", 100, 1e8, last=110, last_ts=time.time() - 200)
-        self.assertIsNone(s.change("1d"))
-        s.hist.append((time.time() - 86400, 100))
-        self.assertIsNone(s.price_at(900))
+    async def test_crossing_from_plus_to_minus_keeps_real_direction(self):
+        info = moex.SecurityInfo("X", "X", "TQBR", "SUR", 2, 100, "today")
+        p = UserProfile()
+        p.threshold_pct = 1
+        down = moex.Quote(info, 99, moex.now_msk(), -1.1, True)
+        up = moex.Quote(info, 101, moex.now_msk(), 1.1, True)
+        self.assertIn("прошла -1%", Monitor._alert_text(down, p, -1, 1))
+        self.assertIn("прошла +1%", Monitor._alert_text(up, p, 1, -1))
+
+    async def test_closed_market_screener_keeps_last_real_snapshot(self):
+        end = time.time() - 3600
+        s = Sec("X", "X", "uid", 100, 1e8, last=110, last_ts=end)
+        for minutes in range(300, -1, -5):
+            s.hist.append((end - minutes * 60, 100 + (300 - minutes) / 300 * 10))
+        self.assertAlmostEqual(s.change("1d"), 10)
+        self.assertIsNotNone(s.change("15m"))
+        self.assertIsNotNone(s.change("30m"))
+        self.assertIsNotNone(s.change("1h"))
+        self.assertIsNotNone(s.change("4h"))
+
+    async def test_screener_warmup_restores_last_price(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tk = tinkoff.TinkoffClient()
+            begin = datetime.now(moex.MSK).replace(tzinfo=None) - timedelta(minutes=10)
+            tk.candles = AsyncMock(return_value=[
+                tinkoff.TCandle(begin, 99, 101, 98, 100, 5, True)])
+            scr = Screener(tk, tmp)
+            sec = Sec("X", "X", "uid", 90, 1e8)
+            await scr._warm_up([sec])
+            self.assertEqual(sec.last, 100)
+            self.assertGreater(sec.last_ts, 0)
+
+
+class ButtonTests(unittest.TestCase):
+    def test_every_generated_callback_has_a_handler_and_fits_telegram_limit(self):
+        markups = [
+            keyboards.report_kb(["SBER", "RUAL"]), keyboards.alert_kb("SBER", True),
+            keyboards.flow_kb("SBER"), keyboards.setup_kb("SBER"),
+            keyboards.book_kb("SBER"), keyboards.tape_kb("SBER"),
+            keyboards.cluster_kb("SBER", "4h"), keyboards.chart_kb("SBER", "5m", ["RUAL"]),
+            keyboards.screener_kb("4h", False, ["SBER", "RUAL"]),
+            keyboards.scr_pick_kb("SBER", False),
+        ]
+        exact = {"refresh", "settings", "noop", "flow:off", "chart:close", "msg:close", "scr:close"}
+        prefixes = ("chart:", "book:", "tape:", "clu:", "setup:", "cscalp:",
+                    "scr:", "watch:", "unwatch:", "pick:")
+        callbacks = [b.callback_data for kb in markups for row in kb.inline_keyboard
+                     for b in row if b.callback_data]
+        self.assertTrue(callbacks)
+        for value in callbacks:
+            self.assertLessEqual(len(value.encode()), 64)
+            self.assertTrue(value in exact or value.startswith(prefixes), value)
+
+
+class ButtonTransitionTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        import bot as bot_module
+        self.mod = bot_module
+        self.mod._scr_msg.clear()
+
+    async def test_screener_photo_to_empty_text_replaces_old_message(self):
+        current = SimpleNamespace(photo=[object()], message_id=7,
+                                  delete=AsyncMock(), edit_text=AsyncMock())
+        sent = SimpleNamespace(message_id=8)
+        client = SimpleNamespace(send_message=AsyncMock(return_value=sent),
+                                 delete_message=AsyncMock())
+        scr = SimpleNamespace(secs={"X": object()}, rows=lambda *_: ([], [], 0),
+                              status_text=lambda: "цена на 18:50 МСК")
+        await self.mod.show_screener(client, 1, scr, "4h", current=current)
+        current.delete.assert_awaited_once()
+        client.send_message.assert_awaited_once()
+        self.assertEqual(self.mod._scr_msg[1], 8)
+
+    async def test_screener_text_to_photo_replaces_old_message(self):
+        current = SimpleNamespace(photo=[], message_id=7,
+                                  delete=AsyncMock(), edit_media=AsyncMock())
+        sent = SimpleNamespace(message_id=9)
+        client = SimpleNamespace(send_photo=AsyncMock(return_value=sent),
+                                 delete_message=AsyncMock())
+        row = Row("X", "X", 1.0, 101.0, 2, 1e8)
+        scr = SimpleNamespace(secs={"X": object()}, rows=lambda *_: ([row], [], 1))
+        with patch("screener.render_png", return_value=b"png"):
+            await self.mod.show_screener(client, 1, scr, "15m", current=current)
+        current.delete.assert_awaited_once()
+        client.send_photo.assert_awaited_once()
+        self.assertEqual(self.mod._scr_msg[1], 9)
+
+
+class FlowSourceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_day_context_uses_moex_without_extra_broker_candle_calls(self):
+        tk = SimpleNamespace(candles=AsyncMock())
+        mon = flow.FlowMonitor(None, None, tk, None)
+        info = moex.SecurityInfo("X", "X", "TQBR", "SUR", 2, 100, "2026-11-05")
+        mon._info = AsyncMock(return_value=info)
+        today = moex.now_msk().strftime("%Y-%m-%d")
+        row = [100, 101, 102, 99, 1000, 10,
+               f"{today} 10:00:00", f"{today} 10:01:00"]
+        with patch("moex._candles", AsyncMock(return_value=[row])), \
+                patch("moex.prev_day_hl", AsyncMock(return_value=(105, 95))):
+            stats = await mon._daystats(None, "X")
+        self.assertEqual((stats.high, stats.low, stats.vwap), (102, 99, 100))
+        tk.candles.assert_not_awaited()
 
 
 if __name__ == "__main__":

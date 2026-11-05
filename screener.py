@@ -94,19 +94,25 @@ class Sec:
     def price_at(self, ago_sec: float) -> Optional[float]:
         """Цена «ago_sec назад»: последний сэмпл не позже целевого момента.
         Если история не дотягивается (после рестарта / ночной разрыв) — None."""
-        target = time.time() - ago_sec
+        # Окно заканчивается временем последней сделки. Иначе через 90 секунд
+        # без сделок, после закрытия или на выходных вся история внезапно
+        # «протухает», хотя данные остаются корректными на момент закрытия.
+        anchor = self.last_ts or (self.hist[-1][0] if self.hist else 0.0)
+        if not anchor:
+            return None
+        target = anchor - ago_sec
         best, best_ts = None, 0.0
         for ts, p in self.hist:
             if ts <= target:
                 best, best_ts = p, ts
             else:
                 break
-        if best is None or target - best_ts > 5 * 60:
+        if best is None or target - best_ts > max(10 * 60, 3 * POLL_SEC):
             return None
         return best
 
     def change(self, win: str) -> Optional[float]:
-        if not self.last or not 0 <= time.time() - self.last_ts <= 90:
+        if not self.last or not self.last_ts:
             return None
         if win == "1d":
             if self.prev_close <= 0:
@@ -253,6 +259,8 @@ class Screener:
             s.hist.clear()
             for p in sorted(dict(pts + existing).items()):
                 s.hist.append(p)
+            if s.hist and s.hist[-1][0] >= s.last_ts:
+                s.last_ts, s.last = s.hist[-1]
         await asyncio.gather(*(one(s) for s in secs))
         self._warm = True
 
@@ -274,7 +282,8 @@ class Screener:
                         hist[ts] = price
                         s.hist.clear()
                         s.hist.extend(sorted(hist.items()))
-        self.updated = now_msk()
+        latest = max((s.last_ts for s in secs), default=0.0)
+        self.updated = datetime.fromtimestamp(latest, _MSK) if latest else None
 
     # ------------------------------------------------------------ объём
     async def poll_volumes(self) -> None:
@@ -307,13 +316,24 @@ class Screener:
         await asyncio.sleep(3)
         while True:
             try:
+                refresh_error = ""
                 if time.time() - self._universe_ts > UNIVERSE_TTL:
-                    await self.refresh_universe(session)
+                    try:
+                        await self.refresh_universe(session)
+                    except Exception as e:
+                        # Сохраняем прежнюю вселенную и всё равно обновляем
+                        # её цены. Иначе один сбой справочника раз в час
+                        # полностью замораживал скринер и все его кнопки.
+                        refresh_error = f"справочник: {e}"[:200]
+                        log.warning("screener universe: %s", e)
+                # GetLastPrices нужен и после закрытия: он восстанавливает
+                # последний снимок после рестарта, не создавая новую цену.
+                await self.poll_prices()
                 if trading_time():
-                    await self.poll_prices()
                     if time.time() - self._vol_ts > VOL_POLL_SEC:
                         await self.poll_volumes()
-                self.error = ""
+                if self.secs:
+                    self.error = refresh_error
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -352,7 +372,7 @@ class Screener:
         if not self.secs:
             return "вселенная ещё не загружена"
         upd = self.updated.strftime("%H:%M:%S") if self.updated else "—"
-        s = f"{len(self.secs)} бумаг, оборот ≥ {MIN_TURNOVER / 1e6:.0f} млн ₽, обновлено {upd} МСК"
+        s = f"{len(self.secs)} бумаг, оборот ≥ {MIN_TURNOVER / 1e6:.0f} млн ₽, цена на {upd} МСК"
         if self.error:
             s += f"\n⚠️ {self.error}"
         return s
@@ -378,13 +398,13 @@ def format_screener(scr: Screener, win: str, esc, only: Optional[set] = None) ->
     head = (f"🔎 <b>Скринер MOEX — {esc(title)}</b>\n" if win == VOL_WIN
             else f"🔎 <b>Скринер MOEX — изменение за {esc(title)}</b>\n")
     if win == "1d":
-        head += "<i>База скринера: официальное закрытие MOEX; это другой период, чем «до 04:00» в списке и алертах.</i>\n"
+        head += "<i>База скринера: официальное закрытие MOEX; это отдельный рыночный расчёт.</i>\n"
     if only is not None:
         head += "<i>только мои бумаги</i>\n"
     if not scr.secs:
         return head + "\n⏳ Загружаю список бумаг… попробуй через минуту."
     if n == 0:
-        why = ("рынок закрыт или история ещё не набрана" if win != "1d"
+        why = ("история этого окна ещё не набрана" if win != "1d"
                else "нет данных о ценах")
         return head + f"\n😴 Нет данных по окну {esc(title)}: {esc(why)}.\n\n<i>{esc(scr.status_text())}</i>"
 

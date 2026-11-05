@@ -72,6 +72,8 @@ class Cell:
 
 def price_endpoints(cells: list[Cell]) -> tuple[float, float]:
     """Цены первой и последней сделки, независимо от сортировки уровней."""
+    if any(not c.first_ts or not c.last_ts for c in cells):
+        return 0.0, 0.0  # часть старой истории не содержит порядка сделок
     timed = [c for c in cells if c.first_ts and c.last_ts]
     if not timed:
         return 0.0, 0.0  # старые агрегаты не содержат порядка сделок
@@ -110,12 +112,36 @@ class ClusterStore:
             elif "version" in raw:
                 raise ValueError("Неизвестная версия clusters.json")
             else:
-                # Старые суммы не позволяют восстановить порядок и дубли.
+                # Старые суммы не содержат порядка сделок, но их можно
+                # сохранить для объёмов/POC. Закрываем весь уже накопленный
+                # диапазон floor-меткой, чтобы часовой backfill не добавил
+                # те же сделки повторно после обновления.
                 backup = self.path + ".legacy-v1.bak"
                 if not os.path.exists(backup):
                     shutil.copy2(self.path, backup)
+                converted: dict[str, dict[str, dict[str, list]]] = {}
+                floors: dict[str, float] = {}
+                for ticker, minutes in raw.items():
+                    if not isinstance(minutes, dict):
+                        raise ValueError(f"Некорректная история кластеров: {ticker}")
+                    dst_minutes = {}
+                    for minute, prices in minutes.items():
+                        if not isinstance(prices, dict):
+                            raise ValueError(f"Некорректная минута кластеров: {ticker} {minute}")
+                        dst_prices = {}
+                        for price, cell in prices.items():
+                            if not isinstance(cell, list) or len(cell) < 3:
+                                raise ValueError(f"Некорректная ячейка кластеров: {ticker} {minute} {price}")
+                            dst_prices[price] = [int(cell[0]), int(cell[1]), int(cell[2]), 0.0, 0.0]
+                        dst_minutes[minute] = dst_prices
+                    if dst_minutes:
+                        latest = datetime.strptime(max(dst_minutes), "%Y-%m-%dT%H:%M").replace(tzinfo=MSK)
+                        floors[ticker] = (latest + timedelta(minutes=1)).timestamp()
+                    converted[ticker] = dst_minutes
+                self.data = converted
+                self._floor = floors
                 self._dirty = True
-                log.warning("clusters: старый агрегат сохранён в %s; начинается новый", backup)
+                log.warning("clusters: старый агрегат сохранён в %s и перенесён без повторного backfill", backup)
             log.info("clusters: загружено %d бумаг из %s", len(self.data), self.path)
         except FileNotFoundError:
             pass
@@ -213,7 +239,12 @@ class ClusterStore:
             if mk < frm or mk > now.strftime("%Y-%m-%dT%H:%M"):
                 continue
             m = datetime.strptime(mk, "%Y-%m-%dT%H:%M")
-            for pk, (b, s, n, first_ts, last_ts) in prices.items():
+            for pk, values in prices.items():
+                if len(values) >= 5:
+                    b, s, n, first_ts, last_ts = values[:5]
+                else:  # защита при ручном восстановлении старого файла
+                    b, s, n = values[:3]
+                    first_ts = last_ts = 0.0
                 out.append(Cell(m, float(pk), b, s, n, first_ts, last_ts))
         out.sort(key=lambda c: (c.minute, c.price))
         return out
@@ -387,8 +418,7 @@ def cluster_text(an: Optional[Analysis], ticker: str, window: str, name: str,
                 f"Лента копится с {started:%d.%m %H:%M} МСК по бумагам из списка "
                 f"(/watch {esc(ticker)}), плюс последний час подгружается при запросе.")
     d = an.decimals
-    chg = (an.last - an.first) / an.first * 100 if an.first else 0.0
-    sign = "+" if chg >= 0 else ""
+    chg = (an.last - an.first) / an.first * 100 if an.first else None
     verdict = ("перевес покупателей" if an.buy_pct >= 58 else
                "перевес продавцов" if an.buy_pct <= 42 else "баланс")
     lines = [
@@ -399,14 +429,18 @@ def cluster_text(an: Optional[Analysis], ticker: str, window: str, name: str,
         f"Покупки {fmt_n(an.buy)} / продажи {fmt_n(an.sell)} · "
         f"дельта <b>{'+' if an.delta >= 0 else ''}{fmt_n(an.delta)}</b>",
         f"{_bar(an.buy_pct)} {an.buy_pct:.0f}% покупок — <b>{verdict}</b>",
-        f"Цена {fmt_price(an.first, d)} → {fmt_price(an.last, d)} ({sign}{chg:.2f}%)",
         f"POC {fmt_price(an.poc, d)}–{fmt_price(an.poc + an.step, d)} · "
         f"зона 70%: {fmt_price(an.va_lo, d)}–{fmt_price(an.va_hi, d)}",
     ]
+    if chg is None:
+        lines.insert(6, "Цена: точное изменение появится после обновления старой истории сделок")
+    else:
+        sign = "+" if chg >= 0 else ""
+        lines.insert(6, f"Цена {fmt_price(an.first, d)} → {fmt_price(an.last, d)} ({sign}{chg:.2f}%)")
     # расхождение цена/дельта — самое интересное
-    if an.delta > 0 and chg < -0.15 and an.buy_pct >= 55:
+    if chg is not None and an.delta > 0 and chg < -0.15 and an.buy_pct >= 55:
         lines.append("⚠️ Покупают по рынку, а цена падает — покупки поглощаются лимитными продавцами.")
-    elif an.delta < 0 and chg > 0.15 and an.buy_pct <= 45:
+    elif chg is not None and an.delta < 0 and chg > 0.15 and an.buy_pct <= 45:
         lines.append("⚠️ Продают по рынку, а цена растёт — продажи поглощаются лимитными покупателями.")
 
     # крупнейшие кластеры по цене

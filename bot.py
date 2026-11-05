@@ -348,7 +348,7 @@ async def cmd_alert(m: Message, store: Store) -> None:
     p = store.get(m.from_user.id)
     p.threshold_pct = v
     store.save()
-    await m.answer(f"🔔 Порог алерта: {v:g}%. С T‑Invest база — последняя биржевая цена до 04:00 МСК; резерв — официальное закрытие MOEX. База подписана в каждом алерте.")
+    await m.answer(f"🔔 Порог алерта: {v:g}%. Для позиции берётся дневная доходность GetPortfolio; для бумаги вне портфеля — опубликованное закрытие T‑Invest. База подписана в каждом алерте.")
 
 
 @router.message(Command("quiet"))
@@ -507,15 +507,23 @@ async def _send_clusters(bot: Bot, chat_id: int, sess, tk, cstore, t: str, windo
     text, png = await _cluster_view(sess, tk, cstore, t, window)
     kb = cluster_kb(t, window)
     if png:
+        # Telegram ограничивает caption 1024 символами. Не режем HTML
+        # посередине <pre>: таблицы уже есть на самой картинке.
+        caption = text.split("\n<b>Крупнейшие кластеры</b>", 1)[0]
         media = InputMediaPhoto(media=BufferedInputFile(png, f"{t}_clusters_{window}.png"),
-                                caption=text[:1024])
+                                caption=caption[:1024])
         if current is not None and current.photo:
             try:
                 await current.edit_media(media, reply_markup=kb); return
             except TelegramBadRequest as e:
                 if "not modified" in str(e): return
                 log.warning("clusters edit_media %s: %s", t, e)
-        await bot.send_photo(chat_id, media.media, caption=text[:1024], reply_markup=kb,
+        if current is not None:
+            try:
+                await current.delete()
+            except Exception:
+                pass
+        await bot.send_photo(chat_id, media.media, caption=caption[:1024], reply_markup=kb,
                              reply_to_message_id=reply_to)
         return
     if current is not None and not current.photo:
@@ -523,6 +531,11 @@ async def _send_clusters(bot: Bot, chat_id: int, sess, tk, cstore, t: str, windo
             await current.edit_text(text, reply_markup=kb); return
         except TelegramBadRequest as e:
             if "not modified" in str(e): return
+    if current is not None:
+        try:
+            await current.delete()
+        except Exception:
+            pass
     await bot.send_message(chat_id, text, reply_markup=kb, reply_to_message_id=reply_to)
 
 
@@ -616,7 +629,7 @@ async def _setup_text(sess, tk: tinkoff.TinkoffClient, cstore: clu.ClusterStore,
         cells, dec, inst.lot, flow.recent_signals(t), rs15, rsd)
     cov = cstore.coverage(t)
     text = stp.setup_text(s, name, dec)
-    text += "\n<i>Дневной контекст сетапа — к официальному закрытию MOEX; VWAP — оценка по минутным свечам T‑Invest.</i>"
+    text += "\n<i>Дневной контекст сетапа — к официальному закрытию MOEX; H/L и VWAP — по минутным свечам MOEX.</i>"
     try:
         ml = market.line(await market.snapshot(sess))
         if ml:
@@ -767,12 +780,18 @@ async def show_screener(bot: Bot, chat_id: int, scr: scrmod.Screener, win: str,
         if current is not None and not current.photo:
             try:
                 await current.edit_text(text, reply_markup=kb); return
-            except TelegramBadRequest:
-                pass
+            except TelegramBadRequest as e:
+                if "not modified" in str(e):
+                    return
         old = _scr_msg.pop(chat_id, None)
-        if old:
+        if old and (current is None or old != current.message_id):
             try:
                 await bot.delete_message(chat_id, old)
+            except Exception:
+                pass
+        if current is not None:
+            try:
+                await current.delete()
             except Exception:
                 pass
         m = await bot.send_message(chat_id, text, reply_markup=kb)
@@ -782,8 +801,26 @@ async def show_screener(bot: Bot, chat_id: int, scr: scrmod.Screener, win: str,
         png = await asyncio.to_thread(scrmod.render_png, scr, win, only)
     except Exception as e:
         log.exception("screener render")
-        await bot.send_message(chat_id, scrmod.format_screener(scr, win, esc, only) +
-                               f"\n<i>(картинка недоступна: {esc(e)})</i>", reply_markup=kb)
+        text = (scrmod.format_screener(scr, win, esc, only) +
+                f"\n<i>(картинка недоступна: {esc(e)})</i>")
+        if current is not None and not current.photo:
+            try:
+                await current.edit_text(text, reply_markup=kb); return
+            except TelegramBadRequest:
+                pass
+        old = _scr_msg.pop(chat_id, None)
+        if old and (current is None or old != current.message_id):
+            try:
+                await bot.delete_message(chat_id, old)
+            except Exception:
+                pass
+        if current is not None:
+            try:
+                await current.delete()
+            except Exception:
+                pass
+        m = await bot.send_message(chat_id, text, reply_markup=kb)
+        _scr_msg[chat_id] = m.message_id
         return
     file = BufferedInputFile(png, f"screener_{win}.png")
     caption = f"🔎 Скринер MOEX — {scrmod.WINDOW_TITLES[win]}" + (" · мои бумаги" if mine else "")
@@ -796,12 +833,12 @@ async def show_screener(bot: Bot, chat_id: int, scr: scrmod.Screener, win: str,
                 return
             log.warning("screener edit_media: %s", e)
     old = _scr_msg.pop(chat_id, None)
-    if old:
+    if old and (current is None or old != current.message_id):
         try:
             await bot.delete_message(chat_id, old)
         except Exception:
             pass
-    if current is not None and not current.photo:
+    if current is not None:
         try:
             await current.delete()
         except Exception:
@@ -873,8 +910,13 @@ async def cb_scr(c: CallbackQuery, scr: scrmod.Screener, store: Store) -> None:
     win = parts[1]
     flags = set(parts[2:])
     await c.answer("Обновляю…" if "r" in flags else None)
-    await show_screener(c.bot, c.message.chat.id, scr, win, current=c.message,
-                        mine="my" in flags, watchlist=store.get(c.from_user.id).watchlist)
+    try:
+        await show_screener(c.bot, c.message.chat.id, scr, win, current=c.message,
+                            mine="my" in flags, watchlist=store.get(c.from_user.id).watchlist)
+    except Exception as e:
+        log.exception("screener button %s", win)
+        await c.bot.send_message(c.message.chat.id,
+                                 f"⚠️ Не удалось обновить скринер: <code>{esc(e)}</code>")
 
 
 # ------------------------------------------------------------ рынок/календарь

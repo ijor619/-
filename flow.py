@@ -146,11 +146,15 @@ class FlowMonitor:
     async def _info(self, sess, t: str) -> Optional[moex.SecurityInfo]:
         if t not in self._infos or time.time() - self._infos_ts.get(t, 0) >= 300:
             try:
-                self._infos[t] = await moex.get_security_info(sess, t)
-                self._infos_ts[t] = time.time()
+                fresh = await moex.get_security_info(sess, t)
+                if fresh is not None:
+                    self._infos[t] = fresh
+                    self._infos_ts[t] = time.time()
             except Exception:
-                return None
-        return self._infos[t]
+                # Временный сбой MOEX не должен ломать кнопки сетапа и
+                # графика, если справочник уже был успешно загружен.
+                return self._infos.get(t)
+        return self._infos.get(t)
 
     async def _daystats(self, sess, t: str) -> DayStats:
         ds = self._day.setdefault(t, DayStats())
@@ -164,12 +168,10 @@ class FlowMonitor:
             return ds
         try:
             day0 = now_msk().replace(hour=0, minute=0, second=0, microsecond=0)
-            inst = await self.tk.instrument(t)
-            candles = await self.tk.candles(inst, 1, now_msk() - day0) if inst else []
-            # Тот же источник, что и лента; VWAP по минутным свечам — оценка.
-            rows = [[c.open, c.close, c.high, c.low,
-                     (c.high + c.low + c.close) / 3 * c.volume, c.volume,
-                     c.begin.isoformat()] for c in candles if c.begin >= day0]
+            # Дневные H/L и VWAP не требуют брокерского API. ISS снимает
+            # лишнюю нагрузку с T-Invest и не мешает кнопкам стакана/ленты.
+            rows = await moex._candles(sess, t, info.board, day0)
+            rows = [r for r in rows if r[6][:10] == day0.strftime("%Y-%m-%d")]
             if rows:
                 ds.high = max(float(r[2]) for r in rows)
                 ds.low = min(float(r[3]) for r in rows)
