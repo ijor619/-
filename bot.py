@@ -52,7 +52,7 @@ from store import Store
 
 log = logging.getLogger(__name__)
 
-BUILD_VERSION = "4.3.0-decision-system-2026-11-07"
+BUILD_VERSION = "4.3.1-paper-trading-2026-11-07"
 
 router = Router(name="stockbot")
 
@@ -110,6 +110,7 @@ HELP = (
     "/why [SBER] — почему есть идея или чего не хватает\n"
     "/plan [SBER] — план входа только по активной идее\n"
     "/dayresult — итог дня: сделки, позиции и идеи\n"
+    "/paperstats [30] [SBER] — виртуальные сделки, где нажато «Взял»\n"
     "/diag — версия и состояние источников данных\n"
     "/flow on|off — торговые идеи; /flow raw on — диагностические события ленты\n"
     "/stats [7] [TICKER] — точность сигналов за N дней\n"
@@ -1125,6 +1126,17 @@ async def cmd_ideas(m: Message, idea_journal: IdeaJournal, store: Store) -> None
     await m.answer(idea_journal.stats(m.from_user.id, days, ticker))
 
 
+@router.message(Command("paperstats"))
+async def cmd_paperstats(m: Message, idea_journal: IdeaJournal) -> None:
+    days, ticker = 30, ""
+    for arg in (m.text or "").split()[1:]:
+        if arg.isdigit():
+            days = max(1, min(int(arg), 180))
+        elif TICKER_RE.match(arg.upper()):
+            ticker = arg.upper()
+    await m.answer(idea_journal.paper_stats(m.from_user.id, days, ticker))
+
+
 def _user_active_idea(journal: IdeaJournal, uid: int, ticker: str = ""):
     rows = [x for x in journal.active(ticker or None) if x.delivery(uid)]
     return max(rows, key=lambda x: x.created_ts) if rows else None
@@ -1625,7 +1637,8 @@ async def cb_idea(c: CallbackQuery, idea_journal: IdeaJournal, store: Store) -> 
     if action in ("take", "skip"):
         idea_journal.set_decision(idea_id, c.from_user.id,
                                   "taken" if action == "take" else "skipped")
-        await c.answer("Отмечено: взял" if action == "take" else "Отмечено: пропустил")
+        await c.answer("Бумажная сделка записана · /paperstats"
+                       if action == "take" else "Отмечено: пропустил")
         return
     if action == "cancel":
         if idea.status not in ("prepared", "active"):
@@ -1771,6 +1784,7 @@ BOT_COMMANDS = [
     ("event", "Добавить/удалить событие — /event add SBER 2026-11-05 МСФО"),
     ("setup", "Сетап: за/против входа — /setup SBER"),
     ("ideas", "Торговые идеи и их статистика — /ideas 30"),
+    ("paperstats", "Бумажные сделки по кнопке «Взял»"),
     ("risk", "Риск на идею и расчёт лотов — /risk 1000"),
     ("performance", "Реальные закрытые сделки — /performance 30"),
     ("riskboard", "Позиции, P/L и лимиты риска"),

@@ -630,7 +630,8 @@ class StartupTests(unittest.IsolatedAsyncioTestCase):
         published = client.set_my_commands.await_args_list[0].args[0]
         names = {x.command for x in published}
         self.assertTrue({"version", "diag", "ideas", "risk", "performance",
-                         "riskboard", "limits", "why", "plan", "dayresult"} <= names)
+                         "riskboard", "limits", "why", "plan", "dayresult",
+                         "paperstats"} <= names)
 
 
 class StoreMigrationTests(TempCase):
@@ -786,6 +787,25 @@ class IdeaTests(TempCase):
         adjustment, n, expectancy = j.adaptive_adjustment("pullback", 1)
         self.assertEqual((adjustment, n), (-10, 20))
         self.assertLess(expectancy, 0)
+
+    def test_paper_stats_uses_only_taken_ideas_without_broker_trade(self):
+        j = ideas.IdeaJournal(str(self.path / "paper.json"))
+        taken = self.sample()
+        taken.status = "target"
+        taken.trigger_ts = taken.created_ts + 1
+        taken.realized_r = 1.5
+        taken.deliveries = [ideas.Delivery(1, 1, 1, "taken")]
+        skipped = self.sample(-1)
+        skipped.id = "skip"
+        skipped.status = "stop"
+        skipped.trigger_ts = skipped.created_ts + 1
+        skipped.realized_r = -1
+        skipped.deliveries = [ideas.Delivery(1, 1, 2, "skipped")]
+        j.ideas = [taken, skipped]
+        text = j.paper_stats(1, 30)
+        self.assertIn("Отмечено «Взял»: <b>1</b>", text)
+        self.assertIn("+1.50R", text)
+        self.assertNotIn("Отмечено «Взял»: <b>2</b>", text)
 
 
 if __name__ == "__main__":

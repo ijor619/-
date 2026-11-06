@@ -242,6 +242,47 @@ class IdeaJournal:
             return 5, n, expectancy
         return 0, n, expectancy
 
+    def paper_stats(self, uid: int, days: int = 30, ticker: str = "") -> str:
+        """Virtual results only for ideas explicitly marked as taken."""
+        days = max(1, min(int(days), 180))
+        cutoff = time.time() - days * 86400
+        rows = [x for x in self.ideas
+                if x.created_ts >= cutoff
+                and (not ticker or x.ticker == ticker)
+                and x.delivery(uid) is not None
+                and x.delivery(uid).decision == "taken"]
+        title = f"🧪 <b>Бумажные сделки · {days} дн.</b>" + (f" · {ticker}" if ticker else "")
+        if not rows:
+            return title + "\nЕщё нет идей, отмеченных кнопкой «Взял»."
+        triggered = [x for x in rows if x.trigger_ts]
+        targets = [x for x in triggered if x.status == "target"]
+        stops = [x for x in triggered if x.status == "stop"]
+        timed = [x for x in triggered if x.status == "expired"]
+        active = [x for x in triggered if x.status == "active"]
+        waiting = [x for x in rows if x.status == "prepared"]
+        no_entry = [x for x in rows if not x.trigger_ts and x.status in ("cancelled", "expired")]
+        resolved = targets + stops
+        win_rate = len(targets) / len(resolved) * 100 if resolved else 0.0
+        expectancy = sum(x.realized_r for x in resolved) / len(resolved) if resolved else 0.0
+        completed = resolved + timed
+        total_r = sum(x.realized_r for x in completed)
+        lines = [title,
+                 f"Отмечено «Взял»: <b>{len(rows)}</b> · триггер достигнут: {len(triggered)}",
+                 f"✅ цель: <b>{len(targets)}</b> · 🛑 стоп: <b>{len(stops)}</b> · ⌛ закрыты по времени: {len(timed)}",
+                 f"Точность цель/стоп: <b>{win_rate:.0f}%</b> · ожидание: <b>{expectancy:+.2f}R</b>",
+                 f"Сумма завершённых исходов: <b>{total_r:+.2f}R</b>",
+                 f"Сейчас: ждут входа {len(waiting)} · активны {len(active)} · отменены до входа {len(no_entry)}",
+                 "", "<b>Последние:</b>"]
+        labels = {"target": "✅ цель", "stop": "🛑 стоп",
+                  "cancelled": "↩️ без входа", "expired": "⌛ время",
+                  "active": "🚀 активна", "prepared": "⏳ ждёт"}
+        for idea in sorted(rows, key=lambda x: x.created_ts, reverse=True)[:8]:
+            result = f" · {idea.realized_r:+.2f}R" if idea.trigger_ts and idea.status in TERMINAL else ""
+            lines.append(f"• {idea.ticker} {('L' if idea.direction > 0 else 'S')} · "
+                         f"{labels.get(idea.status, idea.status)}{result}")
+        lines.append("<i>Это симуляция от триггера идеи. Она не проверяет покупку на счёте и не учитывает твоё реальное проскальзывание.</i>")
+        return "\n".join(lines)
+
 
 @dataclass
 class BreakProbe:
