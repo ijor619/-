@@ -51,7 +51,7 @@ from store import Store
 
 log = logging.getLogger(__name__)
 
-BUILD_VERSION = "4.1.1-stability-2026-11-07"
+BUILD_VERSION = "4.1.2-bothost-2026-11-07"
 
 router = Router(name="stockbot")
 

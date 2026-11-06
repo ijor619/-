@@ -41,6 +41,8 @@
 - Учитываются спред, distance-weighted imbalance, microprice, VWAP/POC, дельта, объём, сила к IMOEX/сектору, ширина рынка, RSI/EMA как контекст, новости, календарь и наличие позиции.
 - `/ideas` показывает activation rate, win rate после входа, expectancy в R, цели/стопы/отмены и разбивку по лонгу/шорту/сетапу; кнопки фиксируют «взял/пропустил».
 - `/risk N` считает лоты по денежному риску с учётом лотности и оценки издержек.
-- Официальный `t-tech-investments` подключает поток сделок/стакана с автопереподпиской; REST остаётся резервом.
+- На Bothost используется REST API T‑Invest. Опциональный `t-tech-investments`
+  подключает поток сделок/стакана только там, где пакет установлен отдельно;
+  без него бот автоматически остаётся на REST.
 
 Документация API: [GetPortfolio](https://developer.tbank.ru/invest/services/operations/methods), [GetClosePrices](https://developer.tbank.ru/invest/services/quotes/marketdata), [расчёт «за сегодня»](https://www.tbank.ru/invest/help/educate/yield-analysis/about/profit-check/).
