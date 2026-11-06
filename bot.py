@@ -40,7 +40,7 @@ import tape
 import tinkoff
 from flow import FlowMonitor
 from journal import Journal
-from ideas import IdeaJournal, card, position_size
+from ideas import IdeaJournal, SETUP_NAMES, card, position_size
 from news import NewsMonitor, NEWS_CHANNEL
 from keyboards import (book_kb, chart_kb, cluster_kb, report_kb, setup_kb, tape_kb, screener_kb,
                        scr_pick_kb, idea_kb)
@@ -1138,7 +1138,7 @@ async def cmd_why(m: Message, idea_journal: IdeaJournal, flow: FlowMonitor,
     idea = _user_active_idea(idea_journal, m.from_user.id, ticker)
     if idea:
         lines = [f"🧠 <b>Почему {idea.ticker} {idea.side}</b>",
-                 f"Сетап: <b>{idea.setup}</b> · оценка {idea.confidence}/100"]
+                 f"Сетап: <b>{SETUP_NAMES.get(idea.setup, idea.setup)}</b> · оценка {idea.confidence}/100"]
         if idea.market_regime:
             lines.append(f"Режим: {idea.market_regime} · согласование TF {idea.timeframe_score:+d}/3")
         lines += [""] + [f"• {esc(x)}" for x in idea.reasons]

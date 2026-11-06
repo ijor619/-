@@ -272,7 +272,7 @@ class IdeaEngine:
         ch5, ch15, ch60 = ctx.ch5 or 0.0, ctx.ch15 or 0.0, ctx.ch60 or 0.0
         if (ctx.volume_mult or 0) >= 2 and abs(ch5) >= 0.25:
             direction = 1 if ch5 > 0 else -1
-            return ("импуль вверх" if direction > 0 else "импуль вниз", direction)
+            return ("импульс вверх" if direction > 0 else "импульс вниз", direction)
         if ch60 >= 0.45 and ch15 >= -0.15:
             return "тренд вверх", 1
         if ch60 <= -0.45 and ch15 <= 0.15:
