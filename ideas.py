@@ -49,6 +49,7 @@ class IdeaContext:
     sector_edge: Optional[float] = None
     rsi14: Optional[float] = None
     ema_edge_pct: Optional[float] = None
+    turnover_rub_min: Optional[float] = None
     fresh: bool = True
     event_risk: str = ""
     news_risk: str = ""
@@ -98,6 +99,9 @@ class Idea:
     mfe_pct: float = 0.0
     mae_pct: float = 0.0
     realized_r: float = 0.0
+    market_regime: str = ""
+    timeframe_score: int = 0
+    liquidity_rub_min: float = 0.0
     deliveries: list[Delivery] = field(default_factory=list)
 
     @property
@@ -195,20 +199,48 @@ class IdeaJournal:
         groups: dict[tuple[str, int], list[Idea]] = {}
         for x in xs:
             groups.setdefault((x.setup, x.direction), []).append(x)
-        lines.append("<pre>сетап                 n  вход  цель/стоп")
+        lines.append("<pre>сетап                 n  вход  ц/с   E(R)")
         for (setup, direction), grp in sorted(groups.items(), key=lambda kv: -len(kv[1])):
             tr = [x for x in grp if x.trigger_ts]
             w = sum(x.status == "target" for x in tr)
             s = sum(x.status == "stop" for x in tr)
+            resolved_group = [x for x in tr if x.status in ("target", "stop")]
+            group_er = (sum(x.realized_r for x in resolved_group) / len(resolved_group)
+                        if resolved_group else 0.0)
             name = SETUP_NAMES.get(setup, setup)[:17]
             side = "L" if direction > 0 else "S"
-            lines.append(f"{name:<17} {side} {len(grp):>3} {len(tr):>5} {w:>3}/{s:<3}")
+            lines.append(f"{name:<17} {side} {len(grp):>3} {len(tr):>5} "
+                         f"{w:>2}/{s:<2} {group_er:>+5.2f}")
         lines.append("</pre>")
         taken = [x for x in xs if (x.delivery(uid) and x.delivery(uid).decision == "taken")]
         skipped = [x for x in xs if (x.delivery(uid) and x.delivery(uid).decision == "skipped")]
         lines.append(f"👆 Отметки: «взял» {len(taken)}, «пропустил» {len(skipped)}.")
         lines.append("<i>Точность считается только по идеям, где цена сначала дошла до триггера; отмены до входа не портят win rate.</i>")
         return "\n".join(lines)
+
+    def adaptive_adjustment(self, setup: str, direction: int,
+                            min_sample: int = 20) -> tuple[int, int, float]:
+        """Conservative score correction from resolved market ideas.
+
+        It is deliberately inactive on a small sample.  One market idea is
+        one observation regardless of how many users received it.
+        """
+        rows = [x for x in self.ideas
+                if x.setup == setup and x.direction == direction
+                and x.status in ("target", "stop") and x.trigger_ts]
+        n = len(rows)
+        expectancy = sum(x.realized_r for x in rows) / n if n else 0.0
+        if n < min_sample:
+            return 0, n, expectancy
+        wins = sum(x.status == "target" for x in rows)
+        win_rate = wins / n
+        if expectancy <= -0.15 and win_rate < 0.40:
+            return -10, n, expectancy
+        if expectancy < 0:
+            return -5, n, expectancy
+        if expectancy >= 0.25 and win_rate >= 0.45:
+            return 5, n, expectancy
+        return 0, n, expectancy
 
 
 @dataclass
@@ -233,6 +265,81 @@ class IdeaEngine:
     @staticmethod
     def _book_ok(ctx: IdeaContext, direction: int) -> bool:
         return ctx.book_imbalance is not None and ctx.book_imbalance * direction >= 0.08
+
+    @staticmethod
+    def regime(ctx: IdeaContext) -> tuple[str, int]:
+        """Return a compact market regime and its direction (-1/0/+1)."""
+        ch5, ch15, ch60 = ctx.ch5 or 0.0, ctx.ch15 or 0.0, ctx.ch60 or 0.0
+        if (ctx.volume_mult or 0) >= 2 and abs(ch5) >= 0.25:
+            direction = 1 if ch5 > 0 else -1
+            return ("импуль вверх" if direction > 0 else "импуль вниз", direction)
+        if ch60 >= 0.45 and ch15 >= -0.15:
+            return "тренд вверх", 1
+        if ch60 <= -0.45 and ch15 <= 0.15:
+            return "тренд вниз", -1
+        if abs(ch60) < 0.35 and abs(ch15) < 0.20:
+            return "диапазон", 0
+        return "смешанный", 0
+
+    @staticmethod
+    def timeframe_alignment(ctx: IdeaContext, direction: int) -> tuple[int, int]:
+        """Signed agreement count across 5/15/60 minute horizons."""
+        values = ((ctx.ch5, 0.03), (ctx.ch15, 0.08), (ctx.ch60, 0.20))
+        score = available = 0
+        for value, dead in values:
+            if value is None:
+                continue
+            available += 1
+            if value * direction > dead:
+                score += 1
+            elif value * direction < -dead:
+                score -= 1
+        return score, available
+
+    def _quality_gate(self, idea: Idea, ctx: IdeaContext) -> bool:
+        """Enrich an idea and reject contexts likely to be noise/slippage."""
+        spread = ctx.spread_pct
+        if spread is None or spread > 0.20:
+            return False
+        if ctx.turnover_rub_min is None or ctx.turnover_rub_min < 100_000:
+            return False
+        regime, regime_direction = self.regime(ctx)
+        tf_score, tf_available = self.timeframe_alignment(ctx, idea.direction)
+        # Continuation setups need a readable higher-timeframe context.
+        if idea.setup in ("breakout", "pullback"):
+            if tf_available < 2 or tf_score <= -1:
+                return False
+            if idea.setup == "pullback" and regime_direction != idea.direction:
+                return False
+            if idea.setup == "breakout" and regime == "диапазон" and (ctx.volume_mult or 0) < 2:
+                return False
+        # Do not fade a strong impulse without both absorption and book support.
+        if idea.setup in ("false_breakout", "absorption"):
+            if regime.startswith("импуль") and regime_direction == -idea.direction:
+                if not self._book_ok(ctx, idea.direction):
+                    return False
+
+        adjustment = 0
+        if tf_score >= 2:
+            adjustment += 5
+        elif tf_score <= -2:
+            adjustment -= 8
+        if spread <= 0.08:
+            adjustment += 4
+        if (ctx.turnover_rub_min or 0) >= 500_000:
+            adjustment += 4
+        if ctx.microprice_edge_pct is not None and ctx.microprice_edge_pct * idea.direction >= 0.01:
+            adjustment += 4
+        if ctx.breadth is not None:
+            if (idea.direction > 0 and ctx.breadth >= 55) or (idea.direction < 0 and ctx.breadth <= 45):
+                adjustment += 3
+            elif (idea.direction > 0 and ctx.breadth <= 30) or (idea.direction < 0 and ctx.breadth >= 70):
+                adjustment -= 6
+        idea.confidence = max(1, min(95, idea.confidence + adjustment))
+        idea.market_regime = regime
+        idea.timeframe_score = tf_score
+        idea.liquidity_rub_min = ctx.turnover_rub_min or 0.0
+        return idea.confidence >= 60
 
     def _make(self, ctx: IdeaContext, setup: str, direction: int, confidence: int,
               reasons: list[str], level_name: str = "", level: float = 0.0,
@@ -348,6 +455,8 @@ class IdeaEngine:
 
         unique: list[Idea] = []
         for idea in sorted(out, key=lambda x: -x.confidence):
+            if not self._quality_gate(idea, ctx):
+                continue
             ck = (idea.ticker, idea.setup, idea.direction)
             if now - self.cooldown.get(ck, 0) < 30 * 60:
                 continue
@@ -423,7 +532,13 @@ def card(idea: Idea, risk_rub: float = 0.0) -> str:
               "cancelled": "↩️ ОТМЕНЕНА ДО ВХОДА", "expired": "⌛ ВРЕМЯ ИСТЕКЛО"}[idea.status]
     side = "LONG ↑" if idea.direction > 0 else "SHORT ↓"
     lines = [f"{status} · <b>{idea.ticker} {side}</b>",
-             f"Сетап: <b>{SETUP_NAMES.get(idea.setup, idea.setup)}</b> · оценка {idea.confidence}/100", ""]
+             f"Сетап: <b>{SETUP_NAMES.get(idea.setup, idea.setup)}</b> · оценка {idea.confidence}/100"]
+    if idea.market_regime:
+        tf = f"{idea.timeframe_score:+d}" if idea.timeframe_score else "0"
+        liq = (f" · оборот ≈{idea.liquidity_rub_min / 1_000_000:.1f} млн ₽/мин"
+               if idea.liquidity_rub_min else "")
+        lines.append(f"Режим: <b>{idea.market_regime}</b> · TF {tf}/3{liq}")
+    lines.append("")
     if idea.status == "prepared":
         lines += [f"🎯 Триггер: <b>{f(idea.trigger)} ₽</b>",
                   f"Вход: {f(idea.entry_lo)}–{f(idea.entry_hi)} ₽", f"🛑 Стоп/отмена: {f(idea.stop)} ₽"]

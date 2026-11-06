@@ -630,7 +630,7 @@ class StartupTests(unittest.IsolatedAsyncioTestCase):
         published = client.set_my_commands.await_args_list[0].args[0]
         names = {x.command for x in published}
         self.assertTrue({"version", "diag", "ideas", "risk", "performance",
-                         "riskboard", "limits"} <= names)
+                         "riskboard", "limits", "why", "plan", "dayresult"} <= names)
 
 
 class StoreMigrationTests(TempCase):
@@ -743,6 +743,49 @@ class IdeaTests(TempCase):
         loaded = ideas.IdeaJournal(path)
         self.assertEqual(len(loaded.ideas), 1)
         self.assertIn("всего: <b>1</b>", loaded.stats(1).lower())
+
+    def context(self, **overrides):
+        data = dict(
+            ticker="SBER", price=100.0, prev_price=99.9, vwap=100.0,
+            ch5=.10, ch15=.20, ch60=.80, market15=.10,
+            buy_pct5=60.0, buy_pct15=58.0, volume_mult=1.3,
+            spread_pct=.05, book_imbalance=.12, microprice_edge_pct=.02,
+            breadth=60.0, sector_edge=.2, turnover_rub_min=1_000_000.0)
+        data.update(overrides)
+        return ideas.IdeaContext(**data)
+
+    def test_quality_gate_adds_regime_timeframes_and_liquidity(self):
+        result = ideas.IdeaEngine().candidates(self.context())
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].setup, "pullback")
+        self.assertEqual(result[0].market_regime, "тренд вверх")
+        self.assertGreaterEqual(result[0].timeframe_score, 2)
+        self.assertIn("оборот", ideas.card(result[0]))
+
+    def test_quality_gate_rejects_illiquid_context(self):
+        for turnover in (None, 50_000.0):
+            with self.subTest(turnover=turnover):
+                result = ideas.IdeaEngine().candidates(
+                    self.context(turnover_rub_min=turnover))
+                self.assertEqual(result, [])
+
+    def test_quality_gate_rejects_conflicting_continuation(self):
+        result = ideas.IdeaEngine().candidates(
+            self.context(ch5=-.25, ch15=-.30, ch60=.80, market15=-.35))
+        self.assertEqual(result, [])
+
+    def test_adaptation_waits_for_sample_then_penalizes_bad_setup(self):
+        j = ideas.IdeaJournal(str(self.path / "adaptive.json"))
+        for i in range(20):
+            x = self.sample()
+            x.id = str(i)
+            x.trigger_ts = x.created_ts + 1
+            x.status = "target" if i < 4 else "stop"
+            x.realized_r = 1.5 if x.status == "target" else -1.0
+            j.ideas.append(x)
+        adjustment, n, expectancy = j.adaptive_adjustment("pullback", 1)
+        self.assertEqual((adjustment, n), (-10, 20))
+        self.assertLess(expectancy, 0)
 
 
 if __name__ == "__main__":

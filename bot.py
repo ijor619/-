@@ -10,7 +10,7 @@ import asyncio
 from typing import Optional
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import re
 import sys
 
@@ -40,7 +40,7 @@ import tape
 import tinkoff
 from flow import FlowMonitor
 from journal import Journal
-from ideas import IdeaJournal, card
+from ideas import IdeaJournal, card, position_size
 from news import NewsMonitor, NEWS_CHANNEL
 from keyboards import (book_kb, chart_kb, cluster_kb, report_kb, setup_kb, tape_kb, screener_kb,
                        scr_pick_kb, idea_kb)
@@ -52,7 +52,7 @@ from store import Store
 
 log = logging.getLogger(__name__)
 
-BUILD_VERSION = "4.2.0-risk-journal-2026-11-07"
+BUILD_VERSION = "4.3.0-decision-system-2026-11-07"
 
 router = Router(name="stockbot")
 
@@ -107,6 +107,9 @@ HELP = (
     "/performance [30] [SBER] — реальные закрытые сделки из T‑Invest\n"
     "/riskboard — позиции, дневной P/L и контроль лимитов\n"
     "/limits — лимиты потери, позиций и концентрации\n"
+    "/why [SBER] — почему есть идея или чего не хватает\n"
+    "/plan [SBER] — план входа только по активной идее\n"
+    "/dayresult — итог дня: сделки, позиции и идеи\n"
     "/diag — версия и состояние источников данных\n"
     "/flow on|off — торговые идеи; /flow raw on — диагностические события ленты\n"
     "/stats [7] [TICKER] — точность сигналов за N дней\n"
@@ -137,6 +140,8 @@ def _help_text(store: Store, user_id: int) -> str:
            else "включены" if p.flow_alerts else "выключены")
         + f"\nТорговые идеи: {'включены' if p.idea_alerts else 'выключены'}"
         + f" · мин. оценка {p.idea_min_conf}/100 · риск {p.risk_rub:g} ₽"
+        + f"\nЛимит дня: {p.daily_loss_limit_rub:g} ₽ · "
+        + f"позиций {p.max_positions or '∞'} · сектор {f'{p.max_sector_pct:g}%' if p.max_sector_pct else 'без лимита'}"
         + f"\nСырые события ленты: {'включены' if p.raw_flow_alerts else 'выключены'}"
         + "\nТихие часы: "
         + (f"{p.quiet_from:02d}:00–{p.quiet_to:02d}:00 МСК" if p.quiet_from >= 0 else "нет")
@@ -300,7 +305,7 @@ async def cmd_help(m: Message, store: Store) -> None:
 @router.message(Command("version"))
 async def cmd_version(m: Message) -> None:
     await m.answer(f"🧱 <b>StockBot {BUILD_VERSION}</b>\n"
-                   "Команды идей: /ideas · /risk · /flow raw on")
+                   "Решения: /ideas · /why · /plan · /riskboard · /performance")
 
 
 @router.message(Command("diag"))
@@ -1120,6 +1125,139 @@ async def cmd_ideas(m: Message, idea_journal: IdeaJournal, store: Store) -> None
     await m.answer(idea_journal.stats(m.from_user.id, days, ticker))
 
 
+def _user_active_idea(journal: IdeaJournal, uid: int, ticker: str = ""):
+    rows = [x for x in journal.active(ticker or None) if x.delivery(uid)]
+    return max(rows, key=lambda x: x.created_ts) if rows else None
+
+
+@router.message(Command("why"))
+async def cmd_why(m: Message, idea_journal: IdeaJournal, flow: FlowMonitor,
+                  sess: aiohttp.ClientSession) -> None:
+    args = (m.text or "").split()[1:]
+    ticker = args[0].upper() if args and TICKER_RE.match(args[0].upper()) else ""
+    idea = _user_active_idea(idea_journal, m.from_user.id, ticker)
+    if idea:
+        lines = [f"🧠 <b>Почему {idea.ticker} {idea.side}</b>",
+                 f"Сетап: <b>{idea.setup}</b> · оценка {idea.confidence}/100"]
+        if idea.market_regime:
+            lines.append(f"Режим: {idea.market_regime} · согласование TF {idea.timeframe_score:+d}/3")
+        lines += [""] + [f"• {esc(x)}" for x in idea.reasons]
+        if idea.cautions:
+            lines += ["", "⚠️ " + "; ".join(esc(x) for x in idea.cautions)]
+        if idea.status == "prepared":
+            lines += ["", f"Идея не активна, пока цена не достигла <b>{idea.trigger:g} ₽</b>.",
+                      f"Слом до входа: {idea.stop:g} ₽."]
+        else:
+            lines += ["", f"Идея активна · стоп {idea.stop:g} ₽ · цель {idea.target1:g} ₽."]
+        await m.answer("\n".join(lines))
+        return
+    if not ticker:
+        await m.answer("Активных идей сейчас нет. Для разбора бумаги: /why SBER")
+        return
+    try:
+        im = await flow.imoex(sess)
+        ctx = flow._idea_context(ticker, im)
+    except Exception:
+        log.exception("why context %s", ticker)
+        ctx = None
+    if ctx is None:
+        await m.answer(f"🧠 <b>{ticker}</b>: нет свежей цены/ленты. "
+                       "Бот не строит идею по устаревшим данным.")
+        return
+    regime, _ = flow.idea_engine.regime(ctx)
+    long_tf, available = flow.idea_engine.timeframe_alignment(ctx, 1)
+    blockers = []
+    if ctx.spread_pct is None:
+        blockers.append("нет свежего стакана/спреда")
+    elif ctx.spread_pct > .20:
+        blockers.append(f"спред {ctx.spread_pct:.2f}% слишком широкий")
+    if ctx.turnover_rub_min is None:
+        blockers.append("ещё нет 10 минут свежей истории оборота")
+    elif ctx.turnover_rub_min < 100_000:
+        blockers.append("низкий минутный оборот")
+    if available < 2:
+        blockers.append("не набрана история для 5/15/60 минут")
+    if ctx.buy_pct5 is None or 43 < ctx.buy_pct5 < 57:
+        blockers.append("нет выраженного агрессивного потока")
+    nearest = ctx.nearest()
+    if not nearest or nearest[2] > .28:
+        blockers.append("цена не у ключевого уровня")
+    lines = [f"🧠 <b>{ticker}: почему нет идеи</b>",
+             f"Режим: <b>{regime}</b>",
+             f"TF 5/15/60: лонг {long_tf:+d}/{available} · шорт {-long_tf:+d}/{available}",
+             f"Поток 5м: {ctx.buy_pct5:.0f}% покупок" if ctx.buy_pct5 is not None else "Поток 5м: нет данных",
+             f"Спред: {ctx.spread_pct:.2f}%" if ctx.spread_pct is not None else "Спред: нет данных"]
+    if ctx.turnover_rub_min is not None:
+        lines.append(f"Оборот: ≈{ctx.turnover_rub_min / 1_000_000:.2f} млн ₽/мин")
+    lines += ["", "<b>Не хватает:</b>"] + [f"• {x}" for x in blockers or ["цельного сетапа: факторы пока не сложились"]]
+    await m.answer("\n".join(lines))
+
+
+@router.message(Command("plan"))
+async def cmd_plan(m: Message, idea_journal: IdeaJournal, store: Store) -> None:
+    args = (m.text or "").split()[1:]
+    ticker = args[0].upper() if args and TICKER_RE.match(args[0].upper()) else ""
+    idea = _user_active_idea(idea_journal, m.from_user.id, ticker)
+    if not idea:
+        suffix = f" по {ticker}" if ticker else ""
+        await m.answer(f"📝 Активного торгового плана{suffix} нет. "
+                       "Бот не придумывает вход без сетапа. Контекст: /why SBER")
+        return
+    p = store.get(m.from_user.id)
+    lots, estimated = position_size(idea, p.risk_rub)
+    state = (f"ждать касания {idea.trigger:g} ₽; раньше не входить"
+             if idea.status == "prepared" else f"триггер {idea.trigger:g} ₽ уже достигнут")
+    lines = [f"📝 <b>План · {idea.ticker} {idea.side}</b>",
+             f"Статус: {state}",
+             f"Зона входа: <b>{idea.entry_lo:g}–{idea.entry_hi:g} ₽</b>",
+             f"Стоп/слом: <b>{idea.stop:g} ₽</b>",
+             f"Цель 1: {idea.target1:g} ₽ (1,5R) · цель 2: {idea.target2:g} ₽ (2,5R)"]
+    if lots:
+        lines.append(f"Размер: до <b>{lots} лот.</b> · риск с издержками ≈{_rub0(estimated)}")
+    else:
+        lines.append("Размер не рассчитан. Задай риск: /risk 1000")
+    lines += [f"Отмена плана: {idea.close_reason or 'цена до входа ломает стоп‑уровень'}",
+              "<i>Бот не выставляет заявки; план — контроль риска, а не гарантия результата.</i>"]
+    await m.answer("\n".join(lines))
+
+
+@router.message(Command("dayresult"))
+async def cmd_dayresult(m: Message, tk: tinkoff.TinkoffClient,
+                        idea_journal: IdeaJournal) -> None:
+    if not tinkoff.enabled():
+        await m.answer("T‑Invest API не подключён.")
+        return
+    fills_result, portfolio_result = await asyncio.gather(
+        tk.operations_by_cursor(None), tk.portfolio_snapshot(), return_exceptions=True)
+    start_msk = datetime.now(moex.MSK).replace(hour=0, minute=0, second=0, microsecond=0)
+    start_utc = start_msk.astimezone(timezone.utc)
+    if isinstance(fills_result, BaseException):
+        closed = []
+    else:
+        closed = [x for x in perf.fifo_closed_trades(fills_result) if x.exit_ts >= start_utc]
+    report = perf.summarize(closed)
+    uid = m.from_user.id
+    day_ideas = [x for x in idea_journal.ideas
+                 if x.created_ts >= start_msk.timestamp() and x.delivery(uid)]
+    targets = sum(x.status == "target" for x in day_ideas)
+    stops = sum(x.status == "stop" for x in day_ideas)
+    cancelled = sum(x.status in ("cancelled", "expired") for x in day_ideas)
+    live = sum(x.status in ("prepared", "active") for x in day_ideas)
+    lines = [f"📊 <b>Итог дня · {start_msk:%d.%m}</b>"]
+    if isinstance(fills_result, BaseException):
+        lines.append("Закрытые сделки: история операций временно недоступна")
+    else:
+        lines += [f"Закрыто реальных сделок: <b>{len(report.trades)}</b>",
+                  f"FIFO‑результат после комиссий: <b>{_rub0(report.net_pnl, True)}</b>"]
+    if isinstance(portfolio_result, BaseException):
+        lines.append("Открытые позиции: дневной P/L временно недоступен")
+    else:
+        lines.append(f"Текущие позиции: <b>{_rub0(portfolio_result.daily_pnl, True)}</b> за день")
+    lines += ["", f"💡 Идеи: {len(day_ideas)} · цель {targets} · стоп {stops} · отмена/время {cancelled} · активны {live}",
+              "<i>Закрытые сделки и дневной P/L открытых позиций показаны раздельно, чтобы не смешивать разные базы расчёта.</i>"]
+    await m.answer("\n".join(lines))
+
+
 @router.message(Command("risk"))
 async def cmd_risk(m: Message, store: Store) -> None:
     args = (m.text or "").split()[1:]
@@ -1637,6 +1775,9 @@ BOT_COMMANDS = [
     ("performance", "Реальные закрытые сделки — /performance 30"),
     ("riskboard", "Позиции, P/L и лимиты риска"),
     ("limits", "Задать торговые лимиты"),
+    ("why", "Почему есть/нет идеи — /why SBER"),
+    ("plan", "План по активной идее — /plan SBER"),
+    ("dayresult", "Сделки, P/L и идеи за сегодня"),
     ("clusters", "Кластеры объёма — /clusters SBER 1h"),
     ("chart", "Свечной график — /chart SBER 5m"),
     ("book", "Стакан — /book SBER"),

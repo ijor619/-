@@ -567,6 +567,7 @@ class FlowMonitor:
         tech_rsi, ema_edge = self._technical_context(t)
         sc = self.screener.idea_context(t) if self.screener is not None else {}
         va = None
+        turnover_rub_min = None
         if self.clusters is not None:
             hist = self.clusters.window(t, stp.LEVEL_LOOKBACK_MIN)
             if hist:
@@ -574,6 +575,19 @@ class FlowMonitor:
                 now5 = [x for x in hist if x.minute >= end - timedelta(minutes=4)]
                 x = stp.volume_anomaly(now5, hist, 5)
                 va = x[0] if x else None
+                recent = [x for x in hist if x.minute >= end - timedelta(minutes=29)]
+                minute_turnover: dict[datetime, float] = {}
+                lot = inst.lot if inst else 1
+                for cell in recent:
+                    minute_turnover[cell.minute] = minute_turnover.get(cell.minute, 0.0) + (
+                        cell.price * (cell.buy + cell.sell) * lot)
+                if minute_turnover:
+                    first_minute = min(x.minute for x in hist)
+                    observed = min(30, int((end - first_minute).total_seconds() // 60) + 1)
+                    if observed >= 10:
+                        # Divide by elapsed minutes, including minutes without
+                        # trades; otherwise one isolated print looks liquid.
+                        turnover_rub_min = sum(minute_turnover.values()) / observed
         return IdeaContext(
             ticker=t, price=price, prev_price=self._prev_price.get(t, 0.0),
             decimals=info.decimals if info else 2, lot=inst.lot if inst else 1,
@@ -584,7 +598,7 @@ class FlowMonitor:
             volume_mult=va, spread_pct=spread, book_imbalance=qi,
             microprice_edge_pct=micro, breadth=sc.get("breadth"),
             sector_edge=sc.get("sector_edge"), rsi14=tech_rsi,
-            ema_edge_pct=ema_edge, fresh=True,
+            ema_edge_pct=ema_edge, turnover_rub_min=turnover_rub_min, fresh=True,
             event_risk=self.calendar.risk_for(t) if self.calendar is not None else "",
             news_risk=self.newsmon.risk_for(t) if self.newsmon is not None else "")
 
@@ -642,6 +656,15 @@ class FlowMonitor:
             if ctx is None:
                 continue
             for idea in self.idea_engine.candidates(ctx):
+                adjustment, sample_n, expectancy = self.idea_journal.adaptive_adjustment(
+                    idea.setup, idea.direction)
+                if adjustment:
+                    idea.confidence = max(1, min(95, idea.confidence + adjustment))
+                    history = f"история сетапа: {sample_n} исходов, {expectancy:+.2f}R"
+                    if adjustment > 0:
+                        idea.reasons.append(history)
+                    else:
+                        idea.cautions.append(history)
                 if t in positions:
                     idea.cautions.append("уже есть открытая позиция: проверь суммарный риск")
                 if self.idea_journal.has_active(t, idea.direction):
