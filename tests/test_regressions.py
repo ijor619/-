@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import clusters
+import charts
 import flow
 import journal
 import ideas
@@ -35,6 +36,36 @@ class TempCase(unittest.TestCase):
 
     def trade(self, price=100, seconds=0, qty=5, side="B"):
         return tinkoff.Trade(self.now + timedelta(seconds=seconds), price, qty, side)
+
+
+class ChartLabelTests(unittest.TestCase):
+    def test_daily_timeframe_separates_today_from_chart_range(self):
+        candles = [
+            charts.Candle(datetime(2026, 8, 3), 1286, 1300, 1280, 1295, 1),
+            charts.Candle(datetime(2026, 11, 6), 1071, 1080, 1050, 1069.6, 1),
+        ]
+        self.assertEqual(charts.range_label(charts.PERIODS["1d"], candles),
+                         "03.08–06.11")
+        info = moex.SecurityInfo("PLZL", "Полюс", "TQBR", "SUR", 1,
+                                 1071.4, "2026-11-05")
+        title = charts.chart_title(info, charts.PERIODS["1d"], candles, -0.17)
+        self.assertIn("свеча 1д", title)
+        self.assertIn("За сегодня: -0,17%", title)
+        self.assertIn("С начала графика: -16,83% · 03.08–06.11", title)
+
+    def test_every_timeframe_has_two_separate_changes(self):
+        info = moex.SecurityInfo("SBER", "Сбер", "TQBR", "SUR", 2,
+                                 100, "2026-11-06")
+        candles = [
+            charts.Candle(datetime(2026, 11, 6, 10), 100, 101, 99, 100, 1),
+            charts.Candle(datetime(2026, 11, 7, 10), 102, 104, 101, 103, 1),
+        ]
+        for key, period in charts.PERIODS.items():
+            with self.subTest(key=key):
+                title = charts.chart_title(info, period, candles, 1.25)
+                self.assertIn(f"свеча {period.title}", title)
+                self.assertIn("За сегодня: +1,25%", title)
+                self.assertIn("С начала графика: +3,00%", title)
 
 
 class DirectionTests(TempCase):

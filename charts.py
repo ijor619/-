@@ -36,7 +36,7 @@ log = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class Period:
     key: str
-    title: str          # подпись кнопки
+    title: str          # интервал одной свечи и подпись кнопки
     base: int           # интервал ISS: 1, 10, 60 (мин) или 24 (день)
     agg: int            # сколько базовых свечей в одной итоговой
     bars: int           # сколько свечей показывать
@@ -72,6 +72,33 @@ class Candle:
     low: float
     close: float
     volume: float
+
+
+def range_label(p: Period, cs: list[Candle]) -> str:
+    """Точный диапазон показанных свечей для подписи изменения цены."""
+    first, last = cs[0].begin, cs[-1].begin
+    if first.date() == last.date():
+        return f"{first:%d.%m %H:%M}–{last:%H:%M}"
+    if p.base == 24 or p.base * p.agg >= 240:
+        return f"{first:%d.%m}–{last:%d.%m}"
+    return f"{first:%d.%m %H:%M}–{last:%d.%m %H:%M}"
+
+
+def chart_title(info: SecurityInfo, p: Period, cs: list[Candle],
+                day_change_pct: Optional[float] = None) -> str:
+    """Заголовок без смешивания дневной доходности и диапазона графика."""
+    last = cs[-1].close
+    first = cs[0].open
+    graph_change = (last - first) / first * 100 if first else 0.0
+    if day_change_pct is None and info.prev_close > 0:
+        day_change_pct = (last - info.prev_close) / info.prev_close * 100
+    today = fmt_pct(day_change_pct) if day_change_pct is not None else "нет данных"
+    return (
+        f"{info.ticker} · {info.name} · свеча {p.title}    "
+        f"{fmt_price(last, info.decimals)} {cur_symbol(info.currency)}\n"
+        f"За сегодня: {today}    "
+        f"С начала графика: {fmt_pct(graph_change)} · {range_label(p, cs)}"
+    )
 
 
 # --------------------------------------------------------------- загрузка
@@ -159,17 +186,15 @@ class Overlay:
 
 
 def render(info: SecurityInfo, p: Period, cs: list[Candle],
-           ov: Optional[Overlay] = None) -> bytes:
+           ov: Optional[Overlay] = None,
+           day_change_pct: Optional[float] = None) -> bytes:
     if not HAVE_MPL:
         raise RuntimeError(f"matplotlib недоступен на сервере: {_MPL_ERR}. "
                            "Проверь установку зависимостей (requirements.txt) и объём RAM.")
-    cur = cur_symbol(info.currency)
     n = len(cs)
     ov = ov or Overlay()
     xs = range(n)
     last = cs[-1].close
-    first = cs[0].open
-    chg = (last - first) / first * 100 if first else 0.0
     colors = [UP if c.close >= c.open else DOWN for c in cs]
 
     fig = plt.figure(figsize=(9, 5.2), dpi=150, facecolor="white")
@@ -233,10 +258,8 @@ def render(info: SecurityInfo, p: Period, cs: list[Candle],
                 color="white", fontweight="bold",
                 bbox=dict(boxstyle="round,pad=0.25", fc=colors[-1], ec="none"))
 
-    ax.set_title(
-        f"{info.ticker} · {info.name} · {p.title}    "
-        f"{fmt_price(last, info.decimals)} {cur}    {fmt_pct(chg)} за период",
-        loc="left", fontsize=11, fontweight="bold", color=TXT)
+    ax.set_title(chart_title(info, p, cs, day_change_pct),
+                 loc="left", fontsize=10.5, fontweight="bold", color=TXT)
 
     # нижняя панель: кумулятивная дельта (если есть) поверх объёма
     axv.bar(xs, [c.volume for c in cs], width=0.7, color=colors, alpha=0.35)
@@ -344,7 +367,8 @@ async def _tinvest_candles(tk, inst, p: Period) -> tuple[list[Candle], list[Cand
 
 
 async def build_chart(sess: aiohttp.ClientSession, info: SecurityInfo,
-                      period: str, tk=None, vol_levels=None) -> Optional[bytes]:
+                      period: str, tk=None, vol_levels=None,
+                      day_change_pct: Optional[float] = None) -> Optional[bytes]:
     """PNG свечного графика или None, если данных нет.
 
     Свечи берутся из T-Invest (реальное время), если есть токен; иначе —
@@ -396,4 +420,4 @@ async def build_chart(sess: aiohttp.ClientSession, info: SecurityInfo,
                     ov.delta = delta_series(cs, trades, p.base * p.agg)
         except Exception as e:
             log.debug("chart overlay %s: %s", info.ticker, e)
-    return render(info, p, cs, ov)
+    return render(info, p, cs, ov, day_change_pct)

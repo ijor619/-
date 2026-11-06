@@ -51,7 +51,7 @@ from store import Store
 
 log = logging.getLogger(__name__)
 
-BUILD_VERSION = "4.1.3-clean-ui-2026-11-07"
+BUILD_VERSION = "4.1.4-chart-range-2026-11-07"
 
 router = Router(name="stockbot")
 
@@ -215,6 +215,16 @@ async def show_chart(bot: Bot, chat_id: int, sess: aiohttp.ClientSession,
     info = await moex.get_security_info(sess, t)
     if info is None:
         return f"❌ <b>{esc(t)}</b> — не найден на Мосбирже"
+    day_change_pct = None
+    try:
+        quote = (await moex.fetch_quotes(
+            sess, {t: info}, {}, tk if tinkoff.enabled() else None)).get(t)
+        if quote is not None:
+            day_change_pct = quote.change_pct
+    except Exception:
+        # График остаётся доступен: charts.render восстановит дневной процент
+        # от предыдущего закрытия MOEX, если точная котировка временно недоступна.
+        log.exception("chart daily change %s", t)
     vol_levels = None
     if flow is not None and tinkoff.enabled():
         try:
@@ -224,7 +234,9 @@ async def show_chart(bot: Bot, chat_id: int, sess: aiohttp.ClientSession,
         except Exception:
             log.exception("chart levels %s", t)
     png = await charts.build_chart(sess, info, period,
-                                   tk if tinkoff.enabled() else None, vol_levels=vol_levels)
+                                   tk if tinkoff.enabled() else None,
+                                   vol_levels=vol_levels,
+                                   day_change_pct=day_change_pct)
     if png is None:
         return f"Нет данных для графика {esc(t)}."
     file = BufferedInputFile(png, f"{t}_{period}.png")
