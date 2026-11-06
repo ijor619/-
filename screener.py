@@ -332,7 +332,9 @@ class Screener:
 
     # ------------------------------------------------------------ цикл
     async def run(self, session: aiohttp.ClientSession) -> None:
-        await asyncio.sleep(3)
+        # Дать Telegram polling и меню команд полностью подняться до тяжёлого
+        # разового прогрева истории по всей вселенной акций.
+        await asyncio.sleep(20)
         while True:
             try:
                 refresh_error = ""

@@ -77,8 +77,13 @@ class Store:
         self.load()
 
     def load(self) -> None:
+        source = self.path
+        # Совместимость со старыми деплоями, где users.json лежал в корне.
+        # После первого сохранения данные окажутся в новом data/users.json.
+        if not os.path.exists(source) and source != "users.json" and os.path.exists("users.json"):
+            source = "users.json"
         try:
-            with open(self.path, encoding="utf-8") as f:
+            with open(source, encoding="utf-8") as f:
                 raw = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             return
@@ -87,6 +92,8 @@ class Store:
                 self._users[int(uid)] = UserProfile.from_dict(d)
             except (TypeError, ValueError):
                 continue
+        if source != self.path and self._users:
+            self.save()
 
     def save(self) -> None:
         d = os.path.dirname(self.path)

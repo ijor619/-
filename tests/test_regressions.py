@@ -1,6 +1,7 @@
 """Offline regressions: no Telegram requests, broker account or real orders."""
 import asyncio
 import json
+import os
 import tempfile
 import time
 import unittest
@@ -540,6 +541,29 @@ class FlowSourceTests(unittest.IsolatedAsyncioTestCase):
             stats = await mon._daystats(None, "X")
         self.assertEqual((stats.high, stats.low, stats.vwap), (102, 99, 100))
         tk.candles.assert_not_awaited()
+
+
+class StartupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_command_menu_is_published_for_private_and_russian_scopes(self):
+        import bot as bot_module
+        client = SimpleNamespace(set_my_commands=AsyncMock())
+        self.assertTrue(await bot_module.setup_menu(client))
+        self.assertEqual(client.set_my_commands.await_count, 4)
+        published = client.set_my_commands.await_args_list[0].args[0]
+        names = {x.command for x in published}
+        self.assertTrue({"version", "diag", "ideas", "risk"} <= names)
+
+
+class StoreMigrationTests(TempCase):
+    def test_legacy_root_users_file_moves_to_data_directory(self):
+        previous = os.getcwd()
+        os.chdir(self.path)
+        self.addCleanup(os.chdir, previous)
+        legacy = {"42": {"watchlist": ["SBER"], "threshold_pct": 1.5}}
+        Path("users.json").write_text(json.dumps(legacy), encoding="utf-8")
+        store = Store("data/users.json")
+        self.assertEqual(store.get(42).watchlist, ["SBER"])
+        self.assertTrue(Path("data/users.json").exists())
 
 
 class IdeaTests(TempCase):

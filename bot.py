@@ -21,7 +21,8 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
-from aiogram.types import (BotCommand, BotCommandScopeDefault, BufferedInputFile,
+from aiogram.types import (BotCommand, BotCommandScopeAllPrivateChats,
+                           BotCommandScopeDefault, BufferedInputFile,
                            CallbackQuery, InputMediaPhoto, KeyboardButton, Message,
                            ReplyKeyboardMarkup)
 
@@ -50,7 +51,7 @@ from store import Store
 
 log = logging.getLogger(__name__)
 
-BUILD_VERSION = "4.1.0-ideas-2026-11-06"
+BUILD_VERSION = "4.1.1-stability-2026-11-07"
 
 router = Router(name="stockbot")
 
@@ -102,6 +103,7 @@ HELP = (
     "/book TICKER — стакан, /tape TICKER — лента сделок\n"
     "/ideas [30] [SBER] — активные идеи и статистика цель/стоп/отмена\n"
     "/risk 1000 — риск на одну идею в рублях (для расчёта лотов)\n"
+    "/diag — версия и состояние источников данных\n"
     "/flow on|off — торговые идеи; /flow raw on — диагностические события ленты\n"
     "/stats [7] [TICKER] — точность сигналов за N дней\n"
     "/backtest TICKER — прогнать детекторы по ленте за час\n"
@@ -263,7 +265,8 @@ async def cmd_start(m: Message, store: Store) -> None:
     store.get(m.from_user.id)
     store.save()
     await m.answer(
-        "Привет! Я слежу за ценами акций на Мосбирже 📈\n\n"
+        f"Привет! Я слежу за ценами акций на Мосбирже 📈\n"
+        f"<i>Сборка {BUILD_VERSION}</i>\n\n"
         "Добавь тикеры: /watch SBER GAZP\n"
         "Или просто напиши тикер обычным сообщением.\n\n"
         "Вся информация — /help. Кнопки внизу — частые действия, "
@@ -282,6 +285,33 @@ async def cmd_help(m: Message, store: Store) -> None:
 async def cmd_version(m: Message) -> None:
     await m.answer(f"🧱 <b>StockBot {BUILD_VERSION}</b>\n"
                    "Команды идей: /ideas · /risk · /flow raw on")
+
+
+@router.message(Command("diag"))
+async def cmd_diag(m: Message, store: Store, flow: FlowMonitor,
+                   scr: scrmod.Screener) -> None:
+    """Короткая самодиагностика без раскрытия токенов и OWNER_ID."""
+    prof = store.get(m.from_user.id)
+    data_dir = os.path.dirname(DATA_FILE) or "."
+    stream = flow.stream
+    stream_state = ("работает" if stream.healthy() else
+                    "доступен, ждёт данные" if stream.available else
+                    "REST-режим")
+    updated = scr.updated.strftime("%d.%m %H:%M:%S МСК") if scr.updated else "ещё нет"
+    lines = [
+        f"🧱 <b>StockBot {BUILD_VERSION}</b>",
+        f"Команд в меню: <b>{len(BOT_COMMANDS)}</b>",
+        f"Бумаги: <b>{', '.join(prof.watchlist) or 'список пуст'}</b>",
+        f"T‑Invest: <b>{'подключён' if tinkoff.enabled() else 'нет токена'}</b>",
+        f"Поток: <b>{stream_state}</b>",
+        f"Скринер: <b>{len(scr.secs)} бумаг</b> · обновление {updated}",
+        f"Хранилище: <b>{'доступно' if os.access(data_dir, os.W_OK) else 'нет записи'}</b>",
+    ]
+    if scr.error:
+        lines.append(f"Ошибка скринера: <code>{esc(scr.error[:300])}</code>")
+    if stream.last_error:
+        lines.append(f"Ошибка потока: <code>{esc(stream.last_error[:300])}</code>")
+    await m.answer("\n".join(lines))
 
 
 @router.message(Command("watch"))
@@ -1435,6 +1465,7 @@ async def on_added(ev) -> None:
 
 BOT_COMMANDS = [
     ("version", "Номер запущенной сборки"),
+    ("diag", "Диагностика версии и источников"),
     ("list", "Мои бумаги и цены"),
     ("screener", "Скринер: что двигается — /screener 15m|vol"),
     ("market", "Рынок сейчас: IMOEX, RTS, валюта, Brent"),
@@ -1465,16 +1496,33 @@ BOT_COMMANDS = [
 ]
 
 
-async def setup_menu(bot: Bot) -> None:
+async def setup_menu(bot: Bot) -> bool:
     """Синяя кнопка «Меню» слева от поля ввода: список команд с подсказками.
     Задаётся через API, BotFather не нужен."""
     try:
-        await bot.set_my_commands(
-            [BotCommand(command=c, description=d[:256]) for c, d in BOT_COMMANDS],
-            scope=BotCommandScopeDefault())
-        log.info("меню команд обновлено (%d команд)", len(BOT_COMMANDS))
+        commands = [BotCommand(command=c, description=d[:256]) for c, d in BOT_COMMANDS]
+        # Telegram может хранить отдельные списки для языка и приватных чатов.
+        # Обновляем все варианты, которые видит личный бот, чтобы старое меню
+        # BotFather не перекрывало актуальные команды приложения.
+        scopes = (BotCommandScopeDefault(), BotCommandScopeAllPrivateChats())
+        for scope in scopes:
+            for language_code in (None, "ru"):
+                await bot.set_my_commands(commands, scope=scope,
+                                          language_code=language_code)
+        log.info("меню команд обновлено (%d команд, default/private, default/ru)",
+                 len(BOT_COMMANDS))
+        return True
     except Exception:
         log.exception("не удалось задать меню команд")
+        return False
+
+
+async def keep_menu_current(bot: Bot, initial_ok: bool) -> None:
+    """Повторить установку меню после временного сбоя Telegram API."""
+    delay = 6 * 60 * 60 if initial_ok else 30
+    while True:
+        await asyncio.sleep(delay)
+        delay = 6 * 60 * 60 if await setup_menu(bot) else 60
 
 
 def main_kb(watchlist: list[str]) -> ReplyKeyboardMarkup:
@@ -1632,11 +1680,14 @@ def main() -> None:
             headers={"User-Agent": "moex-stockbot/1.0"},
             timeout=ClientTimeout(total=20),
         )
+        # Сначала публикуем команды. Тяжёлый прогрев скринера и рыночного
+        # потока не должен отнимать соединения в момент запуска бота.
+        menu_ok = await setup_menu(bot)
+        menu_task = asyncio.create_task(keep_menu_current(bot, menu_ok))
         monitor_task = asyncio.create_task(monitor.run(session))
         flow_task = asyncio.create_task(flow.run(session))
         news_task = asyncio.create_task(newsmon.run(session))
         health_task = asyncio.create_task(health_check(bot))
-        await setup_menu(bot)
         clean_task = asyncio.create_task(cleaner.run_daily(bot, sent, store, moex.now_msk))
         scr_task = asyncio.create_task(scr.run(session)) if tinkoff.enabled() else None
         market.set_client(tk if tinkoff.enabled() else None)
@@ -1648,6 +1699,7 @@ def main() -> None:
                                    journal=journal, newsmon=newsmon, cstore=cstore, flow=flow,
                                    idea_journal=idea_journal, csq=csq, sent=sent, scr=scr, cal=cal)
         finally:
+            menu_task.cancel()
             cal_task.cancel()
             cstore.save(force=True)
             clean_task.cancel()

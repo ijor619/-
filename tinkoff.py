@@ -380,7 +380,9 @@ class TinkoffClient:
         базу брокера. При нескольких счетах значения одной бумаги суммируются.
         """
         cached_at, cached = self._portfolio_cache
-        if time.time() - cached_at < 15:
+        # Дневная доходность меняется медленнее ленты. Минутный кэш заметно
+        # снижает фоновую нагрузку и не влияет на смысл показателя «за день».
+        if time.time() - cached_at < 60:
             return cached
         ids = await self._account_ids()
         if not ids:

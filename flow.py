@@ -38,7 +38,7 @@ from clusters import price_endpoints
 
 log = logging.getLogger(__name__)
 
-FLOW_INTERVAL_SEC = int(os.getenv("FLOW_INTERVAL_SEC", "5"))  # поток; REST реже, как fallback
+FLOW_INTERVAL_SEC = max(10, int(os.getenv("FLOW_INTERVAL_SEC", "15")))
 SIGNAL_COOLDOWN_SEC = 30 * 60   # один и тот же сигнал по бумаге — не чаще
 KIND_COOLDOWN_SEC = 10 * 60     # один и тот же ТИП сигнала по бумаге — не чаще
 DIGEST_SEC = 300                # сигналы по бумаге копятся и уходят пачкой
@@ -732,9 +732,11 @@ class FlowMonitor:
         dec = info.decimals if info else 2
         stream_trades, stream_book = self.stream.snapshot(t, minutes=10)
         now = time.time()
+        # REST — только резерв потока. Частые фоновые запросы раньше могли
+        # съедать лимит T-Invest и мешать ручным кнопкам стакана/ленты.
         need_trades = (not self._rest_trades.get(t) or
-                       now - self._rest_trades_ts.get(t, 0) >= (300 if stream_trades else 30))
-        need_book = stream_book is None and now - self._rest_book_ts.get(t, 0) >= 15
+                       now - self._rest_trades_ts.get(t, 0) >= (300 if stream_trades else 60))
+        need_book = stream_book is None and now - self._rest_book_ts.get(t, 0) >= 30
         calls = []
         if need_trades:
             calls.append(self.tk.last_trades(inst, minutes=10))
