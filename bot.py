@@ -35,14 +35,13 @@ import events as evmod
 import market
 import moex
 import performance as perf
-import setup as stp
 import tape
 import tinkoff
 from flow import FlowMonitor
 from journal import Journal
 from ideas import IdeaJournal, SETUP_NAMES, card, position_size
 from news import NewsMonitor, NEWS_CHANNEL
-from keyboards import (book_kb, chart_kb, cluster_kb, report_kb, setup_kb, tape_kb, screener_kb,
+from keyboards import (book_kb, chart_kb, cluster_kb, report_kb, tape_kb, screener_kb,
                        scr_pick_kb, idea_kb)
 from config import (BOT_TOKEN, CHECK_INTERVAL_SEC, DATA_FILE,
                     DEFAULT_REPORT_MIN, DEFAULT_THRESHOLD_PCT)
@@ -52,7 +51,7 @@ from store import Store
 
 log = logging.getLogger(__name__)
 
-BUILD_VERSION = "4.3.1-paper-trading-2026-11-07"
+BUILD_VERSION = "4.3.2-clean-decisions-2026-11-07"
 
 router = Router(name="stockbot")
 
@@ -120,7 +119,7 @@ HELP = (
     "/clusters SBER [5m|15m|30m|1h|4h|1d] — кластеры: объём по ценам и времени, перевес покупок/продаж\n"
     "/clear — удалить сообщения бота в этом чате сейчас; /autoclear 3|off — ежедневная очистка в N часов МСК\n"
     "/cscalp SBER — открыть бумагу в CScalp на вашем ПК (нужен мостик, см. README)\n"
-    "/setup SBER — сетап: уровни по объёму и их тесты, дельта, VWAP, стакан, сила к рынку, итог за/против\n\n"
+    "\n"
     "Просто напиши тикер сообщением — добавлю в список.\n"
     "Цены — из официального ISS API Мосбиржи, обновление каждую минуту."
 )
@@ -657,103 +656,6 @@ async def cb_clusters(c: CallbackQuery, sess: aiohttp.ClientSession,
             pass
 
 
-# ---------------------------------------------------------------- сетап
-
-async def _setup_text(sess, tk: tinkoff.TinkoffClient, cstore: clu.ClusterStore,
-                      flow: FlowMonitor, t: str) -> str:
-    try:
-        inst = await tk.instrument(t)
-    except Exception as e:
-        return f"⚠️ T-Invest API недоступен: {esc(e)}"
-    if inst is None:
-        return f"❌ <b>{esc(t)}</b> — нет такого тикера на TQBR (Т-Банк)"
-    info = await moex.get_security_info(sess, t)
-    dec = info.decimals if info else 2
-    name = info.name if info else inst.name
-    trades, ob, ds, im = await asyncio.gather(
-        tk.last_trades(inst, minutes=60), tk.order_book(inst, depth=20),
-        flow._daystats(sess, t), flow.imoex(sess), return_exceptions=True)
-    if isinstance(trades, list):
-        cstore.ingest(t, trades)
-    if isinstance(ob, BaseException):
-        ob = None
-    price = (trades[-1].price if isinstance(trades, list) and trades
-             else ob.last if ob else flow._last_price.get(t, 0.0))
-    if not price:
-        return f"По {esc(t)} сейчас нет сделок — сетап считать не по чему."
-    cells = cstore.window(t, stp.LEVEL_LOOKBACK_MIN)
-    if not cells:
-        return (f"🎯 <b>{esc(t)}</b> — в базе пока нет ленты. Добавь бумагу в список "
-                f"(/watch {esc(t)}), через несколько минут появятся данные.")
-    ch15 = flow.price_change(t, 15)
-    day_chg = (price - info.prev_close) / info.prev_close * 100 if info and info.prev_close else None
-    im = im if isinstance(im, dict) else {}
-    rs15 = stp.rel_strength(ch15, im.get("15m"), "15 мин")
-    rsd = stp.rel_strength(day_chg, im.get("day"), "к закрытию MOEX")
-    hi, lo, vwap = (ds.high, ds.low, ds.vwap) if not isinstance(ds, BaseException) else (0, 0, 0)
-    s = await asyncio.to_thread(
-        stp.build_setup, t, price, info.prev_close if info else 0.0, hi, lo, vwap, ob,
-        cells, dec, inst.lot, flow.recent_signals(t), rs15, rsd)
-    cov = cstore.coverage(t)
-    text = stp.setup_text(s, name, dec)
-    text += "\n<i>Дневной контекст сетапа — к официальному закрытию MOEX; H/L и VWAP — по минутным свечам MOEX.</i>"
-    try:
-        ml = market.line(await market.snapshot(sess))
-        if ml:
-            text += "\n\n" + ml
-    except Exception as e:
-        log.debug("market line: %s", e)
-    if cov and (datetime.now() - cov) < timedelta(hours=6):
-        text += f"\n<i>История ленты копится с {cov:%d.%m %H:%M} МСК — уровни и тесты пока неполные.</i>"
-    return text
-
-
-@router.message(Command("setup"))
-async def cmd_setup(m: Message, store: Store, sess: aiohttp.ClientSession,
-                    tk: tinkoff.TinkoffClient, cstore: clu.ClusterStore, flow: FlowMonitor) -> None:
-    if not tinkoff.enabled():
-        await m.answer(NO_TK); return
-    args = (m.text or "").split()[1:]
-    if not args:
-        wl = store.get(m.from_user.id).watchlist
-        if len(wl) == 1:
-            args = [wl[0]]
-        else:
-            await m.answer("Использование: /setup SBER" + (f"\nТвой список: {', '.join(wl)}" if wl else ""))
-            return
-    t = args[0].upper()
-    wait = await m.answer("Собираю сетап…")
-    try:
-        text = await _setup_text(sess, tk, cstore, flow, t)
-    except Exception as e:
-        log.exception("setup %s", t); text = f"⚠️ Не удалось собрать сетап {esc(t)}: <code>{esc(e)}</code>"
-    try:
-        await wait.edit_text(text, reply_markup=setup_kb(t))
-    except TelegramBadRequest:
-        await m.answer(text, reply_markup=setup_kb(t))
-
-
-@router.callback_query(F.data.startswith("setup:"))
-async def cb_setup(c: CallbackQuery, sess: aiohttp.ClientSession, tk: tinkoff.TinkoffClient,
-                   cstore: clu.ClusterStore, flow: FlowMonitor) -> None:
-    parts = c.data.split(":")
-    t = parts[1]
-    await c.answer("Собираю сетап…")
-    if not tinkoff.enabled():
-        await c.bot.send_message(c.from_user.id, NO_TK); return
-    try:
-        text = await _setup_text(sess, tk, cstore, flow, t)
-    except Exception as e:
-        log.exception("setup %s", t); text = f"⚠️ Не удалось собрать сетап {esc(t)}: <code>{esc(e)}</code>"
-    if len(parts) > 2 and parts[2] == "r" and c.message and not c.message.photo:
-        try:
-            await c.message.edit_text(text, reply_markup=setup_kb(t)); return
-        except TelegramBadRequest as e:
-            if "not modified" in str(e): return
-    chat_id, reply_to = _reply_ctx(c)
-    await c.bot.send_message(chat_id, text, reply_markup=setup_kb(t), reply_to_message_id=reply_to)
-
-
 # ---------------------------------------------------------------- CScalp
 
 def _cscalp_allowed(uid: int) -> bool:
@@ -1150,7 +1052,7 @@ async def cmd_why(m: Message, idea_journal: IdeaJournal, flow: FlowMonitor,
     idea = _user_active_idea(idea_journal, m.from_user.id, ticker)
     if idea:
         lines = [f"🧠 <b>Почему {idea.ticker} {idea.side}</b>",
-                 f"Сетап: <b>{SETUP_NAMES.get(idea.setup, idea.setup)}</b> · оценка {idea.confidence}/100"]
+                 f"Тип идеи: <b>{SETUP_NAMES.get(idea.setup, idea.setup)}</b> · оценка {idea.confidence}/100"]
         if idea.market_regime:
             lines.append(f"Режим: {idea.market_regime} · согласование TF {idea.timeframe_score:+d}/3")
         lines += [""] + [f"• {esc(x)}" for x in idea.reasons]
@@ -1782,7 +1684,6 @@ BOT_COMMANDS = [
     ("market", "Рынок сейчас: IMOEX, RTS, валюта, Brent"),
     ("calendar", "Календарь: дивиденды, ЦБ, отчётности — /calendar 14"),
     ("event", "Добавить/удалить событие — /event add SBER 2026-11-05 МСФО"),
-    ("setup", "Сетап: за/против входа — /setup SBER"),
     ("ideas", "Торговые идеи и их статистика — /ideas 30"),
     ("paperstats", "Бумажные сделки по кнопке «Взял»"),
     ("risk", "Риск на идею и расчёт лотов — /risk 1000"),
@@ -1845,7 +1746,7 @@ async def keep_menu_current(bot: Bot, initial_ok: bool) -> None:
 
 def main_kb(watchlist: list[str]) -> ReplyKeyboardMarkup:
     """Постоянная клавиатура под полем ввода: частые действия одним нажатием."""
-    rows = [[KeyboardButton(text="📋 Список"), KeyboardButton(text="🎯 Сетап"),
+    rows = [[KeyboardButton(text="📋 Список"),
              KeyboardButton(text="🧮 Кластеры")],
             [KeyboardButton(text="📈 График"), KeyboardButton(text="📚 Стакан"),
              KeyboardButton(text="🧾 Лента")],
@@ -1858,12 +1759,19 @@ def main_kb(watchlist: list[str]) -> ReplyKeyboardMarkup:
 
 # кнопка → команда; для команд с тикером бот спросит бумагу, если в списке их больше одной
 MENU_MAP = {
-    "📋 Список": "list", "🎯 Сетап": "setup", "🧮 Кластеры": "clusters",
+    "📋 Список": "list", "🧮 Кластеры": "clusters",
     "📈 График": "chart", "📚 Стакан": "book", "🧾 Лента": "tape",
     "📊 Статистика": "stats", "📰 Новости": "news", "⚙️ Настройки": "settings",
     "🔎 Скринер": "screener", "💡 Идеи": "ideas",
 }
-NEEDS_TICKER = {"setup", "clusters", "chart", "book", "tape"}
+NEEDS_TICKER = {"clusters", "chart", "book", "tape"}
+
+
+@router.message(F.text == "🎯 Сетап")
+async def legacy_setup_button(m: Message, store: Store) -> None:
+    """Replace Telegram's cached old reply keyboard after the upgrade."""
+    await m.answer("Ручной «Сетап» убран. Контекст идеи: /why SBER · план: /plan SBER",
+                   reply_markup=main_kb(store.get(m.from_user.id).watchlist))
 
 
 def ticker_pick_kb(cmd: str, tickers: list[str]):
@@ -1909,7 +1817,7 @@ async def cb_pick(c: CallbackQuery, store: Store, **kw) -> None:
 async def _dispatch(m: Message, **kw) -> None:
     """Вызвать обработчик команды напрямую (кнопка меню / выбор тикера)."""
     handlers = {
-        "list": cmd_list, "setup": cmd_setup, "clusters": cmd_clusters, "chart": cmd_chart,
+        "list": cmd_list, "clusters": cmd_clusters, "chart": cmd_chart,
         "book": cmd_book, "tape": cmd_tape, "stats": cmd_stats, "mutes": cmd_mutes, "news": cmd_news,
         "settings": cmd_settings, "screener": cmd_screener, "ideas": cmd_ideas,
     }

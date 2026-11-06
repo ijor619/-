@@ -554,14 +554,15 @@ class ButtonTests(unittest.TestCase):
     def test_every_generated_callback_has_a_handler_and_fits_telegram_limit(self):
         markups = [
             keyboards.report_kb(["SBER", "RUAL"]), keyboards.alert_kb("SBER", True),
-            keyboards.flow_kb("SBER"), keyboards.setup_kb("SBER"),
+            keyboards.flow_kb("SBER"),
+            keyboards.idea_kb("abc", "SBER", "prepared"),
             keyboards.book_kb("SBER"), keyboards.tape_kb("SBER"),
             keyboards.cluster_kb("SBER", "4h"), keyboards.chart_kb("SBER", "5m", ["RUAL"]),
             keyboards.screener_kb("4h", False, ["SBER", "RUAL"]),
             keyboards.scr_pick_kb("SBER", False),
         ]
         exact = {"refresh", "settings", "noop", "flow:off", "chart:close", "msg:close", "scr:close"}
-        prefixes = ("chart:", "book:", "tape:", "clu:", "setup:", "cscalp:",
+        prefixes = ("chart:", "book:", "tape:", "clu:", "idea:", "cscalp:",
                     "scr:", "watch:", "unwatch:", "pick:")
         callbacks = [b.callback_data for kb in markups for row in kb.inline_keyboard
                      for b in row if b.callback_data]
@@ -569,6 +570,7 @@ class ButtonTests(unittest.TestCase):
         for value in callbacks:
             self.assertLessEqual(len(value.encode()), 64)
             self.assertTrue(value in exact or value.startswith(prefixes), value)
+            self.assertFalse(value.startswith("setup:"), value)
 
 
 class ButtonTransitionTests(unittest.IsolatedAsyncioTestCase):
@@ -632,6 +634,7 @@ class StartupTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue({"version", "diag", "ideas", "risk", "performance",
                          "riskboard", "limits", "why", "plan", "dayresult",
                          "paperstats"} <= names)
+        self.assertNotIn("setup", names)
 
 
 class StoreMigrationTests(TempCase):

@@ -62,8 +62,6 @@ def alert_kb(ticker: str, flow: bool = False) -> InlineKeyboardMarkup:
     if flow:
         row += [InlineKeyboardButton(text="📚 Стакан", callback_data=f"book:{ticker}"),
                 InlineKeyboardButton(text="🧾 Лента", callback_data=f"tape:{ticker}")]
-    if flow:
-        row.append(setup_btn(ticker))
     return InlineKeyboardMarkup(inline_keyboard=[
         row,
         _links_row(ticker),
@@ -77,7 +75,7 @@ def flow_kb(ticker: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📚 Стакан", callback_data=f"book:{ticker}"),
          InlineKeyboardButton(text="🧾 Лента", callback_data=f"tape:{ticker}"),
          InlineKeyboardButton(text="📈 График", callback_data=f"chart:{ticker}:1m")],
-        [setup_btn(ticker), cluster_btn(ticker)],
+        [cluster_btn(ticker)],
         _links_row(ticker),
         [InlineKeyboardButton(text="🔕 Выкл. сигналы", callback_data="flow:off")],
     ])
@@ -94,7 +92,7 @@ def idea_kb(idea_id: str, ticker: str, status: str) -> InlineKeyboardMarkup:
         ])
     rows.append([
         InlineKeyboardButton(text="📈 График", callback_data=f"chart:{ticker}:1m"),
-        setup_btn(ticker),
+        cluster_btn(ticker),
     ])
     rows.append(_links_row(ticker))
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -108,24 +106,8 @@ def cscalp_btn(ticker: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text="⚡ CScalp", callback_data=f"cscalp:{ticker}")
 
 
-def setup_btn(ticker: str) -> InlineKeyboardButton:
-    return InlineKeyboardButton(text="🎯 Сетап", callback_data=f"setup:{ticker}")
-
-
 def close_btn() -> InlineKeyboardButton:
     return InlineKeyboardButton(text="✖️ Закрыть", callback_data="msg:close")
-
-
-def setup_kb(ticker: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"setup:{ticker}:r"),
-         cluster_btn(ticker),
-         InlineKeyboardButton(text="📈 График", callback_data=f"chart:{ticker}:5m")],
-        [InlineKeyboardButton(text="📚 Стакан", callback_data=f"book:{ticker}"),
-         InlineKeyboardButton(text="🧾 Лента", callback_data=f"tape:{ticker}")],
-        _links_row(ticker),
-        [close_btn()],
-    ])
 
 
 def book_kb(ticker: str) -> InlineKeyboardMarkup:
@@ -133,7 +115,7 @@ def book_kb(ticker: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"book:{ticker}:r"),
          InlineKeyboardButton(text="🧾 Лента", callback_data=f"tape:{ticker}"),
          InlineKeyboardButton(text="📈 График", callback_data=f"chart:{ticker}:1m")],
-        [setup_btn(ticker), cluster_btn(ticker)],
+        [cluster_btn(ticker)],
         _links_row(ticker),
         [close_btn()],
     ])
@@ -146,8 +128,7 @@ def cluster_kb(ticker: str, window: str) -> InlineKeyboardMarkup:
             for w in WINDOW_ORDER]
     return InlineKeyboardMarkup(inline_keyboard=[
         wins[:3], wins[3:],
-        [setup_btn(ticker),
-         InlineKeyboardButton(text="📚 Стакан", callback_data=f"book:{ticker}"),
+        [InlineKeyboardButton(text="📚 Стакан", callback_data=f"book:{ticker}"),
          InlineKeyboardButton(text="🧾 Лента", callback_data=f"tape:{ticker}"),
          InlineKeyboardButton(text="📈 График", callback_data=f"chart:{ticker}:5m")],
         _links_row(ticker),
@@ -161,7 +142,7 @@ def tape_kb(ticker: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"tape:{ticker}:r"),
          InlineKeyboardButton(text="📚 Стакан", callback_data=f"book:{ticker}"),
          InlineKeyboardButton(text="📈 График", callback_data=f"chart:{ticker}:1m")],
-        [setup_btn(ticker), cluster_btn(ticker)],
+        [cluster_btn(ticker)],
         _links_row(ticker),
         [close_btn()],
     ])
@@ -189,7 +170,7 @@ def chart_kb(ticker: str, period: str,
             tick_row = []
     if tick_row:
         rows.append(tick_row)
-    rows.append([setup_btn(ticker), cluster_btn(ticker)])
+    rows.append([cluster_btn(ticker)])
     rows.append(_links_row(ticker))
     rows.append([
         InlineKeyboardButton(text="🔄 Обновить", callback_data=f"chart:{ticker}:{period}:r"),
@@ -240,7 +221,7 @@ def scr_pick_kb(ticker: str, in_watchlist: bool) -> InlineKeyboardMarkup:
            else InlineKeyboardButton(text="➕ В список", callback_data=f"watch:{ticker}"))
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📈 График", callback_data=f"chart:{ticker}:5m"),
-         setup_btn(ticker),
+         cluster_btn(ticker),
          InlineKeyboardButton(text="📚 Стакан", callback_data=f"book:{ticker}")],
         [add, close_btn()],
         _links_row(ticker),
