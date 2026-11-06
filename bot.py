@@ -50,6 +50,8 @@ from store import Store
 
 log = logging.getLogger(__name__)
 
+BUILD_VERSION = "4.1.0-ideas-2026-11-06"
+
 router = Router(name="stockbot")
 
 # ------------------------------------------------------------ приватность
@@ -84,7 +86,8 @@ async def _private_guard(handler, event, data):
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9]{0,9}$")
 
 HELP = (
-    "📈 Я слежу за акциями Мосбиржи и присылаю изменения цен.\n\n"
+    f"📈 Я слежу за акциями Мосбиржи и присылаю изменения цен.\n"
+    f"<i>Сборка {BUILD_VERSION}</i>\n\n"
     "<b>Команды</b>\n"
     "/watch TICKER [TICKER …] — добавить акции, напр. /watch SBER GAZP\n"
     "/unwatch TICKER — убрать из списка\n"
@@ -273,6 +276,12 @@ async def cmd_start(m: Message, store: Store) -> None:
 async def cmd_help(m: Message, store: Store) -> None:
     await m.answer(_help_text(store, m.from_user.id),
                    reply_markup=main_kb(store.get(m.from_user.id).watchlist))
+
+
+@router.message(Command("version"))
+async def cmd_version(m: Message) -> None:
+    await m.answer(f"🧱 <b>StockBot {BUILD_VERSION}</b>\n"
+                   "Команды идей: /ideas · /risk · /flow raw on")
 
 
 @router.message(Command("watch"))
@@ -1425,6 +1434,7 @@ async def on_added(ev) -> None:
 # -------------------------------------------------------------------- меню
 
 BOT_COMMANDS = [
+    ("version", "Номер запущенной сборки"),
     ("list", "Мои бумаги и цены"),
     ("screener", "Скринер: что двигается — /screener 15m|vol"),
     ("market", "Рынок сейчас: IMOEX, RTS, валюта, Brent"),
@@ -1594,6 +1604,7 @@ def main() -> None:
             "  export BOT_TOKEN='123456:ABC...'\n"
             "или положи в файл .env:  BOT_TOKEN=123456:ABC..."
         )
+    log.info("StockBot build %s starting", BUILD_VERSION)
 
     bot = Bot(token=BOT_TOKEN,
               default=DefaultBotProperties(parse_mode=ParseMode.HTML))
