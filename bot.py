@@ -51,7 +51,7 @@ from store import Store
 
 log = logging.getLogger(__name__)
 
-BUILD_VERSION = "4.1.2-bothost-2026-11-07"
+BUILD_VERSION = "4.1.3-clean-ui-2026-11-07"
 
 router = Router(name="stockbot")
 
@@ -191,7 +191,7 @@ async def _list(m, store: Store, sess: aiohttp.ClientSession, tk=None) -> str:
                      else "⬇️" if q.change_pct < -0.005 else "⚪")
             lines.append(
                 f"{arrow} <b>{t}</b> · {fmt_price(q.price, q.info.decimals)} {cur} · "
-                f"{fmt_pct(q.change_pct)}\n{q.details()}"
+                f"{fmt_pct(q.change_pct)}"
             )
     return "\n".join(lines)
 
@@ -393,7 +393,7 @@ async def cmd_alert(m: Message, store: Store) -> None:
     p = store.get(m.from_user.id)
     p.threshold_pct = v
     store.save()
-    await m.answer(f"🔔 Порог алерта: {v:g}%. Для позиции берётся дневная доходность GetPortfolio; для бумаги вне портфеля — опубликованное закрытие T‑Invest. База подписана в каждом алерте.")
+    await m.answer(f"🔔 Порог алерта: {v:g}% за день.")
 
 
 @router.message(Command("quiet"))

@@ -144,8 +144,7 @@ class Monitor:
             f"{emoji} <b>{esc(q.info.ticker)}</b> — "
             f"<b>{fmt_price(q.price, q.info.decimals)} {cur}</b>\n"
             f"{esc(q.info.name)}: <b>{fmt_pct(q.change_pct)}</b> — {what} "
-            f"(шаг {thr:g}%)\n"
-            + q.details()
+            f"(шаг {thr:g}%)"
         )
 
     @staticmethod
@@ -161,7 +160,7 @@ class Monitor:
                 lines.append(
                     f"{arrow} <b>{esc(t)}</b> · "
                     f"{fmt_price(q.price, q.info.decimals)} {cur} · "
-                    f"{fmt_pct(q.change_pct)}\n{q.details()}"
+                    f"{fmt_pct(q.change_pct)}"
                 )
         return "\n".join(lines)
 

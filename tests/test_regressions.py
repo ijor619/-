@@ -315,6 +315,15 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(info.prev_close, 23.27)
         self.assertIn("позиция T‑Invest", q.details())
         self.assertIn("цена на", q.details())
+        # Источник и расчётная база остаются внутренними метаданными и не
+        # перегружают обычную сводку или ценовой алерт.
+        prof = UserProfile()
+        prof.threshold_pct = 0.5
+        for text in (Monitor._report_text([("RUAL", q)]),
+                     Monitor._alert_text(q, prof, step=6, prev_step=5)):
+            self.assertNotIn("T‑Invest", text)
+            self.assertNotIn("База:", text)
+            self.assertNotIn("нет свежей сделки", text)
 
     async def test_portfolio_failure_uses_official_close_not_candle_guess(self):
         tk = tinkoff.TinkoffClient()
