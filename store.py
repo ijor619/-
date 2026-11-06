@@ -10,7 +10,8 @@ class UserProfile:
     __slots__ = ("watchlist", "threshold_pct", "cooldown_min",
                  "report_min", "last_report_ts", "flow_alerts", "quiet_from", "quiet_to",
                  "clear_hour", "idea_alerts", "raw_flow_alerts", "risk_rub",
-                 "idea_min_conf")
+                 "idea_min_conf", "daily_loss_limit_rub", "max_positions",
+                 "max_sector_pct")
 
     def __init__(self) -> None:
         self.watchlist: list[str] = []      # тикеры в верхнем регистре
@@ -23,6 +24,9 @@ class UserProfile:
         self.raw_flow_alerts: bool = False  # сырые киты/стены — по умолчанию только контекст
         self.risk_rub: float = 0.0          # риск на идею, ₽; 0 = не считать размер
         self.idea_min_conf: int = 65        # минимальная оценка идеи
+        self.daily_loss_limit_rub: float = 0.0  # 0 = лимит выключен
+        self.max_positions: int = 0             # 0 = лимит выключен
+        self.max_sector_pct: float = 0.0        # 0 = лимит выключен
         self.quiet_from: int = -1           # тихие часы, час МСК начала (-1 = выкл)
         self.quiet_to: int = -1             # час МСК окончания
         self.clear_hour: int = 3            # автоочистка чата, час МСК (-1 = выкл)
@@ -39,6 +43,9 @@ class UserProfile:
             "raw_flow_alerts": self.raw_flow_alerts,
             "risk_rub": self.risk_rub,
             "idea_min_conf": self.idea_min_conf,
+            "daily_loss_limit_rub": self.daily_loss_limit_rub,
+            "max_positions": self.max_positions,
+            "max_sector_pct": self.max_sector_pct,
             "quiet_from": self.quiet_from,
             "quiet_to": self.quiet_to,
             "clear_hour": self.clear_hour,
@@ -57,6 +64,11 @@ class UserProfile:
         p.raw_flow_alerts = bool(d.get("raw_flow_alerts", False))
         p.risk_rub = max(0.0, float(d.get("risk_rub", 0.0)))
         p.idea_min_conf = max(40, min(90, int(d.get("idea_min_conf", 65))))
+        p.daily_loss_limit_rub = max(
+            0.0, min(10_000_000.0, float(d.get("daily_loss_limit_rub", 0.0))))
+        p.max_positions = max(0, min(100, int(d.get("max_positions", 0))))
+        p.max_sector_pct = max(
+            0.0, min(100.0, float(d.get("max_sector_pct", 0.0))))
         p.quiet_from = int(d.get("quiet_from", -1))
         p.quiet_to = int(d.get("quiet_to", -1))
         p.clear_hour = int(d.get("clear_hour", 3))

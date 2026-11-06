@@ -34,6 +34,7 @@ import cscalp
 import events as evmod
 import market
 import moex
+import performance as perf
 import setup as stp
 import tape
 import tinkoff
@@ -51,7 +52,7 @@ from store import Store
 
 log = logging.getLogger(__name__)
 
-BUILD_VERSION = "4.1.4-chart-range-2026-11-07"
+BUILD_VERSION = "4.2.0-risk-journal-2026-11-07"
 
 router = Router(name="stockbot")
 
@@ -103,6 +104,9 @@ HELP = (
     "/book TICKER — стакан, /tape TICKER — лента сделок\n"
     "/ideas [30] [SBER] — активные идеи и статистика цель/стоп/отмена\n"
     "/risk 1000 — риск на одну идею в рублях (для расчёта лотов)\n"
+    "/performance [30] [SBER] — реальные закрытые сделки из T‑Invest\n"
+    "/riskboard — позиции, дневной P/L и контроль лимитов\n"
+    "/limits — лимиты потери, позиций и концентрации\n"
     "/diag — версия и состояние источников данных\n"
     "/flow on|off — торговые идеи; /flow raw on — диагностические события ленты\n"
     "/stats [7] [TICKER] — точность сигналов за N дней\n"
@@ -1136,6 +1140,150 @@ async def cmd_risk(m: Message, store: Store) -> None:
     await m.answer(f"💰 Риск на одну идею: <b>{value:g} ₽</b>. В карточке появится расчёт лотов.")
 
 
+def _rub0(value: float, signed: bool = False) -> str:
+    pattern = "+,.0f" if signed else ",.0f"
+    return format(value, pattern).replace(",", " ") + " ₽"
+
+
+def _limits_text(p) -> str:
+    return (
+        "🛡 <b>Лимиты риска</b>\n"
+        f"На идею: <b>{_rub0(p.risk_rub) if p.risk_rub else 'нет'}</b>\n"
+        f"Потеря за день: <b>{_rub0(p.daily_loss_limit_rub) if p.daily_loss_limit_rub else 'нет'}</b>\n"
+        f"Открытых позиций: <b>{p.max_positions or 'нет'}</b>\n"
+        f"Один сектор: <b>{f'{p.max_sector_pct:g}%' if p.max_sector_pct else 'нет'}</b>\n\n"
+        "Задать: /limits day 3000 · trade 1000 · positions 3 · sector 60\n"
+        "0 отключает отдельный лимит; /limits off — все.")
+
+
+@router.message(Command("limits"))
+async def cmd_limits(m: Message, store: Store) -> None:
+    args = (m.text or "").split()[1:]
+    p = store.get(m.from_user.id)
+    if not args:
+        await m.answer(_limits_text(p))
+        return
+    if args[0].lower() == "off":
+        p.risk_rub = p.daily_loss_limit_rub = p.max_sector_pct = 0.0
+        p.max_positions = 0
+        store.save()
+        await m.answer("🛡 Все лимиты риска выключены.")
+        return
+    if len(args) != 2:
+        await m.answer(_limits_text(p))
+        return
+    name = args[0].lower()
+    try:
+        value = float(args[1].replace(",", "."))
+    except ValueError:
+        await m.answer("После названия лимита нужно число.")
+        return
+    valid = True
+    if name == "day" and 0 <= value <= 10_000_000:
+        p.daily_loss_limit_rub = value
+    elif name == "trade" and 0 <= value <= 10_000_000:
+        p.risk_rub = value
+    elif name == "positions" and value.is_integer() and 0 <= value <= 100:
+        p.max_positions = int(value)
+    elif name == "sector" and (value == 0 or 10 <= value <= 100):
+        p.max_sector_pct = value
+    else:
+        valid = False
+    if not valid:
+        await m.answer("Неверный лимит. Примеры: /limits day 3000 · "
+                       "trade 1000 · positions 3 · sector 60")
+        return
+    store.save()
+    await m.answer(_limits_text(p))
+
+
+@router.message(Command("performance"))
+async def cmd_performance(m: Message, tk: tinkoff.TinkoffClient,
+                          idea_journal: IdeaJournal) -> None:
+    if not tinkoff.enabled():
+        await m.answer("T‑Invest API не подключён.")
+        return
+    days, ticker = 30, ""
+    for arg in (m.text or "").split()[1:]:
+        if arg.isdigit():
+            days = max(1, min(int(arg), 365))
+        elif TICKER_RE.match(arg.upper()):
+            ticker = arg.upper()
+    try:
+        fills = await tk.operations_by_cursor(None)
+        closed = perf.closed_for_period(fills, days, ticker)
+        report = perf.summarize(closed)
+        matched, actual_r = perf.idea_matches(
+            closed, idea_journal.ideas, m.from_user.id)
+        await m.answer(perf.format_performance(
+            report, days, ticker, matched, actual_r))
+    except Exception as exc:
+        log.exception("не удалось построить отчёт сделок")
+        await m.answer("⚠️ Не удалось получить исполнения T‑Invest. "
+                       f"Повтори позже. <code>{esc(str(exc)[:160])}</code>")
+
+
+@router.message(Command("riskboard"))
+async def cmd_riskboard(m: Message, store: Store, tk: tinkoff.TinkoffClient,
+                        idea_journal: IdeaJournal) -> None:
+    if not tinkoff.enabled():
+        await m.answer("T‑Invest API не подключён.")
+        return
+    p = store.get(m.from_user.id)
+    try:
+        snap = await tk.portfolio_snapshot()
+    except Exception as exc:
+        log.exception("не удалось получить портфель")
+        await m.answer("⚠️ Портфель T‑Invest сейчас недоступен. "
+                       f"<code>{esc(str(exc)[:160])}</code>")
+        return
+    if not snap.positions:
+        await m.answer("🛡 <b>Риск‑панель</b>\nОткрытых позиций нет.")
+        return
+    warnings: list[str] = []
+    sectors: dict[str, float] = {}
+    known_risk = 0.0
+    position_lines = []
+    for pos in snap.positions:
+        sector = pos.sector or "без сектора"
+        sectors[sector] = sectors.get(sector, 0.0) + abs(pos.market_value)
+        direction = 1 if pos.quantity > 0 else -1
+        candidates = [x for x in idea_journal.active(pos.ticker)
+                      if x.direction == direction]
+        idea = max(candidates, key=lambda x: x.created_ts) if candidates else None
+        idea_risk = (abs(idea.trigger - idea.stop) * abs(pos.quantity)) if idea else 0.0
+        if idea_risk:
+            known_risk += idea_risk
+            risk_text = f"риск по идее {_rub0(idea_risk)}"
+        else:
+            risk_text = "нет активной идеи/стопа"
+            warnings.append(f"{pos.ticker}: риск не оценён")
+        side = "L" if pos.quantity > 0 else "S"
+        position_lines.append(
+            f"• <b>{pos.ticker}</b> {side} {abs(pos.quantity):g} шт. · "
+            f"{_rub0(abs(pos.market_value))} · день {_rub0(pos.daily_pnl, True)} · {risk_text}")
+    if p.daily_loss_limit_rub and snap.daily_pnl <= -p.daily_loss_limit_rub:
+        warnings.insert(0, f"дневной лимит потери превышен: {_rub0(snap.daily_pnl, True)}")
+    if p.max_positions and len(snap.positions) > p.max_positions:
+        warnings.insert(0, f"позиций {len(snap.positions)}, лимит {p.max_positions}")
+    sector_rows = []
+    for sector, value in sorted(sectors.items(), key=lambda x: -x[1]):
+        share = value / snap.gross_exposure * 100 if snap.gross_exposure else 0.0
+        sector_rows.append(f"{esc(sector)} {share:.0f}%")
+        if p.max_sector_pct and share > p.max_sector_pct:
+            warnings.insert(0, f"сектор {esc(sector)}: {share:.0f}%, лимит {p.max_sector_pct:g}%")
+    lines = ["🛡 <b>Риск‑панель</b>",
+             f"Портфель: <b>{_rub0(snap.total_value)}</b> · позиции {_rub0(snap.gross_exposure)}",
+             f"За день: <b>{_rub0(snap.daily_pnl, True)}</b>",
+             f"Оценённый риск по идеям: <b>{_rub0(known_risk)}</b>",
+             f"Секторы: {' · '.join(sector_rows[:5])}", ""]
+    if warnings:
+        lines += ["⚠️ <b>Внимание</b>"] + [f"• {x}" for x in warnings[:8]] + [""]
+    lines += ["<b>Позиции</b>"] + position_lines[:10]
+    lines += ["", "<i>Стоп здесь — уровень активной идеи бота, а не биржевая стоп‑заявка.</i>"]
+    await m.answer("\n".join(lines))
+
+
 @router.message(Command("quiethours"))
 async def cmd_quiethours(m: Message, store: Store) -> None:
     args = (m.text or "").split()[1:]
@@ -1486,6 +1634,9 @@ BOT_COMMANDS = [
     ("setup", "Сетап: за/против входа — /setup SBER"),
     ("ideas", "Торговые идеи и их статистика — /ideas 30"),
     ("risk", "Риск на идею и расчёт лотов — /risk 1000"),
+    ("performance", "Реальные закрытые сделки — /performance 30"),
+    ("riskboard", "Позиции, P/L и лимиты риска"),
+    ("limits", "Задать торговые лимиты"),
     ("clusters", "Кластеры объёма — /clusters SBER 1h"),
     ("chart", "Свечной график — /chart SBER 5m"),
     ("book", "Стакан — /book SBER"),

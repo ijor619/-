@@ -18,6 +18,7 @@ import journal
 import ideas
 import keyboards
 import moex
+import performance as perf
 import tape
 import tinkoff
 from monitor import Monitor
@@ -409,6 +410,43 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "1 счёта"):
             await tk.portfolio_day_quotes()
 
+    async def test_operations_cursor_paginates_and_allocates_commission(self):
+        tk = tinkoff.TinkoffClient()
+        tk._account_ids = AsyncMock(return_value=["acc"])
+        buy = {"id": "op-buy", "type": "OPERATION_TYPE_BUY", "ticker": "SBER",
+               "commission": {"units": "2"}, "date": "2026-11-06T10:00:00Z",
+               "tradesInfo": {"trades": [{"num": "t1", "date": "2026-11-06T10:00:00Z",
+                                             "quantity": "10", "price": {"units": "100"}}]}}
+        sell = {"id": "op-sell", "type": "OPERATION_TYPE_SELL", "ticker": "SBER",
+                "commission": {"units": "3"}, "date": "2026-11-06T11:00:00Z",
+                "tradesInfo": {"trades": [{"num": "t2", "date": "2026-11-06T11:00:00Z",
+                                              "quantity": "10", "price": {"units": "110"}}]}}
+        tk._call = AsyncMock(side_effect=[
+            {"items": [buy], "hasNext": True, "nextCursor": "page-2"},
+            {"items": [sell], "hasNext": False}])
+        rows = await tk.operations_by_cursor(30)
+        self.assertEqual([(x.side, x.quantity, x.commission) for x in rows],
+                         [("B", 10, 2), ("S", 10, 3)])
+        self.assertEqual(tk._call.await_args_list[1].args[1]["cursor"], "page-2")
+
+    async def test_portfolio_snapshot_aggregates_accounts_and_sectors(self):
+        tk = tinkoff.TinkoffClient()
+        tk._account_ids = AsyncMock(return_value=["a", "b"])
+        row = {"totalAmountPortfolio": {"units": "100000"}, "positions": [{
+            "instrumentType": "share", "ticker": "RUAL", "quantity": {"units": "50"},
+            "currentPrice": {"units": "24"}, "averagePositionPriceFifo": {"units": "23"},
+            "dailyYield": {"units": "25"}}]}
+        tk._call = AsyncMock(side_effect=[row, row])
+        tk.instrument = AsyncMock(return_value=tinkoff.Instrument(
+            "RUAL", "uid", "figi", 10, "РУСАЛ", "materials"))
+        snap = await tk.portfolio_snapshot()
+        self.assertEqual(snap.total_value, 200000)
+        self.assertEqual(snap.gross_exposure, 2400)
+        self.assertEqual(snap.daily_pnl, 50)
+        self.assertEqual(snap.positions[0].quantity, 100)
+        self.assertEqual(snap.positions[0].account_count, 2)
+        self.assertEqual(snap.positions[0].sector, "materials")
+
     async def test_candle_guess_is_never_used_for_portfolio_percentage(self):
         tk = tinkoff.TinkoffClient()
         tk.instrument = AsyncMock(return_value=self.inst())
@@ -591,7 +629,8 @@ class StartupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.set_my_commands.await_count, 4)
         published = client.set_my_commands.await_args_list[0].args[0]
         names = {x.command for x in published}
-        self.assertTrue({"version", "diag", "ideas", "risk"} <= names)
+        self.assertTrue({"version", "diag", "ideas", "risk", "performance",
+                         "riskboard", "limits"} <= names)
 
 
 class StoreMigrationTests(TempCase):
@@ -604,6 +643,63 @@ class StoreMigrationTests(TempCase):
         store = Store("data/users.json")
         self.assertEqual(store.get(42).watchlist, ["SBER"])
         self.assertTrue(Path("data/users.json").exists())
+
+    def test_risk_limits_roundtrip(self):
+        target = str(self.path / "users.json")
+        store = Store(target)
+        profile = store.get(42)
+        profile.risk_rub = 1000
+        profile.daily_loss_limit_rub = 3000
+        profile.max_positions = 3
+        profile.max_sector_pct = 60
+        store.save()
+        loaded = Store(target).get(42)
+        self.assertEqual((loaded.risk_rub, loaded.daily_loss_limit_rub,
+                          loaded.max_positions, loaded.max_sector_pct),
+                         (1000, 3000, 3, 60))
+
+
+class PerformanceTests(unittest.TestCase):
+    def fill(self, side, price, quantity=10, fee=0, minute=0, fill_id="x"):
+        return tinkoff.BrokerFill(
+            fill_id, fill_id, "acc", "SBER", side,
+            datetime(2026, 11, 6, 10, minute, tzinfo=UTC), quantity, price, fee)
+
+    def test_long_fifo_net_result_includes_both_commissions(self):
+        rows = perf.fifo_closed_trades([
+            self.fill("B", 100, fee=1, fill_id="b"),
+            self.fill("S", 110, fee=1, minute=1, fill_id="s")])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].gross_pnl, 100)
+        self.assertEqual(rows[0].net_pnl, 98)
+
+    def test_short_fifo_result(self):
+        rows = perf.fifo_closed_trades([
+            self.fill("S", 110, 5, .5, fill_id="s"),
+            self.fill("B", 100, 5, .5, 1, "b")])
+        self.assertEqual(rows[0].direction, -1)
+        self.assertEqual(rows[0].net_pnl, 49)
+
+    def test_one_exit_merges_multiple_entry_lots(self):
+        rows = perf.fifo_closed_trades([
+            self.fill("B", 100, 5, fill_id="b1"),
+            self.fill("B", 102, 5, minute=1, fill_id="b2"),
+            self.fill("S", 110, 10, minute=2, fill_id="s")])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].entry_price, 101)
+        self.assertEqual(rows[0].gross_pnl, 90)
+
+    def test_report_window_keeps_entry_from_older_history(self):
+        now = datetime(2026, 11, 7, 12, tzinfo=UTC)
+        old_entry = tinkoff.BrokerFill(
+            "b", "b", "acc", "SBER", "B", now - timedelta(days=200),
+            10, 100, 1)
+        recent_exit = tinkoff.BrokerFill(
+            "s", "s", "acc", "SBER", "S", now - timedelta(days=1),
+            10, 110, 1)
+        rows = perf.closed_for_period([old_entry, recent_exit], 30, "SBER", now)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].net_pnl, 98)
 
 
 class IdeaTests(TempCase):

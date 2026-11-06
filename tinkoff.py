@@ -189,6 +189,42 @@ class PortfolioDayQuote:
     account_count: int
 
 
+@dataclass(frozen=True)
+class BrokerFill:
+    fill_id: str
+    operation_id: str
+    account_id: str
+    ticker: str
+    side: str                 # B / S
+    ts: datetime              # UTC
+    quantity: float           # штук, не лотов
+    price: float
+    commission: float = 0.0
+
+
+@dataclass
+class PortfolioPosition:
+    ticker: str
+    quantity: float
+    current_price: float
+    average_price: float
+    daily_pnl: float
+    expected_pnl: float
+    market_value: float
+    account_count: int
+    sector: str = ""
+
+
+@dataclass(frozen=True)
+class PortfolioSnapshot:
+    positions: tuple[PortfolioPosition, ...]
+    total_value: float
+    gross_exposure: float
+    daily_pnl: float
+    expected_pnl: float
+    account_count: int
+
+
 INTERVALS = {1: "CANDLE_INTERVAL_1_MIN", 5: "CANDLE_INTERVAL_5_MIN",
              15: "CANDLE_INTERVAL_15_MIN", 30: "CANDLE_INTERVAL_30_MIN",
              60: "CANDLE_INTERVAL_HOUR", 240: "CANDLE_INTERVAL_4_HOUR",
@@ -206,6 +242,8 @@ class TinkoffClient:
         self._instr: dict[str, Optional[Instrument]] = {}
         self._accounts_cache: tuple[float, list[str]] = (0.0, [])
         self._portfolio_cache: tuple[float, dict[str, PortfolioDayQuote]] = (0.0, {})
+        self._portfolio_snapshot_cache: tuple[float, Optional[PortfolioSnapshot]] = (0.0, None)
+        self._operations_cache: dict[int, tuple[float, list[BrokerFill]]] = {}
         self._close_cache: tuple[float, dict[str, tuple[float, datetime, str]]] = (0.0, {})
 
     async def _session(self) -> aiohttp.ClientSession:
@@ -431,6 +469,156 @@ class TinkoffClient:
                 account_count=len(accounts[ticker]))
         self._portfolio_cache = (time.time(), out)
         return out
+
+    async def portfolio_snapshot(self) -> PortfolioSnapshot:
+        """Aggregate open share positions and P/L across configured accounts."""
+        cached_at, cached = self._portfolio_snapshot_cache
+        if cached is not None and time.time() - cached_at < 60:
+            return cached
+        ids = await self._account_ids()
+        if not ids:
+            return PortfolioSnapshot((), 0.0, 0.0, 0.0, 0.0, 0)
+        replies = await asyncio.gather(*(
+            self._call("OperationsService/GetPortfolio", {"accountId": account_id})
+            for account_id in ids), return_exceptions=True)
+        errors = [x for x in replies if isinstance(x, BaseException)]
+        if errors:
+            raise RuntimeError(f"GetPortfolio недоступен для {len(errors)} счёта(ов)")
+        totals: dict[str, dict[str, Any]] = {}
+        total_value = 0.0
+        for account_id, reply in zip(ids, replies):
+            total_value += q2f(reply.get("totalAmountPortfolio"))
+            for p in reply.get("positions", []):
+                if str(p.get("instrumentType") or "share") not in ("share", "shares"):
+                    continue
+                ticker = str(p.get("ticker") or "").upper()
+                quantity = q2f(p.get("quantity"))
+                current = q2f(p.get("currentPrice"))
+                if not ticker or not quantity or current <= 0:
+                    continue
+                average = q2f(p.get("averagePositionPriceFifo")) or q2f(p.get("averagePositionPrice"))
+                row = totals.setdefault(ticker, {
+                    "quantity": 0.0, "value": 0.0, "average_value": 0.0,
+                    "average_qty": 0.0, "daily": 0.0, "expected": 0.0,
+                    "accounts": set()})
+                row["quantity"] += quantity
+                row["value"] += quantity * current
+                row["average_value"] += abs(quantity) * average
+                row["average_qty"] += abs(quantity)
+                row["daily"] += q2f(p.get("dailyYield"))
+                row["expected"] += q2f(p.get("expectedYield"))
+                row["accounts"].add(account_id)
+        positions = []
+        for ticker, row in totals.items():
+            qty = row["quantity"]
+            if not qty:
+                continue
+            positions.append(PortfolioPosition(
+                ticker=ticker, quantity=qty,
+                current_price=abs(row["value"] / qty),
+                average_price=(row["average_value"] / row["average_qty"]
+                               if row["average_qty"] else 0.0),
+                daily_pnl=row["daily"], expected_pnl=row["expected"],
+                market_value=row["value"], account_count=len(row["accounts"])))
+        # Sector enrichment is read-only and cached by instrument().
+        info_rows = await asyncio.gather(*(self.instrument(p.ticker) for p in positions),
+                                         return_exceptions=True)
+        for pos, inst in zip(positions, info_rows):
+            if isinstance(inst, Instrument):
+                pos.sector = inst.sector or "без сектора"
+        snap = PortfolioSnapshot(
+            tuple(sorted(positions, key=lambda x: -abs(x.market_value))),
+            total_value, sum(abs(x.market_value) for x in positions),
+            sum(x.daily_pnl for x in positions),
+            sum(x.expected_pnl for x in positions), len(ids))
+        self._portfolio_snapshot_cache = (time.time(), snap)
+        return snap
+
+    async def operations_by_cursor(self, days: Optional[int] = 30) -> list[BrokerFill]:
+        """Executed buy/sell fills from every account, with pagination.
+
+        ``days=None`` loads the complete available operation history.  This is
+        needed for correct FIFO when a position was opened before the report
+        window; ``from`` and ``to`` are optional in the official cursor API.
+        """
+        cache_key = 0 if days is None else max(1, min(int(days), 3650))
+        cached_at, cached = self._operations_cache.get(cache_key, (0.0, []))
+        if time.time() - cached_at < 60:
+            return list(cached)
+        ids = await self._account_ids()
+        now = datetime.now(timezone.utc)
+        frm = now - timedelta(days=cache_key) if cache_key else None
+
+        async def account_fills(account_id: str) -> list[BrokerFill]:
+            cursor = ""
+            rows: list[dict] = []
+            for page in range(100):  # guard against a broken cursor loop
+                body = {
+                    "accountId": account_id,
+                    "cursor": cursor, "limit": 1000,
+                    "operationTypes": ["OPERATION_TYPE_BUY", "OPERATION_TYPE_SELL",
+                                       "OPERATION_TYPE_BUY_MARGIN", "OPERATION_TYPE_SELL_MARGIN"],
+                    "state": "OPERATION_STATE_EXECUTED",
+                    "withoutCommissions": False, "withoutTrades": False,
+                    "withoutOvernights": True,
+                }
+                if frm is not None:
+                    body["from"] = frm.strftime("%Y-%m-%dT%H:%M:%SZ")
+                    body["to"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+                reply = await self._call("OperationsService/GetOperationsByCursor", body)
+                rows.extend(reply.get("items", []))
+                if not reply.get("hasNext"):
+                    break
+                nxt = str(reply.get("nextCursor") or "")
+                if not nxt or nxt == cursor:
+                    break
+                cursor = nxt
+                if page == 99:
+                    raise RuntimeError("история операций превышает 100 000 записей")
+            out: list[BrokerFill] = []
+            buy_types = {"OPERATION_TYPE_BUY", "OPERATION_TYPE_BUY_MARGIN"}
+            sell_types = {"OPERATION_TYPE_SELL", "OPERATION_TYPE_SELL_MARGIN"}
+            for row in rows:
+                typ = str(row.get("type") or "")
+                side = "B" if typ in buy_types else "S" if typ in sell_types else ""
+                ticker = str(row.get("ticker") or "").upper()
+                if not side or not ticker:
+                    continue
+                operation_id = str(row.get("id") or row.get("cursor") or "")
+                trades = (row.get("tradesInfo") or {}).get("trades") or []
+                total_qty = sum(float(x.get("quantity") or 0) for x in trades)
+                commission = abs(q2f(row.get("commission")))
+                if trades:
+                    for i, trade in enumerate(trades):
+                        qty, price = float(trade.get("quantity") or 0), q2f(trade.get("price"))
+                        stamp = trade.get("date") or row.get("date")
+                        if qty <= 0 or price <= 0 or not stamp:
+                            continue
+                        ts = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+                        fill_id = str(trade.get("num") or f"{operation_id}:{i}")
+                        out.append(BrokerFill(
+                            fill_id, operation_id, account_id, ticker, side, ts,
+                            qty, price, commission * qty / total_qty if total_qty else 0.0))
+                else:
+                    qty = float(row.get("quantityDone") or row.get("quantity") or 0)
+                    price, stamp = q2f(row.get("price")), row.get("date")
+                    if qty > 0 and price > 0 and stamp:
+                        ts = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+                        out.append(BrokerFill(operation_id, operation_id, account_id,
+                                              ticker, side, ts, qty, price, commission))
+            return out
+
+        replies = await asyncio.gather(*(account_fills(x) for x in ids),
+                                       return_exceptions=True)
+        errors = [x for x in replies if isinstance(x, BaseException)]
+        if errors:
+            raise RuntimeError(f"операции недоступны для {len(errors)} счёта(ов): {errors[0]}")
+        fills = [row for batch in replies for row in batch]
+        # A broker operation may reappear across pages; trade number is stable.
+        unique = {(x.account_id, x.fill_id): x for x in fills}
+        result = sorted(unique.values(), key=lambda x: x.ts)
+        self._operations_cache[cache_key] = (time.time(), result)
+        return list(result)
 
     async def last_trades(self, inst: Instrument, minutes: int = 10) -> list[Trade]:
         now = datetime.now(timezone.utc)
