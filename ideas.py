@@ -8,6 +8,7 @@ is cancelled/expired before entry.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import time
@@ -16,8 +17,13 @@ from typing import Optional
 from uuid import uuid4
 
 
+log = logging.getLogger(__name__)
+
 TERMINAL = {"target", "stop", "cancelled", "expired"}
 ACTIVE = {"prepared", "active"}
+MAX_LEVEL_DISTANCE_PCT = 5.0
+MAX_TRIGGER_DISTANCE_PCT = 2.0
+MAX_RISK_PCT = 3.0
 SETUP_NAMES = {
     "breakout": "принятый пробой",
     "false_breakout": "ложный пробой",
@@ -112,6 +118,34 @@ class Idea:
         return next((d for d in self.deliveries if d.uid == uid), None)
 
 
+def idea_geometry_error(idea: Idea, reference_price: float = 0.0) -> str:
+    """Return why an idea is unsafe, or an empty string when geometry is sane."""
+    prices = (idea.trigger, idea.entry_lo, idea.entry_hi, idea.stop,
+              idea.target1, idea.target2)
+    if idea.direction not in (-1, 1):
+        return "некорректное направление"
+    if any(not math.isfinite(x) or x <= 0 for x in prices):
+        return "неположительная или бесконечная цена"
+    if idea.direction > 0:
+        ordered = (idea.stop < idea.entry_lo <= idea.trigger <= idea.entry_hi
+                   < idea.target1 < idea.target2)
+    else:
+        ordered = (idea.target2 < idea.target1 < idea.entry_lo <= idea.trigger
+                   <= idea.entry_hi < idea.stop)
+    if not ordered:
+        return "перепутан порядок входа, стопа и целей"
+    risk_pct = abs(idea.trigger - idea.stop) / idea.trigger * 100
+    if risk_pct <= 0 or risk_pct > MAX_RISK_PCT:
+        return f"риск {risk_pct:.2f}% вне допустимого диапазона"
+    if idea.level and abs(idea.level - idea.trigger) / idea.trigger * 100 > MAX_LEVEL_DISTANCE_PCT:
+        return "уровень относится к другому ценовому диапазону"
+    if reference_price > 0:
+        trigger_gap = abs(idea.trigger - reference_price) / reference_price * 100
+        if trigger_gap > MAX_TRIGGER_DISTANCE_PCT:
+            return f"триггер на {trigger_gap:.2f}% от свежей цены"
+    return ""
+
+
 class IdeaJournal:
     def __init__(self, path: str) -> None:
         self.path = path
@@ -125,9 +159,19 @@ class IdeaJournal:
             if raw.get("version") != 1:
                 raise ValueError("неизвестная версия журнала идей")
             self.ideas = []
+            dropped = 0
             for row in raw.get("ideas", []):
                 row["deliveries"] = [Delivery(**d) for d in row.get("deliveries", [])]
-                self.ideas.append(Idea(**row))
+                idea = Idea(**row)
+                reason = idea_geometry_error(idea)
+                if reason:
+                    dropped += 1
+                    log.warning("ideas: отброшена повреждённая идея %s %s: %s",
+                                idea.ticker, idea.id, reason)
+                    continue
+                self.ideas.append(idea)
+            if dropped:
+                self.save()
         except FileNotFoundError:
             self.ideas = []
         except Exception:
@@ -151,6 +195,11 @@ class IdeaJournal:
         os.replace(tmp, self.path)
 
     def add(self, idea: Idea) -> None:
+        reason = idea_geometry_error(idea)
+        if reason:
+            log.warning("ideas: не сохранена повреждённая идея %s %s: %s",
+                        idea.ticker, idea.id, reason)
+            return
         if not any(x.id == idea.id for x in self.ideas):
             self.ideas.append(idea)
             self.save()
@@ -431,12 +480,22 @@ class IdeaEngine:
         for name, lv in ctx.levels:
             if not lv or not ctx.prev_price:
                 continue
+            if abs(lv - ctx.price) / ctx.price * 100 > MAX_LEVEL_DISTANCE_PCT:
+                continue
             direction = 1 if ctx.prev_price < lv <= ctx.price else -1 if ctx.prev_price > lv >= ctx.price else 0
             if direction:
                 self.probes[(ctx.ticker, round(lv, 6))] = BreakProbe(ctx.ticker, name, lv, direction, now)
 
         for key, pr in list(self.probes.items()):
+            # Probes are shared by the engine, but every probe belongs to one
+            # instrument. Applying a RUAL level to LKOH produced absurd stops
+            # near 20 rubles and targets above 14,000 rubles.
+            if pr.ticker != ctx.ticker:
+                continue
             age = now - pr.ts
+            if abs(pr.level - ctx.price) / ctx.price * 100 > MAX_LEVEL_DISTANCE_PCT:
+                self.probes.pop(key, None)
+                continue
             outside = (ctx.price - pr.level) * pr.direction > 0
             flow = (ctx.buy_pct5 or 50) - 50
             flow_ok = flow * pr.direction >= 7
@@ -497,6 +556,10 @@ class IdeaEngine:
         unique: list[Idea] = []
         for idea in sorted(out, key=lambda x: -x.confidence):
             if not self._quality_gate(idea, ctx):
+                continue
+            reason = idea_geometry_error(idea, ctx.price)
+            if reason:
+                log.warning("ideas: отклонена %s %s: %s", idea.ticker, idea.setup, reason)
                 continue
             ck = (idea.ticker, idea.setup, idea.direction)
             if now - self.cooldown.get(ck, 0) < 30 * 60:

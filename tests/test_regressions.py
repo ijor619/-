@@ -18,6 +18,7 @@ import journal
 import ideas
 import keyboards
 import moex
+import news
 import performance as perf
 import tape
 import tinkoff
@@ -778,6 +779,41 @@ class IdeaTests(TempCase):
             self.context(ch5=-.25, ch15=-.30, ch60=.80, market15=-.35))
         self.assertEqual(result, [])
 
+    def test_probe_from_another_ticker_never_creates_lkoh_idea(self):
+        engine = ideas.IdeaEngine()
+        engine.probes[("RUAL", 24.45)] = ideas.BreakProbe(
+            "RUAL", "объёмный уровень", 24.45, -1, time.time() - 30)
+        result = engine.candidates(self.context(
+            ticker="LKOH", price=5931.9, prev_price=5930.0,
+            vwap=5930.0, ch5=.10, ch15=.20, ch60=.80, buy_pct5=60.0))
+        self.assertFalse(any(x.setup == "false_breakout" for x in result))
+        self.assertIn(("RUAL", 24.45), engine.probes)
+
+    def test_same_ticker_probe_with_impossible_level_is_rejected(self):
+        engine = ideas.IdeaEngine()
+        engine.probes[("LKOH", 24.45)] = ideas.BreakProbe(
+            "LKOH", "повреждённый уровень", 24.45, -1, time.time() - 30)
+        result = engine.candidates(self.context(
+            ticker="LKOH", price=5931.9, prev_price=5930.0,
+            vwap=5930.0, ch5=.10, ch15=.20, ch60=.80, buy_pct5=60.0))
+        self.assertFalse(any(x.setup == "false_breakout" for x in result))
+        self.assertNotIn(("LKOH", 24.45), engine.probes)
+
+    def test_corrupt_geometry_is_removed_from_loaded_journal(self):
+        path = self.path / "ideas.json"
+        good = self.sample()
+        bad = self.sample()
+        bad.id = "bad"
+        bad.ticker = "LKOH"
+        bad.trigger = 5931.9
+        bad.entry_lo, bad.entry_hi = 5931.0, 5932.0
+        bad.stop, bad.target1, bad.target2 = 21.5, 14797.5, 20707.8
+        bad.level = 24.45
+        path.write_text(json.dumps({"version": 1,
+                                    "ideas": [asdict(good), asdict(bad)]}), encoding="utf-8")
+        loaded = ideas.IdeaJournal(str(path))
+        self.assertEqual([x.id for x in loaded.ideas], [good.id])
+
     def test_adaptation_waits_for_sample_then_penalizes_bad_setup(self):
         j = ideas.IdeaJournal(str(self.path / "adaptive.json"))
         for i in range(20):
@@ -809,6 +845,24 @@ class IdeaTests(TempCase):
         self.assertIn("Отмечено «Взял»: <b>1</b>", text)
         self.assertIn("+1.50R", text)
         self.assertNotIn("Отмечено «Взял»: <b>2</b>", text)
+
+
+class NewsRiskTests(TempCase):
+    def item(self, title, tickers, priority=3):
+        return news.NewsItem("id", "moex", "MOEX", title, "",
+                             datetime.now(UTC), tickers=tickers, priority=priority)
+
+    def test_stock_specific_critical_news_does_not_leak_to_other_ticker(self):
+        monitor = news.NewsMonitor(None, None, str(self.path / "seen.json"))
+        monitor._recent_items = [self.item(
+            "Мосбиржа проводит дискретный аукцион по акциям МГКЛ", ["MGKL"])]
+        self.assertEqual(monitor.risk_for("LKOH"), "")
+        self.assertIn("МГКЛ", monitor.risk_for("MGKL"))
+
+    def test_global_critical_news_still_applies_to_every_ticker(self):
+        monitor = news.NewsMonitor(None, None, str(self.path / "seen.json"))
+        monitor._recent_items = [self.item("Банк России изменил ставку", [])]
+        self.assertIn("ставку", monitor.risk_for("LKOH"))
 
 
 if __name__ == "__main__":

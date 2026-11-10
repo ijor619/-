@@ -51,7 +51,7 @@ from store import Store
 
 log = logging.getLogger(__name__)
 
-BUILD_VERSION = "4.3.2-clean-decisions-2026-11-07"
+BUILD_VERSION = "4.3.4-isolated-ideas-2026-11-10"
 
 router = Router(name="stockbot")
 
@@ -1746,7 +1746,7 @@ async def keep_menu_current(bot: Bot, initial_ok: bool) -> None:
 
 def main_kb(watchlist: list[str]) -> ReplyKeyboardMarkup:
     """Постоянная клавиатура под полем ввода: частые действия одним нажатием."""
-    rows = [[KeyboardButton(text="📋 Список"),
+    rows = [[KeyboardButton(text="📋 Список"), KeyboardButton(text="🧠 Почему?"),
              KeyboardButton(text="🧮 Кластеры")],
             [KeyboardButton(text="📈 График"), KeyboardButton(text="📚 Стакан"),
              KeyboardButton(text="🧾 Лента")],
@@ -1759,12 +1759,12 @@ def main_kb(watchlist: list[str]) -> ReplyKeyboardMarkup:
 
 # кнопка → команда; для команд с тикером бот спросит бумагу, если в списке их больше одной
 MENU_MAP = {
-    "📋 Список": "list", "🧮 Кластеры": "clusters",
+    "📋 Список": "list", "🧠 Почему?": "why", "🧮 Кластеры": "clusters",
     "📈 График": "chart", "📚 Стакан": "book", "🧾 Лента": "tape",
     "📊 Статистика": "stats", "📰 Новости": "news", "⚙️ Настройки": "settings",
     "🔎 Скринер": "screener", "💡 Идеи": "ideas",
 }
-NEEDS_TICKER = {"clusters", "chart", "book", "tape"}
+NEEDS_TICKER = {"why", "clusters", "chart", "book", "tape"}
 
 
 @router.message(F.text == "🎯 Сетап")
@@ -1820,6 +1820,7 @@ async def _dispatch(m: Message, **kw) -> None:
         "list": cmd_list, "clusters": cmd_clusters, "chart": cmd_chart,
         "book": cmd_book, "tape": cmd_tape, "stats": cmd_stats, "mutes": cmd_mutes, "news": cmd_news,
         "settings": cmd_settings, "screener": cmd_screener, "ideas": cmd_ideas,
+        "why": cmd_why,
     }
     cmd = m.text.split()[0].lstrip("/")
     fn = handlers.get(cmd)

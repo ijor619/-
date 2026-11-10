@@ -537,7 +537,7 @@ class NewsMonitor:
     def risk_for(self, ticker: str, minutes: int = 45) -> str:
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes)
         xs = [x for x in self._recent_items if x.published >= cutoff
-              and (ticker in x.tickers or x.priority >= 3)]
+              and (ticker in x.tickers or (not x.tickers and x.priority >= 3))]
         if not xs:
             return ""
         latest = max(xs, key=lambda x: x.published)
