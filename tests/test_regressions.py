@@ -846,6 +846,30 @@ class IdeaTests(TempCase):
         self.assertIn("+1.50R", text)
         self.assertNotIn("Отмечено «Взял»: <b>2</b>", text)
 
+    def test_paper_stats_counts_profitable_time_exits_as_wins(self):
+        j = ideas.IdeaJournal(str(self.path / "paper-all.json"))
+        outcomes = [("expired", .05), ("expired", .98), ("stop", -1.0),
+                    ("expired", .11), ("expired", -.47)]
+        rows = []
+        for i, (status, result_r) in enumerate(outcomes):
+            x = self.sample(1 if i % 2 == 0 else -1)
+            x.id = f"outcome-{i}"
+            x.status = status
+            x.trigger_ts = x.created_ts + 1
+            x.realized_r = result_r
+            x.deliveries = [ideas.Delivery(1, 1, i + 1, "taken")]
+            rows.append(x)
+        no_entry = self.sample()
+        no_entry.id = "no-entry"
+        no_entry.status = "expired"
+        no_entry.deliveries = [ideas.Delivery(1, 1, 99, "taken")]
+        j.ideas = rows + [no_entry]
+        text = j.paper_stats(1, 30)
+        self.assertIn("🟢 Вин: <b>3</b> · 🔴 Луз: <b>2</b>", text)
+        self.assertIn("Фактический win rate: <b>60%</b>", text)
+        self.assertIn("Profit factor: <b>0.78</b>", text)
+        self.assertIn("Только цель/стоп: <b>0%</b>", text)
+
 
 class NewsRiskTests(TempCase):
     def item(self, title, tickers, priority=3):

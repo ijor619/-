@@ -30,6 +30,7 @@ SETUP_NAMES = {
     "pullback": "откат по тренду",
     "absorption": "поглощение у уровня",
 }
+OUTCOME_EPS_R = 0.01
 
 
 @dataclass
@@ -146,6 +147,29 @@ def idea_geometry_error(idea: Idea, reference_price: float = 0.0) -> str:
     return ""
 
 
+def outcome_metrics(rows: list[Idea]) -> dict[str, float | int | str]:
+    """Economic outcomes for every completed, triggered idea, including time exits."""
+    completed = [x for x in rows if x.trigger_ts and x.status in TERMINAL]
+    wins = [x for x in completed if x.realized_r >= OUTCOME_EPS_R]
+    losses = [x for x in completed if x.realized_r <= -OUTCOME_EPS_R]
+    flats = [x for x in completed if abs(x.realized_r) < OUTCOME_EPS_R]
+    decided = len(wins) + len(losses)
+    win_rate = len(wins) / decided * 100 if decided else 0.0
+    total_r = sum(x.realized_r for x in completed)
+    avg_r = total_r / len(completed) if completed else 0.0
+    gross_win = sum(x.realized_r for x in wins)
+    gross_loss = abs(sum(x.realized_r for x in losses))
+    if gross_loss:
+        pf = f"{gross_win / gross_loss:.2f}"
+    elif gross_win:
+        pf = "∞"
+    else:
+        pf = "—"
+    return {"completed": len(completed), "wins": len(wins), "losses": len(losses),
+            "flats": len(flats), "win_rate": win_rate, "total_r": total_r,
+            "avg_r": avg_r, "profit_factor": pf}
+
+
 class IdeaJournal:
     def __init__(self, path: str) -> None:
         self.path = path
@@ -238,13 +262,18 @@ class IdeaJournal:
         exp = [x for x in xs if x.status == "expired"]
         resolved = wins + stops
         wr = len(wins) / len(resolved) * 100 if resolved else 0.0
-        er = sum(x.realized_r for x in resolved) / len(resolved) if resolved else 0.0
+        outcomes = outcome_metrics(xs)
         act = len(triggered) / len(xs) * 100
         lines = [f"💡 <b>Статистика идей</b> · {days} дн."
                  + (f" · {ticker}" if ticker else ""),
                  f"Всего: <b>{len(xs)}</b> · активировано: <b>{len(triggered)}</b> ({act:.0f}%) · сейчас: {len(live)}",
                  f"✅ цель: <b>{len(wins)}</b> · 🛑 стоп: <b>{len(stops)}</b> · ↩️ отмена: {len(canc)} · ⌛ истекла: {len(exp)}",
-                 f"Точность после входа: <b>{wr:.0f}%</b> · ожидание: <b>{er:+.2f}R</b>", ""]
+                 f"🟢/🔴 Все завершённые входы: <b>{outcomes['wins']}/{outcomes['losses']}</b>"
+                 + (f" · без результата {outcomes['flats']}" if outcomes["flats"] else ""),
+                 f"Фактический win rate: <b>{outcomes['win_rate']:.0f}%</b> · среднее: "
+                 f"<b>{outcomes['avg_r']:+.2f}R</b> · PF: <b>{outcomes['profit_factor']}</b> · "
+                 f"сумма: <b>{outcomes['total_r']:+.2f}R</b>",
+                 f"Только цель/стоп: <b>{wr:.0f}%</b> ({len(wins)}/{len(stops)})", ""]
         groups: dict[tuple[str, int], list[Idea]] = {}
         for x in xs:
             groups.setdefault((x.setup, x.direction), []).append(x)
@@ -253,9 +282,9 @@ class IdeaJournal:
             tr = [x for x in grp if x.trigger_ts]
             w = sum(x.status == "target" for x in tr)
             s = sum(x.status == "stop" for x in tr)
-            resolved_group = [x for x in tr if x.status in ("target", "stop")]
-            group_er = (sum(x.realized_r for x in resolved_group) / len(resolved_group)
-                        if resolved_group else 0.0)
+            completed_group = [x for x in tr if x.status in TERMINAL]
+            group_er = (sum(x.realized_r for x in completed_group) / len(completed_group)
+                        if completed_group else 0.0)
             name = SETUP_NAMES.get(setup, setup)[:17]
             side = "L" if direction > 0 else "S"
             lines.append(f"{name:<17} {side} {len(grp):>3} {len(tr):>5} "
@@ -264,7 +293,8 @@ class IdeaJournal:
         taken = [x for x in xs if (x.delivery(uid) and x.delivery(uid).decision == "taken")]
         skipped = [x for x in xs if (x.delivery(uid) and x.delivery(uid).decision == "skipped")]
         lines.append(f"👆 Отметки: «взял» {len(taken)}, «пропустил» {len(skipped)}.")
-        lines.append("<i>Точность считается только по идеям, где цена сначала дошла до триггера; отмены до входа не портят win rate.</i>")
+        lines.append("<i>Основной win rate учитывает цель, стоп и закрытие по времени после входа. "
+                     "Отмены до триггера не считаются сделками. PF — сумма положительных R / сумма отрицательных R.</i>")
         return "\n".join(lines)
 
     def adaptive_adjustment(self, setup: str, direction: int,
@@ -315,11 +345,17 @@ class IdeaJournal:
         expectancy = sum(x.realized_r for x in resolved) / len(resolved) if resolved else 0.0
         completed = resolved + timed
         total_r = sum(x.realized_r for x in completed)
+        outcomes = outcome_metrics(rows)
         lines = [title,
                  f"Отмечено «Взял»: <b>{len(rows)}</b> · триггер достигнут: {len(triggered)}",
                  f"✅ цель: <b>{len(targets)}</b> · 🛑 стоп: <b>{len(stops)}</b> · ⌛ закрыты по времени: {len(timed)}",
-                 f"Точность цель/стоп: <b>{win_rate:.0f}%</b> · ожидание: <b>{expectancy:+.2f}R</b>",
-                 f"Сумма завершённых исходов: <b>{total_r:+.2f}R</b>",
+                 "",
+                 f"🟢 Вин: <b>{outcomes['wins']}</b> · 🔴 Луз: <b>{outcomes['losses']}</b>"
+                 + (f" · ⚪ около нуля: {outcomes['flats']}" if outcomes["flats"] else ""),
+                 f"Фактический win rate: <b>{outcomes['win_rate']:.0f}%</b> · средний результат: "
+                 f"<b>{outcomes['avg_r']:+.2f}R</b>",
+                 f"Profit factor: <b>{outcomes['profit_factor']}</b> · сумма: <b>{total_r:+.2f}R</b>",
+                 f"Только цель/стоп: <b>{win_rate:.0f}%</b> · ожидание <b>{expectancy:+.2f}R</b>",
                  f"Сейчас: ждут входа {len(waiting)} · активны {len(active)} · отменены до входа {len(no_entry)}",
                  "", "<b>Последние:</b>"]
         labels = {"target": "✅ цель", "stop": "🛑 стоп",
@@ -329,7 +365,8 @@ class IdeaJournal:
             result = f" · {idea.realized_r:+.2f}R" if idea.trigger_ts and idea.status in TERMINAL else ""
             lines.append(f"• {idea.ticker} {('L' if idea.direction > 0 else 'S')} · "
                          f"{labels.get(idea.status, idea.status)}{result}")
-        lines.append("<i>Это симуляция от триггера идеи. Она не проверяет покупку на счёте и не учитывает твоё реальное проскальзывание.</i>")
+        lines.append("<i>Вин/луз учитывает все завершённые входы, включая закрытые по времени; |результат| &lt;0,01R считается около нуля. "
+                     "Это симуляция от триггера идеи без проверки покупки на счёте и реального проскальзывания.</i>")
         return "\n".join(lines)
 
 
