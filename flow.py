@@ -23,6 +23,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import BufferedInputFile, InputMediaPhoto
 
 import charts
+import bounce as bnc
 import market
 import moex
 import setup as stp
@@ -99,7 +100,8 @@ BREAKOUT_HOLD_SEC = 60 * 60     # максимум/минимум дня дол�
 
 class FlowMonitor:
     def __init__(self, bot: Bot, store: Store, tk: TinkoffClient,
-                 journal: Journal, clusters=None, idea_journal: Optional[IdeaJournal] = None) -> None:
+                 journal: Journal, clusters=None, idea_journal: Optional[IdeaJournal] = None,
+                 bounce_journal: Optional[bnc.BounceJournal] = None) -> None:
         self.bot, self.store, self.tk, self.journal = bot, store, tk, journal
         self.clusters = clusters
         self._books: Dict[str, tape.BookState] = {}
@@ -130,6 +132,8 @@ class FlowMonitor:
         self._confirmed: Dict[int, dict] = {}                  # id(sig) -> {"facts": [...], "ctx": {...}}
         self.idea_journal = idea_journal
         self.idea_engine = IdeaEngine() if idea_journal is not None else None
+        self.bounce_journal = bounce_journal
+        self.bounce_engine = bnc.BounceEngine() if bounce_journal is not None else None
         self.stream = MarketStream()
         self._rest_trades: Dict[str, list[Trade]] = {}
         self._rest_trades_ts: Dict[str, float] = {}
@@ -430,6 +434,11 @@ class FlowMonitor:
                 await self._process_ideas(sess, tickers, im)
             except Exception:
                 log.exception("ideas: ошибка обработки")
+        if self.bounce_journal is not None:
+            try:
+                await self._process_bounces(sess, tickers, im)
+            except Exception:
+                log.exception("bounce: ошибка обработки")
         if not self._main_session():
             return   # новых идей/сырых push нет, но старые идеи сопровождаются
         # «второй факт»: считаем подтверждение один раз на бумагу и направление
@@ -496,6 +505,16 @@ class FlowMonitor:
             self._sent = {k: v for k, v in self._sent.items() if now - v < 3600}
 
     # ---------------------------------------------------------- trade ideas
+    def chart_trades(self, ticker: str, limit: int = 8) -> list:
+        """Merge regular ideas and local-low bounces into one chart history."""
+        rows = []
+        if self.idea_journal is not None:
+            rows.extend(self.idea_journal.for_chart(ticker, limit))
+        if self.bounce_journal is not None:
+            rows.extend(self.bounce_journal.for_chart(ticker, limit))
+        rows.sort(key=lambda x: x.trigger_ts or 0)
+        return rows[-limit:]
+
     def _book_metrics(self, t: str) -> tuple[Optional[float], Optional[float], Optional[float]]:
         """(spread %, distance-weighted queue imbalance, microprice edge %)."""
         ob = self._last_book.get(t)
@@ -620,7 +639,7 @@ class FlowMonitor:
                 if info is not None:
                     chart_png = await charts.build_chart(
                         sess, info, "5m", self.tk,
-                        trade_ideas=self.idea_journal.for_chart(idea.ticker, 8))
+                        trade_ideas=self.chart_trades(idea.ticker, 8))
             except Exception:
                 log.exception("ideas: не построен график сделки %s", idea.id)
         for delivery in list(idea.deliveries):
@@ -737,6 +756,124 @@ class FlowMonitor:
             dirty = True
         if dirty:
             self.idea_journal.save()
+
+    async def _bounce_update_messages(self, sess, idea, transition: str) -> None:
+        """Update a separate paper-bounce card and its numbered chart."""
+        note = {
+            "active": (f"🌱 <b>{idea.ticker}</b>: бумажный вход на отскок "
+                       f"{idea.entry_price:.{idea.decimals}f} ₽."),
+            "target": (f"✅ <b>{idea.ticker}</b>: отскок отработан, "
+                       f"итог после комиссии {idea.net_pct:+.2f}%."),
+            "stop": (f"🛑 <b>{idea.ticker}</b>: стоп по отскоку, "
+                     f"итог после комиссии {idea.net_pct:+.2f}%."),
+            "expired": (f"⌛ <b>{idea.ticker}</b>: выход из отскока по времени, "
+                        f"итог после комиссии {idea.net_pct:+.2f}%."),
+        }.get(transition)
+        chart_png = None
+        if transition in ("active", "target", "stop", "expired") and idea.trigger_ts:
+            try:
+                info = await self._info(sess, idea.ticker)
+                if info is not None:
+                    chart_png = await charts.build_chart(
+                        sess, info, "5m", self.tk,
+                        trade_ideas=self.chart_trades(idea.ticker, 8))
+            except Exception:
+                log.exception("bounce: не построен график %s", idea.id)
+        for delivery in list(idea.deliveries):
+            prof = self.store.get(delivery.uid)
+            kb = idea_kb(idea.id, idea.ticker, idea.status, decisions=False)
+            try:
+                await self.bot.edit_message_text(
+                    bnc.card(idea, prof.risk_rub), chat_id=delivery.chat_id,
+                    message_id=delivery.msg_id, reply_markup=kb)
+            except TelegramBadRequest as e:
+                if "not modified" not in str(e):
+                    log.debug("bounce: edit %s: %s", idea.id, e)
+            except Exception as e:
+                log.debug("bounce: edit %s: %s", idea.id, e)
+            if note and prof.bounce_alerts:
+                try:
+                    if chart_png:
+                        media = InputMediaPhoto(
+                            media=BufferedInputFile(chart_png, f"{idea.ticker}_{idea.id}.png"),
+                            caption=note)
+                        if delivery.chart_msg_id:
+                            try:
+                                await self.bot.edit_message_media(
+                                    media=media, chat_id=delivery.chat_id,
+                                    message_id=delivery.chart_msg_id, reply_markup=kb)
+                                continue
+                            except Exception as e:
+                                log.debug("bounce: chart edit %s: %s", idea.id, e)
+                        msg = await self.bot.send_photo(
+                            delivery.chat_id,
+                            BufferedInputFile(chart_png, f"{idea.ticker}_{idea.id}.png"),
+                            caption=note, reply_markup=kb)
+                        delivery.chart_msg_id = msg.message_id
+                    else:
+                        await self.bot.send_message(delivery.chat_id, note, reply_markup=kb)
+                except Exception:
+                    log.exception("bounce: не отправлен переход %s", transition)
+
+    async def _process_bounces(self, sess, tickers: list[str], im: dict) -> None:
+        """Detect, activate and score the independent local-low strategy."""
+        if self.bounce_journal is None or self.bounce_engine is None:
+            return
+        contexts = {t: self._idea_context(t, im) for t in tickers}
+        dirty = False
+        for idea in list(self.bounce_journal.active()):
+            ctx = contexts.get(idea.ticker)
+            if ctx is None:
+                continue
+            transition = update_lifecycle(idea, ctx.price)
+            if transition:
+                dirty = True
+                if (transition == "active" and not any(d.msg_id for d in idea.deliveries)
+                        and self.bounce_journal.publication_slot(idea.ticker)):
+                    recipients = [(uid, p) for uid, p in self.store.all()
+                                  if p.bounce_alerts and idea.ticker in p.watchlist
+                                  and not p.is_quiet(now_msk().hour)]
+                    for uid, prof in recipients:
+                        try:
+                            msg = await self.bot.send_message(
+                                uid, bnc.card(idea, prof.risk_rub),
+                                reply_markup=idea_kb(
+                                    idea.id, idea.ticker, idea.status, decisions=False))
+                            idea.deliveries.append(
+                                Delivery(uid, msg.chat.id, msg.message_id,
+                                         sent_ts=time.time()))
+                        except Exception:
+                            log.exception("bounce: не отправлен вход %s %s", idea.ticker, uid)
+                await self._bounce_update_messages(sess, idea, transition)
+        if not self._main_session():
+            if dirty:
+                self.bounce_journal.save()
+            return
+
+        pool = []
+        for ticker, ctx in contexts.items():
+            if ctx is None or self.bounce_journal.has_active(ticker, 1):
+                continue
+            history = sorted(self._prices.get(ticker, {}).items())
+            for idea in self.bounce_engine.candidates(bnc.BounceContext(ctx, history)):
+                pool.append((ticker, idea))
+        pool.sort(key=lambda row: row[1].confidence, reverse=True)
+        pending = sum(x.status == "prepared" for x in self.bounce_journal.active())
+        available = max(0, bnc.BOUNCE_DAILY_LIMIT
+                        - self.bounce_journal.published_today() - pending)
+        for ticker, idea in pool:
+            if available <= 0:
+                break
+            has_recipient = any(p.bounce_alerts and ticker in p.watchlist
+                                and not p.is_quiet(now_msk().hour)
+                                for _, p in self.store.all())
+            if not has_recipient or self.bounce_journal.has_active(ticker, 1):
+                continue
+            self.bounce_journal.ideas.append(idea)
+            available -= 1
+            dirty = True
+        if dirty:
+            self.bounce_journal.save()
 
     async def _send_signals(self, sess, uid: int, t: str,
                             sigs: list[tape.Signal]) -> bool:

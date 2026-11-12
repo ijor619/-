@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import clusters
+import bounce
 import charts
 import flow
 import journal
@@ -85,6 +86,76 @@ class ChartLabelTests(unittest.TestCase):
         png = charts.render(info, charts.PERIODS["5m"], candles,
                             trade_ideas=[idea])
         self.assertTrue(png.startswith(b"\x89PNG"))
+
+
+class BounceStrategyTests(TempCase):
+    def context(self, **changes):
+        data = dict(
+            ticker="SBER", price=100.2, prev_price=100.1, decimals=2, lot=10,
+            vwap=100.0, levels=[("сопротивление", 102.0)],
+            ch5=.10, ch15=.05, ch60=0.0, market15=.05,
+            buy_pct5=64.0, buy_pct15=58.0, volume_mult=1.5,
+            spread_pct=.05, book_imbalance=.08, microprice_edge_pct=.01,
+            breadth=60.0, sector_edge=.1, rsi14=52.0, ema_edge_pct=.1,
+            turnover_rub_min=1_000_000.0, fresh=True,
+            event_risk="", news_risk="")
+        data.update(changes)
+        return ideas.IdeaContext(**data)
+
+    @staticmethod
+    def reclaim_history(now):
+        rows = [(now - minute * 60, 100.5) for minute in range(45, 5, -1)]
+        rows[10] = (rows[10][0], 100.0)
+        rows += [(now - 300, 100.2), (now - 240, 100.1),
+                 (now - 120, 99.8), (now - 60, 100.05), (now, 100.2)]
+        return sorted(rows)
+
+    def test_false_sweep_requires_reclaim_and_creates_sane_geometry(self):
+        now = time.time()
+        found = bounce.BounceEngine().candidates(
+            bounce.BounceContext(self.context(), self.reclaim_history(now)))
+        self.assertEqual(len(found), 1)
+        idea = found[0]
+        self.assertEqual(idea.setup, "bounce_reclaim")
+        self.assertLess(idea.stop, idea.trigger)
+        self.assertLess(idea.trigger, idea.target1)
+        self.assertLess(idea.target1, idea.target2)
+        self.assertLess(abs(idea.target1 / idea.trigger - 1), .03)
+
+    def test_trend_support_bounce_is_separate_pattern(self):
+        now = time.time()
+        history = [(now - minute * 60, 100.35) for minute in range(30, 5, -1)]
+        history += [(now - 300, 100.0), (now - 240, 100.08),
+                    (now - 120, 100.25), (now, 100.4)]
+        ctx = self.context(price=100.4, prev_price=100.3, vwap=100.02,
+                           ch60=.8, ch15=-.1)
+        found = bounce.BounceEngine().candidates(
+            bounce.BounceContext(ctx, sorted(history)))
+        self.assertEqual([x.setup for x in found], ["bounce_trend"])
+
+    def test_falling_market_or_news_blocks_bottom_fishing(self):
+        history = self.reclaim_history(time.time())
+        for ctx in (self.context(market15=-.5),
+                    self.context(ch60=-.8),
+                    self.context(news_risk="важная новость")):
+            with self.subTest(ctx=ctx):
+                self.assertEqual(bounce.BounceEngine().candidates(
+                    bounce.BounceContext(ctx, history)), [])
+
+    def test_separate_stats_use_net_percent_after_two_commissions(self):
+        now = time.time()
+        idea = bounce.BounceEngine().candidates(
+            bounce.BounceContext(self.context(), self.reclaim_history(now)))[0]
+        idea.deliveries.append(ideas.Delivery(42, 42, 1, sent_ts=now))
+        ideas.update_lifecycle(idea, idea.trigger, now + 1)
+        ideas.update_lifecycle(idea, idea.target1, now + 2)
+        j = bounce.BounceJournal(str(self.path / "bounce_ideas.json"))
+        j.ideas.append(idea)
+        text = j.stats(42, 30)
+        self.assertIn("плюс: <b>1</b>", text)
+        self.assertIn("средний результат", text)
+        self.assertIn("Комиссия 0.04%", text)
+        self.assertGreater(idea.gross_pct, idea.net_pct)
 
 
 class DirectionTests(TempCase):
@@ -651,7 +722,7 @@ class StartupTests(unittest.IsolatedAsyncioTestCase):
         names = {x.command for x in published}
         self.assertTrue({"version", "diag", "ideas", "risk", "performance",
                          "riskboard", "limits", "why", "plan", "dayresult",
-                         "paperstats"} <= names)
+                         "paperstats", "bounce", "bouncestats"} <= names)
         self.assertNotIn("setup", names)
 
 
@@ -674,11 +745,13 @@ class StoreMigrationTests(TempCase):
         profile.daily_loss_limit_rub = 3000
         profile.max_positions = 3
         profile.max_sector_pct = 60
+        profile.bounce_alerts = False
         store.save()
         loaded = Store(target).get(42)
         self.assertEqual((loaded.risk_rub, loaded.daily_loss_limit_rub,
                           loaded.max_positions, loaded.max_sector_pct),
                          (1000, 3000, 3, 60))
+        self.assertFalse(loaded.bounce_alerts)
 
 
 class PerformanceTests(unittest.TestCase):

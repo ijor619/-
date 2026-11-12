@@ -81,10 +81,11 @@ def flow_kb(ticker: str) -> InlineKeyboardMarkup:
     ])
 
 
-def idea_kb(idea_id: str, ticker: str, status: str) -> InlineKeyboardMarkup:
+def idea_kb(idea_id: str, ticker: str, status: str,
+            decisions: bool = True) -> InlineKeyboardMarkup:
     """Actions under an idea card; callback stays under Telegram's 64 bytes."""
     rows: list[list[InlineKeyboardButton]] = []
-    if status in ("prepared", "active"):
+    if decisions and status in ("prepared", "active"):
         rows.append([
             InlineKeyboardButton(text="✅ Взял", callback_data=f"idea:take:{idea_id}"),
             InlineKeyboardButton(text="⏭ Пропустил", callback_data=f"idea:skip:{idea_id}"),

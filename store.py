@@ -11,7 +11,7 @@ class UserProfile:
                  "report_min", "last_report_ts", "flow_alerts", "quiet_from", "quiet_to",
                  "clear_hour", "idea_alerts", "raw_flow_alerts", "risk_rub",
                  "idea_min_conf", "daily_loss_limit_rub", "max_positions",
-                 "max_sector_pct")
+                 "max_sector_pct", "bounce_alerts")
 
     def __init__(self) -> None:
         self.watchlist: list[str] = []      # тикеры в верхнем регистре
@@ -21,6 +21,7 @@ class UserProfile:
         self.last_report_ts: float = 0.0    # unix-время последней сводки
         self.flow_alerts: bool = True       # сигналы по ленте/стакану (роботы)
         self.idea_alerts: bool = True       # торговые идеи со входом/стопом/целью
+        self.bounce_alerts: bool = True     # отдельные бумажные отскоки от локального минимума
         self.raw_flow_alerts: bool = False  # сырые киты/стены — по умолчанию только контекст
         self.risk_rub: float = 0.0          # риск на идею, ₽; 0 = не считать размер
         self.idea_min_conf: int = 65        # минимальная оценка идеи
@@ -40,6 +41,7 @@ class UserProfile:
             "last_report_ts": self.last_report_ts,
             "flow_alerts": self.flow_alerts,
             "idea_alerts": self.idea_alerts,
+            "bounce_alerts": self.bounce_alerts,
             "raw_flow_alerts": self.raw_flow_alerts,
             "risk_rub": self.risk_rub,
             "idea_min_conf": self.idea_min_conf,
@@ -61,6 +63,7 @@ class UserProfile:
         p.last_report_ts = float(d.get("last_report_ts", 0.0))
         p.flow_alerts = bool(d.get("flow_alerts", True))
         p.idea_alerts = bool(d.get("idea_alerts", True))
+        p.bounce_alerts = bool(d.get("bounce_alerts", True))
         p.raw_flow_alerts = bool(d.get("raw_flow_alerts", False))
         p.risk_rub = max(0.0, float(d.get("risk_rub", 0.0)))
         p.idea_min_conf = max(40, min(90, int(d.get("idea_min_conf", 65))))

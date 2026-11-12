@@ -27,6 +27,7 @@ from aiogram.types import (BotCommand, BotCommandScopeAllPrivateChats,
                            ReplyKeyboardMarkup)
 
 import charts
+import bounce as bnc
 import cleaner
 import screener as scrmod
 import clusters as clu
@@ -52,7 +53,7 @@ from store import Store
 
 log = logging.getLogger(__name__)
 
-BUILD_VERSION = "4.4.1-clean-percent-charts-2026-11-13"
+BUILD_VERSION = "4.5.0-local-low-bounce-2026-11-13"
 
 router = Router(name="stockbot")
 
@@ -103,6 +104,8 @@ HELP = (
     "/chart TICKER [1m|5m|15m|30m|1h|4h|1d] — свечной график\n"
     "/book TICKER — стакан, /tape TICKER — лента сделок\n"
     "/ideas [30] [SBER] — активные идеи и статистика цель/стоп/отмена\n"
+    "/bounce [on|off] — бумажные входы на подтверждённый отскок от локального минимума\n"
+    "/bouncestats [30] [SBER] — отдельная статистика отскоков в процентах\n"
     "/risk 1000 — риск на одну идею в рублях (для расчёта лотов)\n"
     "/performance [30] [SBER] — реальные закрытые сделки из T‑Invest\n"
     "/riskboard — позиции, дневной P/L и контроль лимитов\n"
@@ -143,6 +146,8 @@ def _help_text(store: Store, user_id: int) -> str:
         + f" · мин. оценка {p.idea_min_conf}/100 · риск {p.risk_rub:g} ₽"
         + f"\nФокус идей: до {MAX_IDEAS_PER_DAY}/день · комиссия "
         + f"{COMMISSION_PCT_PER_SIDE:g}% на входе и выходе"
+        + f"\nОтскоки от минимума: {'включены' if p.bounce_alerts else 'выключены'}"
+        + f" · до {bnc.BOUNCE_DAILY_LIMIT}/день · только бумажная симуляция"
         + f"\nЛимит дня: {p.daily_loss_limit_rub:g} ₽ · "
         + f"позиций {p.max_positions or '∞'} · сектор {f'{p.max_sector_pct:g}%' if p.max_sector_pct else 'без лимита'}"
         + f"\nСырые события ленты: {'включены' if p.raw_flow_alerts else 'выключены'}"
@@ -249,9 +254,8 @@ async def show_chart(bot: Bot, chat_id: int, sess: aiohttp.ClientSession,
                                    tk if tinkoff.enabled() else None,
                                    vol_levels=vol_levels,
                                    day_change_pct=day_change_pct,
-                                   trade_ideas=(flow.idea_journal.for_chart(
-                                       t, 8)
-                                                if flow and flow.idea_journal else None))
+                                   trade_ideas=(flow.chart_trades(t, 8)
+                                                if flow else None))
     if png is None:
         return f"Нет данных для графика {esc(t)}."
     file = BufferedInputFile(png, f"{t}_{period}.png")
@@ -1045,6 +1049,47 @@ async def cmd_paperstats(m: Message, idea_journal: IdeaJournal) -> None:
     await m.answer(idea_journal.paper_stats(m.from_user.id, days, ticker))
 
 
+@router.message(Command("bounce"))
+async def cmd_bounce(m: Message, bounce_journal: bnc.BounceJournal,
+                     store: Store) -> None:
+    """Control and inspect the independent paper bounce strategy."""
+    args = (m.text or "").split()[1:]
+    p = store.get(m.from_user.id)
+    if args and args[0].lower() in ("on", "off"):
+        p.bounce_alerts = args[0].lower() == "on"
+        store.save()
+        await m.answer(
+            f"🌱 Отскоки от локального минимума: "
+            f"<b>{'включены' if p.bounce_alerts else 'выключены'}</b>.\n"
+            "Это бумажная симуляция: заявки брокеру не отправляются.")
+        return
+    active = [x for x in bounce_journal.active()
+              if x.delivery(m.from_user.id) is not None]
+    lines = ["🌱 <b>Отскок от локального минимума</b>",
+             f"Статус: <b>{'включен' if p.bounce_alerts else 'выключен'}</b>",
+             f"Лимит: до <b>{bnc.BOUNCE_DAILY_LIMIT}</b> активированных входов за день по всем бумагам.",
+             "Модели: ложный вынос минимума с возвратом; отскок от VWAP/уровня в восходящем тренде.",
+             f"Комиссия: {COMMISSION_PCT_PER_SIDE:g}% на входе и выходе."]
+    if active:
+        lines += ["", "<b>Сейчас сопровождаются:</b>"]
+        lines += [f"• {x.ticker} · {bnc.BOUNCE_SETUP_NAMES.get(x.setup, x.setup)} · {x.status}"
+                  for x in active]
+    lines += ["", "/bounce on|off · /bouncestats 30 [TICKER]",
+              "<i>Бот ждёт подтверждения отскока, а не ловит падающую цену.</i>"]
+    await m.answer("\n".join(lines))
+
+
+@router.message(Command("bouncestats"))
+async def cmd_bouncestats(m: Message, bounce_journal: bnc.BounceJournal) -> None:
+    days, ticker = 30, ""
+    for arg in (m.text or "").split()[1:]:
+        if arg.isdigit():
+            days = max(1, min(int(arg), 180))
+        elif TICKER_RE.match(arg.upper()):
+            ticker = arg.upper()
+    await m.answer(bounce_journal.stats(m.from_user.id, days, ticker))
+
+
 def _user_active_idea(journal: IdeaJournal, uid: int, ticker: str = ""):
     rows = [x for x in journal.active(ticker or None) if x.delivery(uid)]
     return max(rows, key=lambda x: x.created_ts) if rows else None
@@ -1692,6 +1737,8 @@ BOT_COMMANDS = [
     ("calendar", "Календарь: дивиденды, ЦБ, отчётности — /calendar 14"),
     ("event", "Добавить/удалить событие — /event add SBER 2026-11-05 МСФО"),
     ("ideas", "Торговые идеи и их статистика — /ideas 30"),
+    ("bounce", "Бумажные отскоки от локального минимума"),
+    ("bouncestats", "Статистика отскоков в % — /bouncestats 30"),
     ("paperstats", "Бумажные сделки по кнопке «Взял»"),
     ("risk", "Риск на идею и расчёт лотов — /risk 1000"),
     ("performance", "Реальные закрытые сделки — /performance 30"),
@@ -1758,7 +1805,8 @@ def main_kb(watchlist: list[str]) -> ReplyKeyboardMarkup:
             [KeyboardButton(text="📈 График"), KeyboardButton(text="📚 Стакан"),
              KeyboardButton(text="🧾 Лента")],
             [KeyboardButton(text="🔎 Скринер"), KeyboardButton(text="💡 Идеи"),
-             KeyboardButton(text="📊 Статистика"),
+             KeyboardButton(text="🌱 Отскоки")],
+            [KeyboardButton(text="📊 Статистика"),
              KeyboardButton(text="📰 Новости"), KeyboardButton(text="⚙️ Настройки")]]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True,
                                input_field_placeholder="Тикер или команда…")
@@ -1769,7 +1817,7 @@ MENU_MAP = {
     "📋 Список": "list", "🧠 Почему?": "why", "🧮 Кластеры": "clusters",
     "📈 График": "chart", "📚 Стакан": "book", "🧾 Лента": "tape",
     "📊 Статистика": "stats", "📰 Новости": "news", "⚙️ Настройки": "settings",
-    "🔎 Скринер": "screener", "💡 Идеи": "ideas",
+    "🔎 Скринер": "screener", "💡 Идеи": "ideas", "🌱 Отскоки": "bounce",
 }
 NEEDS_TICKER = {"why", "clusters", "chart", "book", "tape"}
 
@@ -1899,8 +1947,10 @@ def main() -> None:
     monitor = Monitor(bot, store, tk if tinkoff.enabled() else None)
     journal = Journal(os.path.join(os.path.dirname(DATA_FILE) or ".", "signals.json"))
     idea_journal = IdeaJournal(os.path.join(os.path.dirname(DATA_FILE) or ".", "ideas.json"))
+    bounce_journal = bnc.BounceJournal(
+        os.path.join(os.path.dirname(DATA_FILE) or ".", "bounce_ideas.json"))
     cstore = clu.ClusterStore(os.path.join(os.path.dirname(DATA_FILE) or ".", "clusters.json"))
-    flow = FlowMonitor(bot, store, tk, journal, cstore, idea_journal)
+    flow = FlowMonitor(bot, store, tk, journal, cstore, idea_journal, bounce_journal)
     newsmon = NewsMonitor(bot, store,
                           os.path.join(os.path.dirname(DATA_FILE) or ".", "news_seen.json"),
                           mode=os.getenv("NEWS_MODE", "stocks"))
@@ -1931,7 +1981,8 @@ def main() -> None:
         try:
             await dp.start_polling(bot, store=store, sess=session, tk=tk,
                                    journal=journal, newsmon=newsmon, cstore=cstore, flow=flow,
-                                   idea_journal=idea_journal, csq=csq, sent=sent, scr=scr, cal=cal)
+                                   idea_journal=idea_journal, bounce_journal=bounce_journal,
+                                   csq=csq, sent=sent, scr=scr, cal=cal)
         finally:
             menu_task.cancel()
             cal_task.cancel()
