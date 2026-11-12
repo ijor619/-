@@ -137,6 +137,23 @@ class Idea:
     def side(self) -> str:
         return "лонг" if self.direction > 0 else "шорт"
 
+    @property
+    def gross_pct(self) -> float:
+        if self.entry_price <= 0 or self.exit_price <= 0:
+            return 0.0
+        return ((self.exit_price / self.entry_price - 1) * 100 * self.direction)
+
+    @property
+    def commission_pct(self) -> float:
+        if self.entry_price <= 0 or self.exit_price <= 0:
+            return 0.0
+        return ((self.entry_price + self.exit_price) / self.entry_price
+                * COMMISSION_RATE_PER_SIDE * 100)
+
+    @property
+    def net_pct(self) -> float:
+        return self.gross_pct - self.commission_pct
+
     def delivery(self, uid: int) -> Optional[Delivery]:
         return next((d for d in self.deliveries if d.uid == uid), None)
 
@@ -802,8 +819,8 @@ def card(idea: Idea, risk_rub: float = 0.0) -> str:
     if idea.status in TERMINAL:
         lines += ["", f"Итог: <b>{idea.close_reason}</b>"]
         if idea.trigger_ts:
-            lines.append(f"Результат после комиссии: <b>{idea.realized_r:+.2f}R</b> "
-                         f"(движение {idea.gross_r:+.2f}R − комиссия {idea.commission_r:.2f}R) · "
+            lines.append(f"Результат после комиссии: <b>{idea.net_pct:+.2f}%</b> "
+                         f"(движение {idea.gross_pct:+.2f}% − комиссия {idea.commission_pct:.2f}%) · "
                          f"MFE {idea.mfe_pct:+.2f}% · MAE {idea.mae_pct:+.2f}%")
     elif idea.status == "prepared":
         mins = max(0, int((idea.expires_ts - time.time()) / 60))

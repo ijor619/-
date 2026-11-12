@@ -608,10 +608,10 @@ class FlowMonitor:
         """Edit the card and keep one entry/result chart for the virtual trade."""
         note = {
             "active": f"🚀 <b>{idea.ticker} {idea.side}</b>: виртуальный вход по триггеру {idea.entry_price:.{idea.decimals}f} ₽.",
-            "target": f"✅ <b>{idea.ticker} {idea.side}</b>: цель достигнута, итог после комиссии {idea.realized_r:+.2f}R.",
-            "stop": f"🛑 <b>{idea.ticker} {idea.side}</b>: стоп, итог после комиссии {idea.realized_r:+.2f}R.",
+            "target": f"✅ <b>{idea.ticker} {idea.side}</b>: цель достигнута, итог после комиссии {idea.net_pct:+.2f}%.",
+            "stop": f"🛑 <b>{idea.ticker} {idea.side}</b>: стоп, итог после комиссии {idea.net_pct:+.2f}%.",
             "cancelled": f"↩️ <b>{idea.ticker} {idea.side}</b>: идея отменилась до входа — {idea.close_reason}.",
-            "expired": f"⌛ <b>{idea.ticker} {idea.side}</b>: выход по времени, итог после комиссии {idea.realized_r:+.2f}R.",
+            "expired": f"⌛ <b>{idea.ticker} {idea.side}</b>: выход по времени, итог после комиссии {idea.net_pct:+.2f}%.",
         }.get(transition)
         chart_png = None
         if transition in ("active", "target", "stop", "expired") and idea.trigger_ts:
@@ -620,7 +620,7 @@ class FlowMonitor:
                 if info is not None:
                     chart_png = await charts.build_chart(
                         sess, info, "5m", self.tk,
-                        trade_ideas=self.idea_journal.for_chart(idea.ticker, 12))
+                        trade_ideas=self.idea_journal.for_chart(idea.ticker, 8))
             except Exception:
                 log.exception("ideas: не построен график сделки %s", idea.id)
         for delivery in list(idea.deliveries):

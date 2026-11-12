@@ -52,7 +52,7 @@ from store import Store
 
 log = logging.getLogger(__name__)
 
-BUILD_VERSION = "4.4.0-focused-ideas-charts-2026-11-13"
+BUILD_VERSION = "4.4.1-clean-percent-charts-2026-11-13"
 
 router = Router(name="stockbot")
 
@@ -250,7 +250,7 @@ async def show_chart(bot: Bot, chat_id: int, sess: aiohttp.ClientSession,
                                    vol_levels=vol_levels,
                                    day_change_pct=day_change_pct,
                                    trade_ideas=(flow.idea_journal.for_chart(
-                                       t, 8 if period in ("4h", "1d") else 12)
+                                       t, 8)
                                                 if flow and flow.idea_journal else None))
     if png is None:
         return f"Нет данных для графика {esc(t)}."

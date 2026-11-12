@@ -81,7 +81,7 @@ class ChartLabelTests(unittest.TestCase):
             trigger_ts=datetime(2026, 11, 13, 10, 5, tzinfo=ideas.MSK).timestamp(),
             closed_ts=datetime(2026, 11, 13, 10, 20, tzinfo=ideas.MSK).timestamp(),
             entry_price=100.1, trigger=100.1, exit_price=100.7,
-            direction=1, realized_r=.42, status="expired")
+            direction=1, realized_r=.42, net_pct=.52, status="expired")
         png = charts.render(info, charts.PERIODS["5m"], candles,
                             trade_ideas=[idea])
         self.assertTrue(png.startswith(b"\x89PNG"))
@@ -749,6 +749,8 @@ class IdeaTests(TempCase):
         self.assertAlmostEqual(x.gross_r, 1.5)
         self.assertGreater(x.commission_r, 0)
         self.assertAlmostEqual(x.realized_r, 1.5 - x.commission_r)
+        self.assertAlmostEqual(x.net_pct, x.gross_pct - x.commission_pct)
+        self.assertGreater(x.net_pct, 1.4)
         self.assertGreater(x.mfe_pct, 0)
 
     def test_tradeable_gate_removes_noisy_setups_but_keeps_repeated_ticker(self):

@@ -197,6 +197,24 @@ def render(info: SecurityInfo, p: Period, cs: list[Candle],
     xs = range(n)
     last = cs[-1].close
     colors = [UP if c.close >= c.open else DOWN for c in cs]
+    span_end = cs[-1].begin + (timedelta(days=1) if p.base == 24 else
+                               timedelta(minutes=p.base * p.agg))
+
+    def _trade_point(ts: float) -> Optional[int]:
+        if not ts:
+            return None
+        dt = datetime.fromtimestamp(ts, moex.MSK).replace(tzinfo=None)
+        if dt < cs[0].begin or dt > span_end:
+            return None
+        return min(range(n), key=lambda i: abs((cs[i].begin - dt).total_seconds()))
+
+    visible_trades = []
+    for idea in (trade_ideas or []):
+        xi = _trade_point(getattr(idea, "trigger_ts", 0.0))
+        xo = _trade_point(getattr(idea, "closed_ts", 0.0))
+        if xi is not None or xo is not None:
+            visible_trades.append((idea, xi, xo))
+    trade_mode = bool(visible_trades)
 
     fig = plt.figure(figsize=(9, 5.2), dpi=150, facecolor="white")
     gs = gridspec.GridSpec(2, 1, height_ratios=[4, 1], hspace=0.05)
@@ -212,13 +230,13 @@ def render(info: SecurityInfo, p: Period, cs: list[Candle],
            edgecolor=colors, linewidth=0.6)
 
     # линия предыдущего закрытия (актуальна для внутридневных периодов)
-    if p.base != 24 and info.prev_close > 0:
+    if not trade_mode and p.base != 24 and info.prev_close > 0:
         ax.axhline(info.prev_close, color=MUTED, linewidth=0.9, linestyle="--")
         ax.annotate(f"пред. закр. {fmt_price(info.prev_close, info.decimals)}",
                     xy=(0, info.prev_close), xytext=(3, 3),
                     textcoords="offset points", fontsize=7.5, color=MUTED)
     # уровни: high/low дня, VWAP, стены стакана (только внутридневные периоды)
-    if p.base != 24:
+    if not trade_mode and p.base != 24:
         lo_y, hi_y = min(c.low for c in cs), max(c.high for c in cs)
         pad = (hi_y - lo_y) * 0.25 or last * 0.005
         def _in_view(v: float) -> bool:
@@ -252,70 +270,62 @@ def render(info: SecurityInfo, p: Period, cs: list[Candle],
                             xytext=(-2, 2), textcoords="offset points", fontsize=7,
                             color=c, ha="right")
 
-    # текущая цена
-    ax.axhline(last, color=colors[-1], linewidth=0.7, alpha=0.6)
-    ax.annotate(fmt_price(last, info.decimals), xy=(n - 1, last),
-                xytext=(6, -3), textcoords="offset points", fontsize=8,
-                color="white", fontweight="bold",
-                bbox=dict(boxstyle="round,pad=0.25", fc=colors[-1], ec="none"))
+    # Текущая цена остаётся в заголовке. В чистом режиме сделок отдельная
+    # горизонталь и ценовая плашка только мешают входам/выходам.
+    if not trade_mode:
+        ax.axhline(last, color=colors[-1], linewidth=0.7, alpha=0.6)
+        ax.annotate(fmt_price(last, info.decimals), xy=(n - 1, last),
+                    xytext=(6, -3), textcoords="offset points", fontsize=8,
+                    color="white", fontweight="bold",
+                    bbox=dict(boxstyle="round,pad=0.25", fc=colors[-1], ec="none"))
 
     # Virtual executions from the idea journal. A prepared/cancelled idea has
     # no entry and is deliberately absent: the chart depicts only trades that
     # would actually have been opened by the simulator.
-    plotted_trades = 0
-    if trade_ideas:
-        span_end = cs[-1].begin + (timedelta(days=1) if p.base == 24 else
-                                   timedelta(minutes=p.base * p.agg))
-
-        def _point(ts: float) -> Optional[int]:
-            if not ts:
-                return None
-            dt = datetime.fromtimestamp(ts, moex.MSK).replace(tzinfo=None)
-            if dt < cs[0].begin or dt > span_end:
-                return None
-            return min(range(n), key=lambda i: abs((cs[i].begin - dt).total_seconds()))
-
-        for seq, idea in enumerate(trade_ideas):
-            xi = _point(getattr(idea, "trigger_ts", 0.0))
-            xo = _point(getattr(idea, "closed_ts", 0.0))
-            if xi is None and xo is None:
-                continue
+    if trade_mode:
+        result_items = []
+        for seq, (idea, xi, xo) in enumerate(visible_trades[:8]):
+            trade_no = seq + 1
             entry = float(getattr(idea, "entry_price", 0.0) or getattr(idea, "trigger", 0.0))
             exit_price = float(getattr(idea, "exit_price", 0.0) or 0.0)
             direction = int(getattr(idea, "direction", 0))
-            net_r = float(getattr(idea, "realized_r", 0.0) or 0.0)
             status = getattr(idea, "status", "")
-            result_color = UP if net_r > 0.01 else DOWN if net_r < -0.01 else MUTED
+            net_pct = getattr(idea, "net_pct", None)
+            if net_pct is None:
+                net_pct = ((exit_price / entry - 1) * 100 * direction
+                           if entry > 0 and exit_price > 0 else 0.0)
+            net_pct = float(net_pct)
+            result_color = UP if net_pct > 0.005 else DOWN if net_pct < -0.005 else MUTED
+            jitter = ((seq % 3) - 1) * 0.13
+            x_entry = xi + jitter if xi is not None else None
+            x_exit = xo + jitter if xo is not None else None
             if xi is not None and entry > 0:
-                marker = "^" if direction > 0 else "v"
-                ax.scatter([xi], [entry], marker=marker, s=54, color="#2563eb",
-                           edgecolors="white", linewidths=0.7, zorder=8)
-                offset = 10 if direction > 0 else -17
-                ax.annotate(f"Вход {'L' if direction > 0 else 'S'}\n{fmt_price(entry, info.decimals)}",
-                            xy=(xi, entry), xytext=(0, offset), textcoords="offset points",
-                            ha="center", va="bottom" if direction > 0 else "top",
-                            fontsize=6.3, color="#1d4ed8", fontweight="bold",
-                            bbox=dict(boxstyle="round,pad=0.18", fc="white",
-                                      ec="#93c5fd", alpha=0.88), zorder=9)
+                ax.scatter([x_entry], [entry], marker="o", s=72, facecolor="white",
+                           edgecolor="#2563eb", linewidth=1.7, zorder=8)
+                ax.text(x_entry, entry, str(trade_no), ha="center", va="center",
+                        fontsize=6.2, color="#1d4ed8", fontweight="bold", zorder=9)
             if xi is not None and xo is not None and entry > 0 and exit_price > 0:
-                ax.plot([xi, xo], [entry, exit_price], color=result_color,
-                        linewidth=1.4, linestyle="--", alpha=0.9, zorder=6)
+                ax.plot([x_entry, x_exit], [entry, exit_price], color=result_color,
+                        linewidth=1.25, alpha=0.82, zorder=6)
             if xo is not None and exit_price > 0 and status in ("target", "stop", "expired"):
-                ax.scatter([xo], [exit_price], marker="X", s=58, color=result_color,
-                           edgecolors="white", linewidths=0.7, zorder=8)
-                vertical = 12 if seq % 2 == 0 else -21
-                ax.annotate(f"Выход {net_r:+.2f}R\nпосле комиссии",
-                            xy=(xo, exit_price), xytext=(4, vertical),
-                            textcoords="offset points", ha="left",
-                            va="bottom" if vertical > 0 else "top", fontsize=6.3,
-                            color=result_color, fontweight="bold",
-                            bbox=dict(boxstyle="round,pad=0.18", fc="white",
-                                      ec=result_color, alpha=0.9), zorder=9)
-            plotted_trades += 1
-        if plotted_trades:
-            ax.text(0.995, 0.015, "▲/▼ вход · ✕ выход · результат после комиссии",
-                    transform=ax.transAxes, ha="right", va="bottom", fontsize=6.5,
-                    color=MUTED, bbox=dict(fc="white", ec="none", alpha=0.78))
+                ax.scatter([x_exit], [exit_price], marker="o", s=72, facecolor="white",
+                           edgecolor=result_color, linewidth=1.7, zorder=8)
+                ax.text(x_exit, exit_price, str(trade_no), ha="center", va="center",
+                        fontsize=6.2, color=result_color, fontweight="bold", zorder=9)
+                result_items.append((trade_no, f"{net_pct:+.2f}%", result_color))
+            else:
+                result_items.append((trade_no, "вход", "#2563eb"))
+
+        # Compact numbered result strip, matching the chosen mock-up. It uses
+        # axes coordinates, so it stays readable on every timeframe.
+        gap = min(0.145, 0.80 / max(1, len(result_items)))
+        start = 0.5 - gap * (len(result_items) - 1) / 2
+        for idx, (trade_no, result, color) in enumerate(result_items):
+            ax.text(start + idx * gap, 0.018, f"{trade_no}  {result}",
+                    transform=ax.transAxes, ha="center", va="bottom",
+                    fontsize=6.8, color=color, fontweight="bold",
+                    bbox=dict(boxstyle="round,pad=0.28", fc="white",
+                              ec="#d1d5db", alpha=0.94), zorder=10)
 
     ax.set_title(chart_title(info, p, cs, day_change_pct),
                  loc="left", fontsize=10.5, fontweight="bold", color=TXT)
@@ -323,7 +333,7 @@ def render(info: SecurityInfo, p: Period, cs: list[Candle],
     # нижняя панель: кумулятивная дельта (если есть) поверх объёма
     axv.bar(xs, [c.volume for c in cs], width=0.7, color=colors, alpha=0.35)
     axv.set_ylabel("Объём", fontsize=7.5, color=MUTED)
-    if ov.delta and len(ov.delta) == n and any(ov.delta):
+    if not trade_mode and ov.delta and len(ov.delta) == n and any(ov.delta):
         axd = axv.twinx()
         dcol = UP if ov.delta[-1] >= 0 else DOWN
         axd.plot(list(xs), ov.delta, color=dcol, linewidth=1.4)
