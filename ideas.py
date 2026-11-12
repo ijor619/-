@@ -13,6 +13,7 @@ import math
 import os
 import time
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import uuid4
 
@@ -31,6 +32,23 @@ SETUP_NAMES = {
     "absorption": "поглощение у уровня",
 }
 OUTCOME_EPS_R = 0.01
+MSK = timezone(timedelta(hours=3))
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)).replace(",", "."))
+    except (TypeError, ValueError):
+        return default
+
+
+# Broker commission is charged on both the entry and the exit. 0.04% per
+# operation therefore means about 0.08% for a completed round trip.
+COMMISSION_PCT_PER_SIDE = max(0.0, _env_float("IDEA_COMMISSION_PCT", 0.04))
+COMMISSION_RATE_PER_SIDE = COMMISSION_PCT_PER_SIDE / 100
+ROUND_TRIP_COST_BPS = COMMISSION_PCT_PER_SIDE * 2 * 100
+MAX_IDEAS_PER_DAY = max(1, int(_env_float("IDEA_DAILY_LIMIT", 8)))
+MIN_TRADEABLE_CONFIDENCE = max(1, int(_env_float("IDEA_MIN_QUALITY", 70)))
 
 
 @dataclass
@@ -72,6 +90,8 @@ class Delivery:
     chat_id: int
     msg_id: int
     decision: str = ""       # taken / skipped
+    chart_msg_id: int = 0    # one entry/result chart, edited through the lifecycle
+    sent_ts: float = 0.0     # activation publication time; old rows fall back to idea time
 
 
 @dataclass
@@ -106,6 +126,8 @@ class Idea:
     mfe_pct: float = 0.0
     mae_pct: float = 0.0
     realized_r: float = 0.0
+    gross_r: float = 0.0
+    commission_r: float = 0.0
     market_regime: str = ""
     timeframe_score: int = 0
     liquidity_rub_min: float = 0.0
@@ -147,6 +169,45 @@ def idea_geometry_error(idea: Idea, reference_price: float = 0.0) -> str:
     return ""
 
 
+def commission_in_r(entry_price: float, exit_price: float, stop: float) -> float:
+    """Two-sided broker commission expressed in initial stop-risk units."""
+    risk = abs(entry_price - stop)
+    if entry_price <= 0 or exit_price <= 0 or risk <= 0:
+        return 0.0
+    rub_per_share = (entry_price + exit_price) * COMMISSION_RATE_PER_SIDE
+    return rub_per_share / risk
+
+
+def set_net_outcome(idea: Idea, gross_r: float) -> None:
+    """Persist gross, commission and net R for a completed virtual trade."""
+    idea.gross_r = gross_r
+    idea.commission_r = commission_in_r(idea.entry_price, idea.exit_price, idea.stop)
+    idea.realized_r = gross_r - idea.commission_r
+
+
+def is_tradeable(idea: Idea) -> bool:
+    """Evidence-based temporary gate used while a longer sample accumulates."""
+    if idea.setup == "absorption":
+        return False
+    if idea.setup == "pullback" and idea.direction < 0:
+        return False
+    if idea.market_regime == "тренд вниз":
+        return False
+    # Continuation needs unanimous 5/15/60-minute alignment. A false breakout
+    # is a reversal by construction and is useful only while those horizons
+    # have not already crowded into the new direction.
+    if idea.setup == "false_breakout":
+        if idea.timeframe_score > 0:
+            return False
+    elif idea.timeframe_score != 3:
+        return False
+    # Scores >=90 were inversely calibrated in the first forward sample. Keep
+    # them in the detector code, but do not expose them as executable ideas.
+    if idea.confidence < MIN_TRADEABLE_CONFIDENCE or idea.confidence >= 90:
+        return False
+    return True
+
+
 def outcome_metrics(rows: list[Idea]) -> dict[str, float | int | str]:
     """Economic outcomes for every completed, triggered idea, including time exits."""
     completed = [x for x in rows if x.trigger_ts and x.status in TERMINAL]
@@ -184,7 +245,22 @@ class IdeaJournal:
                 raise ValueError("неизвестная версия журнала идей")
             self.ideas = []
             dropped = 0
+            migrated = 0
             for row in raw.get("ideas", []):
+                # Old journals stored gross R only. Migrate once so historical
+                # reports and new results use the same net-of-commission basis.
+                if ("gross_r" not in row and row.get("trigger_ts")
+                        and row.get("status") in TERMINAL):
+                    gross = float(row.get("realized_r") or 0.0)
+                    fee_r = commission_in_r(float(row.get("entry_price") or 0.0),
+                                            float(row.get("exit_price") or 0.0),
+                                            float(row.get("stop") or 0.0))
+                    row["gross_r"] = gross
+                    row["commission_r"] = fee_r
+                    row["realized_r"] = gross - fee_r
+                    migrated += 1
+                row.setdefault("gross_r", 0.0)
+                row.setdefault("commission_r", 0.0)
                 row["deliveries"] = [Delivery(**d) for d in row.get("deliveries", [])]
                 idea = Idea(**row)
                 reason = idea_geometry_error(idea)
@@ -194,7 +270,7 @@ class IdeaJournal:
                                 idea.ticker, idea.id, reason)
                     continue
                 self.ideas.append(idea)
-            if dropped:
+            if dropped or migrated:
                 self.save()
         except FileNotFoundError:
             self.ideas = []
@@ -238,6 +314,31 @@ class IdeaJournal:
         return any(x.ticker == ticker and x.direction == direction and x.status in ACTIVE
                    for x in self.ideas)
 
+    @staticmethod
+    def _msk_day(ts: float):
+        return datetime.fromtimestamp(ts, MSK).date()
+
+    def published_today(self, ticker: str = "", now: Optional[float] = None) -> int:
+        day = self._msk_day(now or time.time())
+        return sum(1 for x in self.ideas
+                   if any(d.msg_id > 0 and self._msk_day(d.sent_ts or x.created_ts) == day
+                          for d in x.deliveries)
+                   and (not ticker or x.ticker == ticker))
+
+    def publication_slot(self, ticker: str, now: Optional[float] = None) -> bool:
+        """Global daily cap; strong repeated situations in one ticker remain allowed."""
+        return self.published_today(now=now) < MAX_IDEAS_PER_DAY
+
+    def for_chart(self, ticker: str, limit: int = 20) -> list[Idea]:
+        """Recent triggered virtual trades for entry/exit chart markers."""
+        rows = [x for x in self.ideas if x.ticker == ticker and x.trigger_ts
+                and any(d.msg_id > 0 for d in x.deliveries)]
+        active = [x for x in rows if x.status == "active"]
+        closed = sorted((x for x in rows if x.status in TERMINAL),
+                        key=lambda x: x.closed_ts or x.updated_ts, reverse=True)
+        selected = active + closed[:max(0, limit - len(active))]
+        return sorted(selected, key=lambda x: x.trigger_ts)
+
     def set_decision(self, idea_id: str, uid: int, decision: str) -> bool:
         idea = self.find(idea_id)
         d = idea.delivery(uid) if idea else None
@@ -277,7 +378,7 @@ class IdeaJournal:
         groups: dict[tuple[str, int], list[Idea]] = {}
         for x in xs:
             groups.setdefault((x.setup, x.direction), []).append(x)
-        lines.append("<pre>сетап                 n  вход  ц/с   E(R)")
+        lines.append("<pre>сетап                 n  вход  ц/с  Eнет(R)")
         for (setup, direction), grp in sorted(groups.items(), key=lambda kv: -len(kv[1])):
             tr = [x for x in grp if x.trigger_ts]
             w = sum(x.status == "target" for x in tr)
@@ -293,8 +394,9 @@ class IdeaJournal:
         taken = [x for x in xs if (x.delivery(uid) and x.delivery(uid).decision == "taken")]
         skipped = [x for x in xs if (x.delivery(uid) and x.delivery(uid).decision == "skipped")]
         lines.append(f"👆 Отметки: «взял» {len(taken)}, «пропустил» {len(skipped)}.")
-        lines.append("<i>Основной win rate учитывает цель, стоп и закрытие по времени после входа. "
-                     "Отмены до триггера не считаются сделками. PF — сумма положительных R / сумма отрицательных R.</i>")
+        lines.append(f"<i>Все результаты после комиссии {COMMISSION_PCT_PER_SIDE:g}% за вход и "
+                     f"{COMMISSION_PCT_PER_SIDE:g}% за выход; проскальзывание не включено. "
+                     "Win rate учитывает цель, стоп и закрытие по времени. Отмены до триггера не считаются сделками.</i>")
         return "\n".join(lines)
 
     def adaptive_adjustment(self, setup: str, direction: int,
@@ -306,12 +408,12 @@ class IdeaJournal:
         """
         rows = [x for x in self.ideas
                 if x.setup == setup and x.direction == direction
-                and x.status in ("target", "stop") and x.trigger_ts]
+                and x.status in TERMINAL and x.trigger_ts]
         n = len(rows)
         expectancy = sum(x.realized_r for x in rows) / n if n else 0.0
         if n < min_sample:
             return 0, n, expectancy
-        wins = sum(x.status == "target" for x in rows)
+        wins = sum(x.realized_r >= OUTCOME_EPS_R for x in rows)
         win_rate = wins / n
         if expectancy <= -0.15 and win_rate < 0.40:
             return -10, n, expectancy
@@ -365,8 +467,9 @@ class IdeaJournal:
             result = f" · {idea.realized_r:+.2f}R" if idea.trigger_ts and idea.status in TERMINAL else ""
             lines.append(f"• {idea.ticker} {('L' if idea.direction > 0 else 'S')} · "
                          f"{labels.get(idea.status, idea.status)}{result}")
-        lines.append("<i>Вин/луз учитывает все завершённые входы, включая закрытые по времени; |результат| &lt;0,01R считается около нуля. "
-                     "Это симуляция от триггера идеи без проверки покупки на счёте и реального проскальзывания.</i>")
+        lines.append(f"<i>Результат включает комиссию {COMMISSION_PCT_PER_SIDE:g}% на входе и выходе. "
+                     "Вин/луз учитывает все завершённые входы, включая закрытые по времени; |результат| &lt;0,01R считается около нуля. "
+                     "Это симуляция без проверки покупки на счёте и реального проскальзывания.</i>")
         return "\n".join(lines)
 
 
@@ -639,23 +742,25 @@ def update_lifecycle(idea: Idea, price: float, now: Optional[float] = None,
     risk = abs(idea.entry_price - idea.stop)
     if target:
         idea.status, idea.closed_ts, idea.exit_price = "target", now, idea.target1
-        idea.realized_r = abs(idea.target1 - idea.entry_price) / risk if risk else 0.0
+        set_net_outcome(idea, abs(idea.target1 - idea.entry_price) / risk if risk else 0.0)
         idea.close_reason = "первая цель достигнута"
         return "target"
     if stopped:
         idea.status, idea.closed_ts, idea.exit_price = "stop", now, idea.stop
-        idea.realized_r = -1.0
+        set_net_outcome(idea, -1.0)
         idea.close_reason = "защитный стоп достигнут"
         return "stop"
     if now >= idea.expires_ts:
         idea.status, idea.closed_ts, idea.exit_price = "expired", now, price
-        idea.realized_r = ((price - idea.entry_price) * idea.direction / risk) if risk else 0.0
+        gross = ((price - idea.entry_price) * idea.direction / risk) if risk else 0.0
+        set_net_outcome(idea, gross)
         idea.close_reason = "время идеи истекло после входа"
         return "expired"
     return None
 
 
-def position_size(idea: Idea, risk_rub: float, costs_bps: float = 8.0) -> tuple[int, float]:
+def position_size(idea: Idea, risk_rub: float,
+                  costs_bps: float = ROUND_TRIP_COST_BPS) -> tuple[int, float]:
     """Return lots and estimated ruble risk including round-trip costs."""
     if risk_rub <= 0 or idea.lot <= 0:
         return 0, 0.0
@@ -685,10 +790,11 @@ def card(idea: Idea, risk_rub: float = 0.0) -> str:
                   f"Вход: {f(idea.entry_lo)}–{f(idea.entry_hi)} ₽", f"🛑 Стоп/отмена: {f(idea.stop)} ₽"]
     else:
         lines += [f"Вход: <b>{f(idea.entry_price or idea.trigger)} ₽</b>", f"🛑 Стоп: {f(idea.stop)} ₽"]
-    lines += [f"✅ Цель 1: {f(idea.target1)} ₽ (1,5R) · цель 2: {f(idea.target2)} ₽ (2,5R)"]
+    lines += [f"✅ Цель 1: {f(idea.target1)} ₽ (1,5R до комиссии) · "
+              f"цель 2: {f(idea.target2)} ₽ (2,5R до комиссии)"]
     lots, rub = position_size(idea, risk_rub)
     if lots:
-        lines.append(f"💰 При риске {risk_rub:,.0f} ₽: до <b>{lots} лот.</b> (оценка риска {rub:,.0f} ₽)")
+        lines.append(f"💰 При риске {risk_rub:,.0f} ₽: до <b>{lots} лот.</b> (стоп + комиссия ≈{rub:,.0f} ₽)")
     if idea.reasons:
         lines += ["", "<b>Почему:</b>"] + [f"• {x}" for x in idea.reasons[:4]]
     if idea.cautions:
@@ -696,7 +802,9 @@ def card(idea: Idea, risk_rub: float = 0.0) -> str:
     if idea.status in TERMINAL:
         lines += ["", f"Итог: <b>{idea.close_reason}</b>"]
         if idea.trigger_ts:
-            lines.append(f"Результат: {idea.realized_r:+.2f}R · MFE {idea.mfe_pct:+.2f}% · MAE {idea.mae_pct:+.2f}%")
+            lines.append(f"Результат после комиссии: <b>{idea.realized_r:+.2f}R</b> "
+                         f"(движение {idea.gross_r:+.2f}R − комиссия {idea.commission_r:.2f}R) · "
+                         f"MFE {idea.mfe_pct:+.2f}% · MAE {idea.mae_pct:+.2f}%")
     elif idea.status == "prepared":
         mins = max(0, int((idea.expires_ts - time.time()) / 60))
         lines.append(f"<i>Не вход до касания триггера. Идея живёт ещё ≈{mins} мин.</i>")

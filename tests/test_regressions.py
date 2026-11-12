@@ -69,6 +69,23 @@ class ChartLabelTests(unittest.TestCase):
                 self.assertIn("За сегодня: +1,25%", title)
                 self.assertIn("С начала графика: +3,00%", title)
 
+    @unittest.skipUnless(charts.HAVE_MPL, "matplotlib is optional in the local test runtime")
+    def test_virtual_trade_entry_and_exit_render_on_chart(self):
+        info = moex.SecurityInfo("SBER", "Сбер", "TQBR", "SUR", 2,
+                                 100, "2026-11-12")
+        candles = [charts.Candle(datetime(2026, 11, 13, 10, i * 5),
+                                 100 + i * .1, 100.4 + i * .1,
+                                 99.8 + i * .1, 100.2 + i * .1, 1000)
+                   for i in range(6)]
+        idea = SimpleNamespace(
+            trigger_ts=datetime(2026, 11, 13, 10, 5, tzinfo=ideas.MSK).timestamp(),
+            closed_ts=datetime(2026, 11, 13, 10, 20, tzinfo=ideas.MSK).timestamp(),
+            entry_price=100.1, trigger=100.1, exit_price=100.7,
+            direction=1, realized_r=.42, status="expired")
+        png = charts.render(info, charts.PERIODS["5m"], candles,
+                            trade_ideas=[idea])
+        self.assertTrue(png.startswith(b"\x89PNG"))
+
 
 class DirectionTests(TempCase):
     def test_sell_whale_with_buy_context_is_short(self):
@@ -729,8 +746,48 @@ class IdeaTests(TempCase):
         self.assertIsNone(ideas.update_lifecycle(x, 100.8, now=1200))
         self.assertEqual(ideas.update_lifecycle(x, 101.6, now=1300), "target")
         self.assertEqual(x.status, "target")
-        self.assertAlmostEqual(x.realized_r, 1.5)
+        self.assertAlmostEqual(x.gross_r, 1.5)
+        self.assertGreater(x.commission_r, 0)
+        self.assertAlmostEqual(x.realized_r, 1.5 - x.commission_r)
         self.assertGreater(x.mfe_pct, 0)
+
+    def test_tradeable_gate_removes_noisy_setups_but_keeps_repeated_ticker(self):
+        good = self.sample()
+        good.setup = "false_breakout"
+        good.confidence = 80
+        good.market_regime = "диапазон"
+        self.assertTrue(ideas.is_tradeable(good))
+        noisy = self.sample()
+        noisy.setup = "absorption"
+        noisy.confidence = 80
+        noisy.market_regime = "диапазон"
+        self.assertFalse(ideas.is_tradeable(noisy))
+        overconfident = self.sample()
+        overconfident.setup = "breakout"
+        overconfident.confidence = 92
+        overconfident.market_regime = "смешанный"
+        self.assertFalse(ideas.is_tradeable(overconfident))
+        continuation = self.sample()
+        continuation.setup = "breakout"
+        continuation.confidence = 80
+        continuation.market_regime = "смешанный"
+        continuation.timeframe_score = 2
+        self.assertFalse(ideas.is_tradeable(continuation))
+        continuation.timeframe_score = 3
+        self.assertTrue(ideas.is_tradeable(continuation))
+
+    def test_daily_limit_is_global_not_per_ticker(self):
+        j = ideas.IdeaJournal(str(self.path / "limit.json"))
+        for i in range(ideas.MAX_IDEAS_PER_DAY):
+            x = self.sample()
+            x.id = f"daily-{i}"
+            x.ticker = "SBER"
+            x.deliveries = [ideas.Delivery(1, 1, i + 1)]
+            j.ideas.append(x)
+        self.assertFalse(j.publication_slot("SBER"))
+        j.ideas.pop()
+        self.assertTrue(j.publication_slot("SBER"))
+        self.assertTrue(j.publication_slot("RUAL"))
 
     def test_risk_size_includes_lot_and_costs(self):
         x = self.sample()
@@ -813,6 +870,28 @@ class IdeaTests(TempCase):
                                     "ideas": [asdict(good), asdict(bad)]}), encoding="utf-8")
         loaded = ideas.IdeaJournal(str(path))
         self.assertEqual([x.id for x in loaded.ideas], [good.id])
+
+    def test_old_gross_results_are_migrated_to_net_commission_once(self):
+        path = self.path / "old-ideas.json"
+        x = self.sample()
+        x.status = "target"
+        x.trigger_ts = x.created_ts + 1
+        x.entry_price = x.trigger
+        x.closed_ts = x.created_ts + 60
+        x.exit_price = x.target1
+        x.realized_r = 1.5
+        row = asdict(x)
+        row.pop("gross_r")
+        row.pop("commission_r")
+        path.write_text(json.dumps({"version": 1, "ideas": [row]}))
+        loaded = ideas.IdeaJournal(str(path))
+        migrated = loaded.ideas[0]
+        self.assertEqual(migrated.gross_r, 1.5)
+        self.assertGreater(migrated.commission_r, 0)
+        self.assertAlmostEqual(migrated.realized_r,
+                               migrated.gross_r - migrated.commission_r)
+        loaded_again = ideas.IdeaJournal(str(path)).ideas[0]
+        self.assertAlmostEqual(loaded_again.realized_r, migrated.realized_r)
 
     def test_adaptation_waits_for_sample_then_penalizes_bad_setup(self):
         j = ideas.IdeaJournal(str(self.path / "adaptive.json"))

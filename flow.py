@@ -20,7 +20,9 @@ from typing import Dict, Optional
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import BufferedInputFile, InputMediaPhoto
 
+import charts
 import market
 import moex
 import setup as stp
@@ -28,7 +30,7 @@ import tape
 from marketstream import MarketStream
 from journal import CHECKPOINTS, Entry, Journal, HIT_PCT
 from ideas import (Delivery, IdeaContext, IdeaEngine, IdeaJournal, card,
-                   update_lifecycle)
+                   is_tradeable, update_lifecycle)
 from keyboards import flow_kb, idea_kb
 from formatting import fmt_pct
 from moex import now_msk
@@ -425,7 +427,7 @@ class FlowMonitor:
         im = await self.imoex(sess)
         if self.idea_journal is not None:
             try:
-                await self._process_ideas(tickers, im)
+                await self._process_ideas(sess, tickers, im)
             except Exception:
                 log.exception("ideas: ошибка обработки")
         if not self._main_session():
@@ -602,8 +604,25 @@ class FlowMonitor:
             event_risk=self.calendar.risk_for(t) if self.calendar is not None else "",
             news_risk=self.newsmon.risk_for(t) if self.newsmon is not None else "")
 
-    async def _idea_update_messages(self, idea, transition: str) -> None:
-        """Edit the card and send a short, explicit state-change notification."""
+    async def _idea_update_messages(self, sess, idea, transition: str) -> None:
+        """Edit the card and keep one entry/result chart for the virtual trade."""
+        note = {
+            "active": f"🚀 <b>{idea.ticker} {idea.side}</b>: виртуальный вход по триггеру {idea.entry_price:.{idea.decimals}f} ₽.",
+            "target": f"✅ <b>{idea.ticker} {idea.side}</b>: цель достигнута, итог после комиссии {idea.realized_r:+.2f}R.",
+            "stop": f"🛑 <b>{idea.ticker} {idea.side}</b>: стоп, итог после комиссии {idea.realized_r:+.2f}R.",
+            "cancelled": f"↩️ <b>{idea.ticker} {idea.side}</b>: идея отменилась до входа — {idea.close_reason}.",
+            "expired": f"⌛ <b>{idea.ticker} {idea.side}</b>: выход по времени, итог после комиссии {idea.realized_r:+.2f}R.",
+        }.get(transition)
+        chart_png = None
+        if transition in ("active", "target", "stop", "expired") and idea.trigger_ts:
+            try:
+                info = await self._info(sess, idea.ticker)
+                if info is not None:
+                    chart_png = await charts.build_chart(
+                        sess, info, "5m", self.tk,
+                        trade_ideas=self.idea_journal.for_chart(idea.ticker, 12))
+            except Exception:
+                log.exception("ideas: не построен график сделки %s", idea.id)
         for delivery in list(idea.deliveries):
             prof = self.store.get(delivery.uid)
             try:
@@ -616,21 +635,32 @@ class FlowMonitor:
                     log.debug("ideas: edit %s: %s", idea.id, e)
             except Exception as e:
                 log.debug("ideas: edit %s: %s", idea.id, e)
-            note = {
-                "active": f"🚀 <b>{idea.ticker} {idea.side}</b>: триггер достигнут, идея активна.",
-                "target": f"✅ <b>{idea.ticker} {idea.side}</b>: идея отработана в плюс, цель 1 достигнута ({idea.realized_r:+.2f}R).",
-                "stop": f"🛑 <b>{idea.ticker} {idea.side}</b>: идея выбита по стопу (−1R).",
-                "cancelled": f"↩️ <b>{idea.ticker} {idea.side}</b>: идея отменилась до входа — {idea.close_reason}.",
-                "expired": f"⌛ <b>{idea.ticker} {idea.side}</b>: время идеи истекло — {idea.close_reason}.",
-            }.get(transition)
             if note and prof.idea_alerts:
                 try:
-                    await self.bot.send_message(delivery.chat_id, note,
-                                                reply_markup=idea_kb(idea.id, idea.ticker, idea.status))
+                    kb = idea_kb(idea.id, idea.ticker, idea.status)
+                    if chart_png:
+                        media = InputMediaPhoto(
+                            media=BufferedInputFile(chart_png, f"{idea.ticker}_{idea.id}.png"),
+                            caption=note)
+                        if delivery.chart_msg_id:
+                            try:
+                                await self.bot.edit_message_media(
+                                    media=media, chat_id=delivery.chat_id,
+                                    message_id=delivery.chart_msg_id, reply_markup=kb)
+                                continue
+                            except Exception as e:
+                                log.debug("ideas: trade chart edit %s: %s", idea.id, e)
+                        msg = await self.bot.send_photo(
+                            delivery.chat_id,
+                            BufferedInputFile(chart_png, f"{idea.ticker}_{idea.id}.png"),
+                            caption=note, reply_markup=kb)
+                        delivery.chart_msg_id = msg.message_id
+                    else:
+                        await self.bot.send_message(delivery.chat_id, note, reply_markup=kb)
                 except Exception:
                     log.exception("ideas: не отправлен переход %s", transition)
 
-    async def _process_ideas(self, tickers: list[str], im: dict) -> None:
+    async def _process_ideas(self, sess, tickers: list[str], im: dict) -> None:
         if self.idea_journal is None or self.idea_engine is None:
             return
         contexts = {t: self._idea_context(t, im) for t in tickers}
@@ -643,7 +673,23 @@ class FlowMonitor:
             transition = update_lifecycle(idea, ctx.price)
             if transition:
                 dirty = True
-                await self._idea_update_messages(idea, transition)
+                if (transition == "active" and not any(d.msg_id for d in idea.deliveries)
+                        and self.idea_journal.publication_slot(idea.ticker)):
+                    recipients = [(uid, p) for uid, p in self.store.all()
+                                  if p.idea_alerts and idea.ticker in p.watchlist
+                                  and not p.is_quiet(now_msk().hour)
+                                  and idea.confidence >= p.idea_min_conf]
+                    for uid, prof in recipients:
+                        try:
+                            msg = await self.bot.send_message(
+                                uid, card(idea, prof.risk_rub),
+                                reply_markup=idea_kb(idea.id, idea.ticker, idea.status))
+                            idea.deliveries.append(
+                                Delivery(uid, msg.chat.id, msg.message_id,
+                                         sent_ts=time.time()))
+                        except Exception:
+                            log.exception("ideas: не отправлен вход %s %s", idea.ticker, uid)
+                await self._idea_update_messages(sess, idea, transition)
         if not self._main_session():
             if dirty:
                 self.idea_journal.save()
@@ -652,6 +698,7 @@ class FlowMonitor:
             positions = await self.tk.portfolio_day_quotes()
         except Exception:
             positions = {}
+        pool = []
         for t, ctx in contexts.items():
             if ctx is None:
                 continue
@@ -665,29 +712,29 @@ class FlowMonitor:
                         idea.reasons.append(history)
                     else:
                         idea.cautions.append(history)
+                if not is_tradeable(idea):
+                    continue
                 if t in positions:
                     idea.cautions.append("уже есть открытая позиция: проверь суммарный риск")
                 if self.idea_journal.has_active(t, idea.direction):
                     continue
-                recipients = [(uid, p) for uid, p in self.store.all()
-                              if p.idea_alerts and t in p.watchlist
-                              and not p.is_quiet(now_msk().hour)
-                              and idea.confidence >= p.idea_min_conf]
-                if not recipients:
-                    continue
-                self.idea_journal.ideas.append(idea)
-                for uid, prof in recipients:
-                    try:
-                        msg = await self.bot.send_message(
-                            uid, card(idea, prof.risk_rub),
-                            reply_markup=idea_kb(idea.id, idea.ticker, idea.status))
-                        idea.deliveries.append(Delivery(uid, msg.chat.id, msg.message_id))
-                    except Exception:
-                        log.exception("ideas: не отправлена %s %s", t, uid)
-                if idea.deliveries:
-                    dirty = True
-                else:
-                    self.idea_journal.ideas.remove(idea)
+                pool.append((t, idea))
+
+        # Prefer the setups that survived costs in the first forward sample.
+        priority = {"false_breakout": 30, "pullback": 20, "breakout": 10}
+        pool.sort(key=lambda row: (priority.get(row[1].setup, 0), row[1].confidence),
+                  reverse=True)
+        for t, idea in pool:
+            recipients = [(uid, p) for uid, p in self.store.all()
+                          if p.idea_alerts and t in p.watchlist
+                          and not p.is_quiet(now_msk().hour)
+                          and idea.confidence >= p.idea_min_conf]
+            if not recipients:
+                continue
+            # Keep a strong setup internally until its trigger. Only a real
+            # activation consumes the daily limit and reaches Telegram.
+            self.idea_journal.ideas.append(idea)
+            dirty = True
         if dirty:
             self.idea_journal.save()
 

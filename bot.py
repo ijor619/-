@@ -39,7 +39,8 @@ import tape
 import tinkoff
 from flow import FlowMonitor
 from journal import Journal
-from ideas import IdeaJournal, SETUP_NAMES, card, position_size
+from ideas import (COMMISSION_PCT_PER_SIDE, MAX_IDEAS_PER_DAY, IdeaJournal,
+                   SETUP_NAMES, card, position_size)
 from news import NewsMonitor, NEWS_CHANNEL
 from keyboards import (book_kb, chart_kb, cluster_kb, report_kb, tape_kb, screener_kb,
                        scr_pick_kb, idea_kb)
@@ -51,7 +52,7 @@ from store import Store
 
 log = logging.getLogger(__name__)
 
-BUILD_VERSION = "4.3.5-full-outcomes-2026-11-10"
+BUILD_VERSION = "4.4.0-focused-ideas-charts-2026-11-13"
 
 router = Router(name="stockbot")
 
@@ -140,6 +141,8 @@ def _help_text(store: Store, user_id: int) -> str:
            else "включены" if p.flow_alerts else "выключены")
         + f"\nТорговые идеи: {'включены' if p.idea_alerts else 'выключены'}"
         + f" · мин. оценка {p.idea_min_conf}/100 · риск {p.risk_rub:g} ₽"
+        + f"\nФокус идей: до {MAX_IDEAS_PER_DAY}/день · комиссия "
+        + f"{COMMISSION_PCT_PER_SIDE:g}% на входе и выходе"
         + f"\nЛимит дня: {p.daily_loss_limit_rub:g} ₽ · "
         + f"позиций {p.max_positions or '∞'} · сектор {f'{p.max_sector_pct:g}%' if p.max_sector_pct else 'без лимита'}"
         + f"\nСырые события ленты: {'включены' if p.raw_flow_alerts else 'выключены'}"
@@ -245,7 +248,10 @@ async def show_chart(bot: Bot, chat_id: int, sess: aiohttp.ClientSession,
     png = await charts.build_chart(sess, info, period,
                                    tk if tinkoff.enabled() else None,
                                    vol_levels=vol_levels,
-                                   day_change_pct=day_change_pct)
+                                   day_change_pct=day_change_pct,
+                                   trade_ideas=(flow.idea_journal.for_chart(
+                                       t, 8 if period in ("4h", "1d") else 12)
+                                                if flow and flow.idea_journal else None))
     if png is None:
         return f"Нет данных для графика {esc(t)}."
     file = BufferedInputFile(png, f"{t}_{period}.png")
@@ -1189,7 +1195,8 @@ async def cmd_risk(m: Message, store: Store) -> None:
         return
     p.risk_rub = value
     store.save()
-    await m.answer(f"💰 Риск на одну идею: <b>{value:g} ₽</b>. В карточке появится расчёт лотов.")
+    await m.answer(f"💰 Риск на одну идею: <b>{value:g} ₽</b>. В карточке появится расчёт лотов "
+                   f"с комиссией {COMMISSION_PCT_PER_SIDE:g}% на входе и выходе.")
 
 
 def _rub0(value: float, signed: bool = False) -> str:

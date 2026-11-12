@@ -187,7 +187,8 @@ class Overlay:
 
 def render(info: SecurityInfo, p: Period, cs: list[Candle],
            ov: Optional[Overlay] = None,
-           day_change_pct: Optional[float] = None) -> bytes:
+           day_change_pct: Optional[float] = None,
+           trade_ideas: Optional[list] = None) -> bytes:
     if not HAVE_MPL:
         raise RuntimeError(f"matplotlib недоступен на сервере: {_MPL_ERR}. "
                            "Проверь установку зависимостей (requirements.txt) и объём RAM.")
@@ -257,6 +258,64 @@ def render(info: SecurityInfo, p: Period, cs: list[Candle],
                 xytext=(6, -3), textcoords="offset points", fontsize=8,
                 color="white", fontweight="bold",
                 bbox=dict(boxstyle="round,pad=0.25", fc=colors[-1], ec="none"))
+
+    # Virtual executions from the idea journal. A prepared/cancelled idea has
+    # no entry and is deliberately absent: the chart depicts only trades that
+    # would actually have been opened by the simulator.
+    plotted_trades = 0
+    if trade_ideas:
+        span_end = cs[-1].begin + (timedelta(days=1) if p.base == 24 else
+                                   timedelta(minutes=p.base * p.agg))
+
+        def _point(ts: float) -> Optional[int]:
+            if not ts:
+                return None
+            dt = datetime.fromtimestamp(ts, moex.MSK).replace(tzinfo=None)
+            if dt < cs[0].begin or dt > span_end:
+                return None
+            return min(range(n), key=lambda i: abs((cs[i].begin - dt).total_seconds()))
+
+        for seq, idea in enumerate(trade_ideas):
+            xi = _point(getattr(idea, "trigger_ts", 0.0))
+            xo = _point(getattr(idea, "closed_ts", 0.0))
+            if xi is None and xo is None:
+                continue
+            entry = float(getattr(idea, "entry_price", 0.0) or getattr(idea, "trigger", 0.0))
+            exit_price = float(getattr(idea, "exit_price", 0.0) or 0.0)
+            direction = int(getattr(idea, "direction", 0))
+            net_r = float(getattr(idea, "realized_r", 0.0) or 0.0)
+            status = getattr(idea, "status", "")
+            result_color = UP if net_r > 0.01 else DOWN if net_r < -0.01 else MUTED
+            if xi is not None and entry > 0:
+                marker = "^" if direction > 0 else "v"
+                ax.scatter([xi], [entry], marker=marker, s=54, color="#2563eb",
+                           edgecolors="white", linewidths=0.7, zorder=8)
+                offset = 10 if direction > 0 else -17
+                ax.annotate(f"Вход {'L' if direction > 0 else 'S'}\n{fmt_price(entry, info.decimals)}",
+                            xy=(xi, entry), xytext=(0, offset), textcoords="offset points",
+                            ha="center", va="bottom" if direction > 0 else "top",
+                            fontsize=6.3, color="#1d4ed8", fontweight="bold",
+                            bbox=dict(boxstyle="round,pad=0.18", fc="white",
+                                      ec="#93c5fd", alpha=0.88), zorder=9)
+            if xi is not None and xo is not None and entry > 0 and exit_price > 0:
+                ax.plot([xi, xo], [entry, exit_price], color=result_color,
+                        linewidth=1.4, linestyle="--", alpha=0.9, zorder=6)
+            if xo is not None and exit_price > 0 and status in ("target", "stop", "expired"):
+                ax.scatter([xo], [exit_price], marker="X", s=58, color=result_color,
+                           edgecolors="white", linewidths=0.7, zorder=8)
+                vertical = 12 if seq % 2 == 0 else -21
+                ax.annotate(f"Выход {net_r:+.2f}R\nпосле комиссии",
+                            xy=(xo, exit_price), xytext=(4, vertical),
+                            textcoords="offset points", ha="left",
+                            va="bottom" if vertical > 0 else "top", fontsize=6.3,
+                            color=result_color, fontweight="bold",
+                            bbox=dict(boxstyle="round,pad=0.18", fc="white",
+                                      ec=result_color, alpha=0.9), zorder=9)
+            plotted_trades += 1
+        if plotted_trades:
+            ax.text(0.995, 0.015, "▲/▼ вход · ✕ выход · результат после комиссии",
+                    transform=ax.transAxes, ha="right", va="bottom", fontsize=6.5,
+                    color=MUTED, bbox=dict(fc="white", ec="none", alpha=0.78))
 
     ax.set_title(chart_title(info, p, cs, day_change_pct),
                  loc="left", fontsize=10.5, fontweight="bold", color=TXT)
@@ -368,7 +427,8 @@ async def _tinvest_candles(tk, inst, p: Period) -> tuple[list[Candle], list[Cand
 
 async def build_chart(sess: aiohttp.ClientSession, info: SecurityInfo,
                       period: str, tk=None, vol_levels=None,
-                      day_change_pct: Optional[float] = None) -> Optional[bytes]:
+                      day_change_pct: Optional[float] = None,
+                      trade_ideas: Optional[list] = None) -> Optional[bytes]:
     """PNG свечного графика или None, если данных нет.
 
     Свечи берутся из T-Invest (реальное время), если есть токен; иначе —
@@ -420,4 +480,4 @@ async def build_chart(sess: aiohttp.ClientSession, info: SecurityInfo,
                     ov.delta = delta_series(cs, trades, p.base * p.agg)
         except Exception as e:
             log.debug("chart overlay %s: %s", info.ticker, e)
-    return render(info, p, cs, ov, day_change_pct)
+    return render(info, p, cs, ov, day_change_pct, trade_ideas)
