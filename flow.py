@@ -946,7 +946,10 @@ class FlowMonitor:
         need_book = stream_book is None and now - self._rest_book_ts.get(t, 0) >= 30
         calls = []
         if need_trades:
-            calls.append(self.tk.last_trades(inst, minutes=10))
+            # One wider read after a restart lets the local-low strategy work
+            # immediately instead of waiting 45 minutes for in-memory history.
+            warmup_minutes = 50 if not self._prices.get(t) else 10
+            calls.append(self.tk.last_trades(inst, minutes=warmup_minutes))
         if need_book:
             calls.append(self.tk.order_book(inst, depth=20))
         replies = await asyncio.gather(*calls, return_exceptions=True) if calls else []
