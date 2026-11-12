@@ -867,7 +867,12 @@ class FlowMonitor:
             has_recipient = any(p.bounce_alerts and ticker in p.watchlist
                                 and not p.is_quiet(now_msk().hour)
                                 for _, p in self.store.all())
-            if not has_recipient or self.bounce_journal.has_active(ticker, 1):
+            recent_same = any(
+                x.ticker == ticker and x.setup == idea.setup
+                and time.time() - x.created_ts < bnc.BOUNCE_COOLDOWN_SEC
+                for x in self.bounce_journal.ideas)
+            if (not has_recipient or recent_same
+                    or self.bounce_journal.has_active(ticker, 1)):
                 continue
             self.bounce_journal.ideas.append(idea)
             available -= 1
