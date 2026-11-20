@@ -53,7 +53,7 @@ from store import Store
 
 log = logging.getLogger(__name__)
 
-BUILD_VERSION = "4.5.1-stable-price-alerts-2026-11-20"
+BUILD_VERSION = "4.6.0-managed-exits-2026-11-20"
 
 router = Router(name="stockbot")
 
@@ -1206,6 +1206,7 @@ async def cmd_dayresult(m: Message, tk: tinkoff.TinkoffClient,
                  if x.created_ts >= start_msk.timestamp() and x.delivery(uid)]
     targets = sum(x.status == "target" for x in day_ideas)
     stops = sum(x.status == "stop" for x in day_ideas)
+    protected = sum(x.status == "protected" for x in day_ideas)
     cancelled = sum(x.status in ("cancelled", "expired") for x in day_ideas)
     live = sum(x.status in ("prepared", "active") for x in day_ideas)
     lines = [f"📊 <b>Итог дня · {start_msk:%d.%m}</b>"]
@@ -1218,7 +1219,8 @@ async def cmd_dayresult(m: Message, tk: tinkoff.TinkoffClient,
         lines.append("Открытые позиции: дневной P/L временно недоступен")
     else:
         lines.append(f"Текущие позиции: <b>{_rub0(portfolio_result.daily_pnl, True)}</b> за день")
-    lines += ["", f"💡 Идеи: {len(day_ideas)} · цель {targets} · стоп {stops} · отмена/время {cancelled} · активны {live}",
+    lines += ["", f"💡 Идеи: {len(day_ideas)} · цель {targets} · стоп {stops} · "
+              f"фиксация {protected} · отмена/время {cancelled} · активны {live}",
               "<i>Закрытые сделки и дневной P/L открытых позиций показаны раздельно, чтобы не смешивать разные базы расчёта.</i>"]
     await m.answer("\n".join(lines))
 
