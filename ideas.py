@@ -20,7 +20,7 @@ from uuid import uuid4
 
 log = logging.getLogger(__name__)
 
-TERMINAL = {"target", "stop", "cancelled", "expired"}
+TERMINAL = {"target", "stop", "protected", "cancelled", "expired"}
 ACTIVE = {"prepared", "active"}
 MAX_LEVEL_DISTANCE_PCT = 5.0
 MAX_TRIGGER_DISTANCE_PCT = 2.0
@@ -49,6 +49,12 @@ COMMISSION_RATE_PER_SIDE = COMMISSION_PCT_PER_SIDE / 100
 ROUND_TRIP_COST_BPS = COMMISSION_PCT_PER_SIDE * 2 * 100
 MAX_IDEAS_PER_DAY = max(1, int(_env_float("IDEA_DAILY_LIMIT", 8)))
 MIN_TRADEABLE_CONFIDENCE = max(1, int(_env_float("IDEA_MIN_QUALITY", 70)))
+# Once a trade has shown a meaningful favourable move, retain part of that
+# move instead of allowing it to decay into a time-stop loss.
+PROFIT_PROTECT_ARM_R = max(0.1, _env_float("IDEA_PROTECT_ARM_R", 0.50))
+PROFIT_PROTECT_MIN_PCT = max(0.05, _env_float("IDEA_PROTECT_MIN_PCT", 0.20))
+PROFIT_PROTECT_KEEP = min(0.90, max(0.10, _env_float("IDEA_PROTECT_KEEP", 0.65)))
+PROFIT_PROTECT_MIN_NET_PCT = max(0.0, _env_float("IDEA_PROTECT_MIN_NET_PCT", 0.04))
 
 
 @dataclass
@@ -132,6 +138,9 @@ class Idea:
     timeframe_score: int = 0
     liquidity_rub_min: float = 0.0
     deliveries: list[Delivery] = field(default_factory=list)
+    # Full holding window after activation. Before entry expires_ts remains the
+    # preparation deadline; activation resets it from the actual trigger time.
+    hold_minutes: int = 0
 
     @property
     def side(self) -> str:
@@ -278,6 +287,18 @@ class IdeaJournal:
                     migrated += 1
                 row.setdefault("gross_r", 0.0)
                 row.setdefault("commission_r", 0.0)
+                if "hold_minutes" not in row:
+                    original_window = max(
+                        1, round((float(row.get("expires_ts") or 0.0)
+                                  - float(row.get("created_ts") or 0.0)) / 60))
+                    row["hold_minutes"] = original_window
+                    # Old active rows used creation time as the holding clock.
+                    # Give them the full post-entry window during migration.
+                    if row.get("status") == "active" and row.get("trigger_ts"):
+                        row["expires_ts"] = max(
+                            float(row.get("expires_ts") or 0.0),
+                            float(row["trigger_ts"]) + original_window * 60)
+                    migrated += 1
                 row["deliveries"] = [Delivery(**d) for d in row.get("deliveries", [])]
                 idea = Idea(**row)
                 reason = idea_geometry_error(idea)
@@ -376,8 +397,10 @@ class IdeaJournal:
         wins = [x for x in triggered if x.status == "target"]
         stops = [x for x in triggered if x.status == "stop"]
         live = [x for x in xs if x.status in ACTIVE]
-        canc = [x for x in xs if x.status == "cancelled"]
-        exp = [x for x in xs if x.status == "expired"]
+        canc = [x for x in xs if x.status == "cancelled"
+                or (x.status == "expired" and not x.trigger_ts)]
+        exp = [x for x in triggered if x.status == "expired"]
+        protected = [x for x in triggered if x.status == "protected"]
         resolved = wins + stops
         wr = len(wins) / len(resolved) * 100 if resolved else 0.0
         outcomes = outcome_metrics(xs)
@@ -385,7 +408,9 @@ class IdeaJournal:
         lines = [f"💡 <b>Статистика идей</b> · {days} дн."
                  + (f" · {ticker}" if ticker else ""),
                  f"Всего: <b>{len(xs)}</b> · активировано: <b>{len(triggered)}</b> ({act:.0f}%) · сейчас: {len(live)}",
-                 f"✅ цель: <b>{len(wins)}</b> · 🛑 стоп: <b>{len(stops)}</b> · ↩️ отмена: {len(canc)} · ⌛ истекла: {len(exp)}",
+                 f"✅ цель: <b>{len(wins)}</b> · 🛑 стоп: <b>{len(stops)}</b> · "
+                 f"🛡 фиксация: <b>{len(protected)}</b> · ↩️ без входа: {len(canc)} · "
+                 f"⌛ выход по времени: {len(exp)}",
                  f"🟢/🔴 Все завершённые входы: <b>{outcomes['wins']}/{outcomes['losses']}</b>"
                  + (f" · без результата {outcomes['flats']}" if outcomes["flats"] else ""),
                  f"Фактический win rate: <b>{outcomes['win_rate']:.0f}%</b> · среднее: "
@@ -456,18 +481,20 @@ class IdeaJournal:
         targets = [x for x in triggered if x.status == "target"]
         stops = [x for x in triggered if x.status == "stop"]
         timed = [x for x in triggered if x.status == "expired"]
+        protected = [x for x in triggered if x.status == "protected"]
         active = [x for x in triggered if x.status == "active"]
         waiting = [x for x in rows if x.status == "prepared"]
         no_entry = [x for x in rows if not x.trigger_ts and x.status in ("cancelled", "expired")]
         resolved = targets + stops
         win_rate = len(targets) / len(resolved) * 100 if resolved else 0.0
         expectancy = sum(x.realized_r for x in resolved) / len(resolved) if resolved else 0.0
-        completed = resolved + timed
+        completed = resolved + timed + protected
         total_r = sum(x.realized_r for x in completed)
         outcomes = outcome_metrics(rows)
         lines = [title,
                  f"Отмечено «Взял»: <b>{len(rows)}</b> · триггер достигнут: {len(triggered)}",
-                 f"✅ цель: <b>{len(targets)}</b> · 🛑 стоп: <b>{len(stops)}</b> · ⌛ закрыты по времени: {len(timed)}",
+                 f"✅ цель: <b>{len(targets)}</b> · 🛑 стоп: <b>{len(stops)}</b> · "
+                 f"🛡 фиксация: <b>{len(protected)}</b> · ⌛ по времени: {len(timed)}",
                  "",
                  f"🟢 Вин: <b>{outcomes['wins']}</b> · 🔴 Луз: <b>{outcomes['losses']}</b>"
                  + (f" · ⚪ около нуля: {outcomes['flats']}" if outcomes["flats"] else ""),
@@ -478,6 +505,7 @@ class IdeaJournal:
                  f"Сейчас: ждут входа {len(waiting)} · активны {len(active)} · отменены до входа {len(no_entry)}",
                  "", "<b>Последние:</b>"]
         labels = {"target": "✅ цель", "stop": "🛑 стоп",
+                  "protected": "🛡 фиксация",
                   "cancelled": "↩️ без входа", "expired": "⌛ время",
                   "active": "🚀 активна", "prepared": "⏳ ждёт"}
         for idea in sorted(rows, key=lambda x: x.created_ts, reverse=True)[:8]:
@@ -624,7 +652,8 @@ class IdeaEngine:
         return Idea(uuid4().hex[:12], ctx.ticker, direction, setup, time.time(), time.time(),
                     time.time() + minutes * 60, "prepared", trigger, entry_lo, entry_hi,
                     stop, target1, target2, max(1, min(confidence, 95)), reasons, cautions,
-                    level_name, level, ctx.spread_pct or 0.0, ctx.lot, ctx.decimals)
+                    level_name, level, ctx.spread_pct or 0.0, ctx.lot, ctx.decimals,
+                    hold_minutes=minutes)
 
     def candidates(self, ctx: IdeaContext) -> list[Idea]:
         if not ctx.fresh or ctx.price <= 0 or (ctx.spread_pct or 0) > 0.35:
@@ -745,6 +774,12 @@ def update_lifecycle(idea: Idea, price: float, now: Optional[float] = None,
         hit = price >= idea.trigger if idea.direction > 0 else price <= idea.trigger
         if hit:
             idea.status, idea.trigger_ts, idea.entry_price = "active", now, idea.trigger
+            if idea.hold_minutes <= 0:
+                idea.hold_minutes = max(
+                    1, round((idea.expires_ts - idea.created_ts) / 60))
+            # Preparation time no longer eats into the actual trade. Every
+            # activation gets the complete setup-specific holding window.
+            idea.expires_ts = now + idea.hold_minutes * 60
             return "active"
         if now >= idea.expires_ts:
             idea.status, idea.closed_ts, idea.exit_price = "expired", now, price
@@ -767,6 +802,24 @@ def update_lifecycle(idea: Idea, price: float, now: Optional[float] = None,
         set_net_outcome(idea, -1.0)
         idea.close_reason = "защитный стоп достигнут"
         return "stop"
+    risk_pct = risk / idea.entry_price * 100 if idea.entry_price and risk else 0.0
+    arm_pct = max(PROFIT_PROTECT_MIN_PCT, risk_pct * PROFIT_PROTECT_ARM_R)
+    if idea.mfe_pct >= arm_pct:
+        round_trip_pct = COMMISSION_PCT_PER_SIDE * 2
+        protected_gross_pct = max(
+            round_trip_pct + PROFIT_PROTECT_MIN_NET_PCT,
+            idea.mfe_pct * PROFIT_PROTECT_KEEP)
+        # MFE persists between updates: this is a retracement after a
+        # previously observed favourable move, not an immediate exit.
+        if signed <= protected_gross_pct:
+            exit_price = idea.entry_price * (
+                1 + idea.direction * protected_gross_pct / 100)
+            idea.status, idea.closed_ts, idea.exit_price = "protected", now, exit_price
+            gross = ((exit_price - idea.entry_price) * idea.direction / risk) if risk else 0.0
+            set_net_outcome(idea, gross)
+            idea.close_reason = (
+                f"защитная фиксация после движения +{idea.mfe_pct:.2f}%")
+            return "protected"
     if now >= idea.expires_ts:
         idea.status, idea.closed_ts, idea.exit_price = "expired", now, price
         gross = ((price - idea.entry_price) * idea.direction / risk) if risk else 0.0
@@ -792,6 +845,7 @@ def card(idea: Idea, risk_rub: float = 0.0) -> str:
     f = lambda x: f"{x:.{d}f}".replace(".", ",")
     status = {"prepared": "💡 ПОДГОТОВЛЕН", "active": "🚀 АКТИВИРОВАНА",
               "target": "✅ ОТРАБОТАНА В ПЛЮС", "stop": "🛑 ВЫБИТА ПО СТОПУ",
+              "protected": "🛡 ПРИБЫЛЬ ЗАФИКСИРОВАНА",
               "cancelled": "↩️ ОТМЕНЕНА ДО ВХОДА", "expired": "⌛ ВРЕМЯ ИСТЕКЛО"}[idea.status]
     side = "LONG ↑" if idea.direction > 0 else "SHORT ↓"
     lines = [f"{status} · <b>{idea.ticker} {side}</b>",
@@ -825,4 +879,8 @@ def card(idea: Idea, risk_rub: float = 0.0) -> str:
     elif idea.status == "prepared":
         mins = max(0, int((idea.expires_ts - time.time()) / 60))
         lines.append(f"<i>Не вход до касания триггера. Идея живёт ещё ≈{mins} мин.</i>")
+    elif idea.status == "active":
+        mins = max(0, int((idea.expires_ts - time.time()) / 60))
+        lines.append(f"<i>Плановый выход через ≈{mins} мин.; цель, стоп или "
+                     "защита прибыли могут закрыть раньше.</i>")
     return "\n".join(lines)
