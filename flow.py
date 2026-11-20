@@ -629,11 +629,12 @@ class FlowMonitor:
             "active": f"🚀 <b>{idea.ticker} {idea.side}</b>: виртуальный вход по триггеру {idea.entry_price:.{idea.decimals}f} ₽.",
             "target": f"✅ <b>{idea.ticker} {idea.side}</b>: цель достигнута, итог после комиссии {idea.net_pct:+.2f}%.",
             "stop": f"🛑 <b>{idea.ticker} {idea.side}</b>: стоп, итог после комиссии {idea.net_pct:+.2f}%.",
+            "protected": f"🛡 <b>{idea.ticker} {idea.side}</b>: прибыль зафиксирована на откате, итог после комиссии {idea.net_pct:+.2f}%.",
             "cancelled": f"↩️ <b>{idea.ticker} {idea.side}</b>: идея отменилась до входа — {idea.close_reason}.",
             "expired": f"⌛ <b>{idea.ticker} {idea.side}</b>: выход по времени, итог после комиссии {idea.net_pct:+.2f}%.",
         }.get(transition)
         chart_png = None
-        if transition in ("active", "target", "stop", "expired") and idea.trigger_ts:
+        if transition in ("active", "target", "stop", "protected", "expired") and idea.trigger_ts:
             try:
                 info = await self._info(sess, idea.ticker)
                 if info is not None:
@@ -766,11 +767,13 @@ class FlowMonitor:
                        f"итог после комиссии {idea.net_pct:+.2f}%."),
             "stop": (f"🛑 <b>{idea.ticker}</b>: стоп по отскоку, "
                      f"итог после комиссии {idea.net_pct:+.2f}%."),
+            "protected": (f"🛡 <b>{idea.ticker}</b>: прибыль по отскоку зафиксирована, "
+                          f"итог после комиссии {idea.net_pct:+.2f}%.") ,
             "expired": (f"⌛ <b>{idea.ticker}</b>: выход из отскока по времени, "
                         f"итог после комиссии {idea.net_pct:+.2f}%."),
         }.get(transition)
         chart_png = None
-        if transition in ("active", "target", "stop", "expired") and idea.trigger_ts:
+        if transition in ("active", "target", "stop", "protected", "expired") and idea.trigger_ts:
             try:
                 info = await self._info(sess, idea.ticker)
                 if info is not None:
