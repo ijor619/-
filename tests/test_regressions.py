@@ -856,6 +856,31 @@ class IdeaTests(TempCase):
         self.assertGreater(x.net_pct, 1.4)
         self.assertGreater(x.mfe_pct, 0)
 
+    def test_trigger_starts_a_full_holding_window(self):
+        x = self.sample()
+        x.created_ts = 1_000
+        x.expires_ts = 2_500
+        x.hold_minutes = 25
+        self.assertEqual(ideas.update_lifecycle(x, 100.1, now=2_490), "active")
+        self.assertEqual(x.expires_ts, 2_490 + 25 * 60)
+        self.assertIsNone(ideas.update_lifecycle(x, 100.2, now=2_501))
+
+    def test_retracement_protects_a_proven_long_profit(self):
+        x = self.sample()
+        self.assertEqual(ideas.update_lifecycle(x, 100.1, now=1_100), "active")
+        self.assertIsNone(ideas.update_lifecycle(x, 100.8, now=1_200))
+        self.assertEqual(ideas.update_lifecycle(x, 100.4, now=1_300), "protected")
+        self.assertEqual(x.status, "protected")
+        self.assertGreater(x.net_pct, 0.0)
+        self.assertIn("защитная фиксация", x.close_reason)
+
+    def test_retracement_protects_a_proven_short_profit(self):
+        x = self.sample(direction=-1)
+        self.assertEqual(ideas.update_lifecycle(x, 99.9, now=1_100), "active")
+        self.assertIsNone(ideas.update_lifecycle(x, 99.2, now=1_200))
+        self.assertEqual(ideas.update_lifecycle(x, 99.6, now=1_300), "protected")
+        self.assertGreater(x.net_pct, 0.0)
+
     def test_tradeable_gate_removes_noisy_setups_but_keeps_repeated_ticker(self):
         good = self.sample()
         good.setup = "false_breakout"
@@ -997,6 +1022,24 @@ class IdeaTests(TempCase):
                                migrated.gross_r - migrated.commission_r)
         loaded_again = ideas.IdeaJournal(str(path)).ideas[0]
         self.assertAlmostEqual(loaded_again.realized_r, migrated.realized_r)
+
+    def test_old_active_idea_gets_full_window_once(self):
+        path = self.path / "old-active.json"
+        x = self.sample()
+        x.created_ts = 1_000
+        x.expires_ts = 2_500
+        x.status = "active"
+        x.trigger_ts = 2_000
+        x.entry_price = x.trigger
+        row = asdict(x)
+        row.pop("hold_minutes")
+        path.write_text(json.dumps({"version": 1, "ideas": [row]}))
+
+        first = ideas.IdeaJournal(str(path)).ideas[0]
+        self.assertEqual(first.hold_minutes, 25)
+        self.assertEqual(first.expires_ts, 3_500)
+        second = ideas.IdeaJournal(str(path)).ideas[0]
+        self.assertEqual(second.expires_ts, 3_500)
 
     def test_adaptation_waits_for_sample_then_penalizes_bad_setup(self):
         j = ideas.IdeaJournal(str(self.path / "adaptive.json"))
