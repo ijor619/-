@@ -15,7 +15,7 @@ class UserProfile:
 
     def __init__(self) -> None:
         self.watchlist: list[str] = []      # тикеры в верхнем регистре
-        self.threshold_pct: float = 5.0     # алерт при |изменении за день| >= N%
+        self.threshold_pct: float = 5.0     # сдвиг дневного % от прошлого алерта
         self.cooldown_min: float = 30.0     # пауза между повторными алертами, мин
         self.report_min: float = 60.0       # период сводки, мин (0 = выкл)
         self.last_report_ts: float = 0.0    # unix-время последней сводки

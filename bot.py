@@ -53,7 +53,7 @@ from store import Store
 
 log = logging.getLogger(__name__)
 
-BUILD_VERSION = "4.5.0-local-low-bounce-2026-11-13"
+BUILD_VERSION = "4.5.1-stable-price-alerts-2026-11-20"
 
 router = Router(name="stockbot")
 
@@ -98,7 +98,7 @@ HELP = (
     "/market — рынок сейчас: IMOEX, RTS, юань, доллар, Brent\n"
     "/calendar [дней] — дивиденды, заседания ЦБ, отчётности по списку; /event add|del — свои события\n"
     "/list — список с текущими ценами\n"
-    "/alert N — алерт, если цена уйдёт более чем на N% за день (0.1–50)\n"
+    "/alert N — алерт после реального сдвига на N п.п. от прошлого алерта (0.1–50)\n"
     "/quiet N — мин. пауза между повторными алертами, мин\n"
     "/report N — сводка каждые N минут, 0 — выключить\n"
     "/chart TICKER [1m|5m|15m|30m|1h|4h|1d] — свечной график\n"
@@ -135,7 +135,7 @@ def _help_text(store: Store, user_id: int) -> str:
         HELP
         + f"\n\n<b>Твои настройки</b>\n"
         f"Список: {', '.join(p.watchlist) or '—'}\n"
-        f"Порог алерта: {p.threshold_pct:g}%\n"
+        f"Интервал алерта: {p.threshold_pct:g} п.п. от прошлого\n"
         f"Пауза между алертами: {p.cooldown_min:g} мин\n"
         f"Сводка: "
         + (f"каждые {p.report_min:g} мин" if p.report_min > 0 else "выключена")
@@ -409,8 +409,8 @@ async def cmd_alert(m: Message, store: Store) -> None:
     if not args:
         p = store.get(m.from_user.id)
         await m.answer(
-            f"Сейчас порог: {p.threshold_pct:g}%.\n"
-            "Установить: /alert 5 — алерт при изменении ≥ 5% за день."
+            f"Сейчас интервал: {p.threshold_pct:g} п.п.\n"
+            "Установить: /alert 0.5 — следующий алерт только после сдвига на 0.5 п.п. от прошлого."
         )
         return
     try:
@@ -424,7 +424,7 @@ async def cmd_alert(m: Message, store: Store) -> None:
     p = store.get(m.from_user.id)
     p.threshold_pct = v
     store.save()
-    await m.answer(f"🔔 Порог алерта: {v:g}% за день.")
+    await m.answer(f"🔔 Реальный интервал алерта: {v:g} п.п. от прошлого сообщения.")
 
 
 @router.message(Command("quiet"))
@@ -1757,7 +1757,7 @@ BOT_COMMANDS = [
     ("mutes", "Авто-фильтр: какие сигналы отключены"),
     ("news", "Новости: статус и последние"),
     ("flow", "Сигналы роботов вкл/выкл — /flow on|off"),
-    ("alert", "Порог алерта, % — /alert 3"),
+    ("alert", "Реальный интервал от прошлого алерта — /alert 0.5"),
     ("report", "Сводка каждые N мин — /report 60"),
     ("quiethours", "Тихие часы — /quiethours 23 9"),
     ("backtest", "Прогнать детекторы за час — /backtest SBER"),

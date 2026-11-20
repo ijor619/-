@@ -441,7 +441,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         prof = UserProfile()
         prof.threshold_pct = 0.5
         for text in (Monitor._report_text([("RUAL", q)]),
-                     Monitor._alert_text(q, prof, step=6, prev_step=5)):
+                     Monitor._alert_text(q, 2.9)):
             self.assertNotIn("T‑Invest", text)
             self.assertNotIn("База:", text)
             self.assertNotIn("нет свежей сделки", text)
@@ -586,34 +586,64 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
                 q.change_pct = 2.1
                 mon._last_alert[(1, "X")] = time.time()
                 await mon.tick(None)
-                self.assertEqual(mon._step[(1, "X")][1], 1)
+                self.assertEqual(mon._alert_anchor[(1, "X")][1], 1.1)
                 mon._last_alert[(1, "X")] = 0
                 bot.send_message.side_effect = RuntimeError("offline")
                 await mon.tick(None)
-                self.assertEqual(mon._step[(1, "X")][1], 1)
+                self.assertEqual(mon._alert_anchor[(1, "X")][1], 1.1)
                 bot.send_message.side_effect = None
                 await mon.tick(None)
-                self.assertEqual(mon._step[(1, "X")][1], 2)
+                self.assertEqual(mon._alert_anchor[(1, "X")][1], 2.1)
                 q.reference_key, q.change_pct = "other-base", 5.1
                 calls = bot.send_message.await_count
                 await mon.tick(None)
                 self.assertEqual(bot.send_message.await_count, calls)
 
-    async def test_negative_recovery_says_above(self):
+    async def test_negative_recovery_reports_real_change_from_last_alert(self):
         info = moex.SecurityInfo("X", "X", "TQBR", "SUR", 2, 100, "today")
         q = moex.Quote(info, 97.5, moex.now_msk(), -2.5, True)
-        p = UserProfile()
-        p.threshold_pct = 1
-        self.assertIn("выше -3%", Monitor._alert_text(q, p, -2, -3))
+        text = Monitor._alert_text(q, -3.1)
+        self.assertIn("восстановилась", text)
+        self.assertIn("0,60 п.п.", text)
+        self.assertIn("было -3,10%", text)
+        self.assertNotIn("шаг", text)
+
+    async def test_real_half_percent_step_from_last_sent_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(str(Path(tmp) / "users.json"))
+            prof = store.get(1)
+            prof.watchlist, prof.report_min = ["X"], 0
+            prof.threshold_pct, prof.cooldown_min = .5, 0
+            bot = SimpleNamespace(send_message=AsyncMock())
+            mon = Monitor(bot, store)
+            info = moex.SecurityInfo("X", "X", "TQBR", "SUR", 2, 100, "today")
+            mon._load_infos = AsyncMock(return_value={"X": info})
+            q = moex.Quote(info, 96.39, moex.now_msk(), -3.61, True,
+                           reference_key="base")
+            with patch("monitor.moex.fetch_quotes", AsyncMock(return_value={"X": q})):
+                await mon.tick(None)  # anchor = -3.61
+                q.change_pct = -3.49
+                await mon.tick(None)
+                q.change_pct = -4.10
+                await mon.tick(None)
+                self.assertEqual(bot.send_message.await_count, 0)
+                q.change_pct = -4.11
+                await mon.tick(None)
+                self.assertEqual(bot.send_message.await_count, 1)
+                self.assertEqual(mon._alert_anchor[(1, "X")][1], -4.11)
+                q.change_pct = -3.62
+                await mon.tick(None)
+                self.assertEqual(bot.send_message.await_count, 1)
+                q.change_pct = -3.61
+                await mon.tick(None)
+                self.assertEqual(bot.send_message.await_count, 2)
 
     async def test_crossing_from_plus_to_minus_keeps_real_direction(self):
         info = moex.SecurityInfo("X", "X", "TQBR", "SUR", 2, 100, "today")
-        p = UserProfile()
-        p.threshold_pct = 1
         down = moex.Quote(info, 99, moex.now_msk(), -1.1, True)
         up = moex.Quote(info, 101, moex.now_msk(), 1.1, True)
-        self.assertIn("прошла -1%", Monitor._alert_text(down, p, -1, 1))
-        self.assertIn("прошла +1%", Monitor._alert_text(up, p, 1, -1))
+        self.assertIn("снизилась", Monitor._alert_text(down, 1.1))
+        self.assertIn("выросла", Monitor._alert_text(up, -1.1))
 
     async def test_closed_market_screener_keeps_last_real_snapshot(self):
         end = time.time() - 3600
