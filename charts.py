@@ -307,7 +307,7 @@ def render(info: SecurityInfo, p: Period, cs: list[Candle],
             if xi is not None and xo is not None and entry > 0 and exit_price > 0:
                 ax.plot([x_entry, x_exit], [entry, exit_price], color=result_color,
                         linewidth=1.25, alpha=0.82, zorder=6)
-            if xo is not None and exit_price > 0 and status in ("target", "stop", "expired"):
+            if xo is not None and exit_price > 0 and status in ("target", "stop", "protected", "expired"):
                 ax.scatter([x_exit], [exit_price], marker="o", s=72, facecolor="white",
                            edgecolor=result_color, linewidth=1.7, zorder=8)
                 ax.text(x_exit, exit_price, str(trade_no), ha="center", va="center",
