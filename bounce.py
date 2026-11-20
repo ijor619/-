@@ -86,6 +86,7 @@ class BounceJournal(IdeaJournal):
         lines.append("</pre>")
         lines.append("<b>Последние:</b>")
         labels = {"target": "цель", "stop": "стоп", "expired": "время",
+                  "protected": "фиксация",
                   "active": "активна", "prepared": "ждёт", "cancelled": "без входа"}
         for idea in sorted(rows, key=lambda x: x.created_ts, reverse=True)[:8]:
             result = (f" · {idea.net_pct:+.2f}%" if idea.trigger_ts and idea.status in TERMINAL
@@ -177,7 +178,8 @@ class BounceEngine:
             level_name="локальный минимум", level=local_low,
             spread_pct=ctx.spread_pct or 0.0, lot=ctx.lot, decimals=ctx.decimals,
             market_regime=regime, timeframe_score=tf_score,
-            liquidity_rub_min=ctx.turnover_rub_min or 0.0)
+            liquidity_rub_min=ctx.turnover_rub_min or 0.0,
+            hold_minutes=minutes)
         return None if idea_geometry_error(idea, ctx.price) else idea
 
     def candidates(self, data: BounceContext) -> list[Idea]:
@@ -244,6 +246,7 @@ def card(idea: Idea, risk_rub: float = 0.0) -> str:
     price = lambda value: f"{value:.{d}f}".replace(".", ",")
     status = {"prepared": "🌱 ГОТОВИТСЯ", "active": "🚀 ВХОД АКТИВИРОВАН",
               "target": "✅ ОТСКОК ОТРАБОТАН", "stop": "🛑 СТОП",
+              "protected": "🛡 ПРИБЫЛЬ ЗАФИКСИРОВАНА",
               "cancelled": "↩️ ОТМЕНЁН ДО ВХОДА", "expired": "⌛ ВЫХОД ПО ВРЕМЕНИ"}[idea.status]
     risk = abs((idea.entry_price or idea.trigger) - idea.stop)
     r1 = abs(idea.target1 - (idea.entry_price or idea.trigger)) / risk if risk else 0.0
@@ -271,5 +274,9 @@ def card(idea: Idea, risk_rub: float = 0.0) -> str:
             lines.append(f"Результат после комиссии: <b>{idea.net_pct:+.2f}%</b> · "
                          f"MFE {idea.mfe_pct:+.2f}% · MAE {idea.mae_pct:+.2f}%")
     else:
+        if idea.status == "active":
+            mins = max(0, int((idea.expires_ts - time.time()) / 60))
+            lines.append(f"<i>Плановый выход через ≈{mins} мин.; защита прибыли "
+                         "может закрыть раньше.</i>")
         lines.append("<i>Бумажная сделка: бот не отправляет заявку брокеру.</i>")
     return "\n".join(lines)
